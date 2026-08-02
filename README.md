@@ -70,9 +70,10 @@ move({ source: { type: 'sheets', spreadsheetId: '...', range: 'Orders!A1:F' } })
 // Drive file — fileType selects the parser: 'csv', 'xlsx', or 'json'
 move({ source: { type: 'drive', fileId: '...', fileType: 'csv' } })
 
-// BigQuery table — reads the full table (SELECT *), not arbitrary SQL;
-// declaring transformations is model()'s job, not move()'s
+// BigQuery — exactly one of table, query, or queryFileId
 move({ source: { type: 'bigquery', projectId: '...', dataset: 'staging', table: 'orders' } })
+move({ source: { type: 'bigquery', projectId: '...', query: 'SELECT customer, SUM(amount) AS total FROM staging.orders GROUP BY 1' } })
+move({ source: { type: 'bigquery', projectId: '...', queryFileId: '<drive file id of a .sql file>' } })
 
 // External API — expects a JSON array of objects in the response body
 move({ source: { type: 'api', url: 'https://...', options: { /* UrlFetchApp params */ } } })
@@ -85,6 +86,13 @@ files are converted to a temporary Google Sheet under the hood (Apps
 Script has no native XLSX parser), read, and the temporary copy is deleted
 immediately after — this requires the Advanced Drive Service enabled in
 your Apps Script project.
+
+For `bigquery` sources, `table`/`query`/`queryFileId` are mutually
+exclusive — pick one. `query` and `queryFileId` must be a read-only
+`SELECT` (a leading `WITH` is fine, for CTEs); anything else is rejected
+before it reaches BigQuery. This isn't a hard security boundary, just a
+keyword check to keep `move()` read-only — declaring transformations that
+write or modify data is `model()`'s job, not `move()`'s.
 
 **Loading the extracted array into a `target` is not implemented yet** —
 `move()` only accepts `source` for now. Writing to Sheets/Drive/BigQuery
