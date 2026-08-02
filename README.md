@@ -6,9 +6,11 @@ probably already have open.
 
 > **Status: early-stage / pre-alpha.**
 > This library is still in the design phase. `move()`, `model()`, and
-> `orchestrate()` are not implemented yet — there is no working `src.js` to
-> install. Everything below describes the intended design, not something
-> you can run today. Watch this repo for progress.
+> `orchestrate()` are not implemented yet. `src.js` currently contains only
+> a minimal smoke-test module (`NotSoBigData.helloWorld()`) that validates
+> the `eval(UrlFetchApp.fetch(...))` loading pattern described below —
+> everything else in this README describes the intended design, not
+> something you can run today. Watch this repo for progress.
 
 ## What is this for?
 
@@ -40,6 +42,14 @@ runtime — no package manager, no build step, just one line:
 ```javascript
 eval(UrlFetchApp.fetch('https://raw.githubusercontent.com/moschionigabriel/notsobigdata/main/src.js').getContentText())
 ```
+
+> **Where to put that line matters.** A direct `eval()` call's declarations
+> only become visible in the scope of whatever function called it — never
+> beyond it. Put this line at the top level of your file (outside any
+> function), or inline it in the exact same function where you then call
+> `move()`/`model()`/`orchestrate()`. Routing it through a separate loader
+> function will silently break — the library disappears the moment that
+> function returns, and you'll get a `ReferenceError` instead.
 
 ## Planned usage
 
