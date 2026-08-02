@@ -6,9 +6,11 @@ probably already have open.
 
 > **Status: early-stage / pre-alpha.**
 > This library is still in the design phase. `move()`, `model()`, and
-> `orchestrate()` are not implemented yet — there is no working `src.js` to
-> install. Everything below describes the intended design, not something
-> you can run today. Watch this repo for progress.
+> `orchestrate()` are not implemented yet. `src.js` currently contains only
+> a minimal smoke-test module (`NotSoBigData.helloWorld()`) that validates
+> the `eval(UrlFetchApp.fetch(...))` loading pattern described below —
+> everything else in this README describes the intended design, not
+> something you can run today. Watch this repo for progress.
 
 ## What is this for?
 
