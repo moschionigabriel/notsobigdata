@@ -41,6 +41,14 @@ runtime — no package manager, no build step, just one line:
 eval(UrlFetchApp.fetch('https://raw.githubusercontent.com/moschionigabriel/notsobigdata/main/src.js').getContentText())
 ```
 
+> **Where to put that line matters.** A direct `eval()` call's declarations
+> only become visible in the scope of whatever function called it — never
+> beyond it. Put this line at the top level of your file (outside any
+> function), or inline it in the exact same function where you then call
+> `move()`/`model()`/`orchestrate()`. Routing it through a separate loader
+> function will silently break — the library disappears the moment that
+> function returns, and you'll get a `ReferenceError` instead.
+
 ## Planned usage
 
 The examples below are illustrative of the intended API shape — not final,
