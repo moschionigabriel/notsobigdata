@@ -263,6 +263,13 @@ var NotSoBigData = (function () {
   // set it false to append rows.slice(1) instead of the full array,
   // skipping the header move() always puts at rows[0] - otherwise every
   // append duplicates the header row in the middle of the sheet.
+  //
+  // In "overwrite" mode, the clear step only runs when rows is non-empty -
+  // an empty extract (flaky source, empty query result, misconfigured
+  // range) leaves existing sheet content alone instead of wiping it out
+  // for nothing. Same guarding principle as loadBigQuery's WRITE_TRUNCATE
+  // skip below, applied here since sheets has no equivalent skip-the-job
+  // escape hatch to lean on.
   function loadSheets(rows, target) {
     if (!target.spreadsheetId) {
       throw new Error('move(): sheets target requires "spreadsheetId".');
@@ -285,7 +292,7 @@ var NotSoBigData = (function () {
       startColumn = anchor.getColumn();
     }
 
-    if (mode === 'overwrite') {
+    if (mode === 'overwrite' && rows.length > 0) {
       if (anchor) {
         anchor.clearContent();
       } else {
@@ -390,13 +397,24 @@ var NotSoBigData = (function () {
     return DriveApp.getFolderById(target.folderId).createFile(target.fileName, content, mimeType).getId();
   }
 
+  // Both csv/json targets skip overwriting an *existing* file's content
+  // when rows is empty - same guarding principle as loadSheets/loadBigQuery
+  // above: an empty extract shouldn't silently wipe out real data. Creating
+  // a brand-new file (no fileId to protect yet) still goes ahead even with
+  // zero rows, since there's nothing at risk in that case.
   function loadDriveCsv(rows, target) {
     var fileId = resolveDriveWriteTarget(target);
+    if (fileId && rows.length === 0) {
+      return fileId;
+    }
     return writeDriveText(fileId, target, rowsToCsv(rows), MimeType.CSV);
   }
 
   function loadDriveJson(rows, target) {
     var fileId = resolveDriveWriteTarget(target);
+    if (fileId && rows.length === 0) {
+      return fileId;
+    }
     return writeDriveText(fileId, target, JSON.stringify(rowsToObjects(rows)), MimeType.PLAIN_TEXT);
   }
 
@@ -428,8 +446,14 @@ var NotSoBigData = (function () {
   // always deleted afterward (permanently, via Drive.Files.remove - the
   // same cleanup extractDriveXlsx uses for its own temp copy), including
   // on error.
+  // Same empty-extract guard as loadDriveCsv/loadDriveJson above: skip
+  // building/exporting the temp spreadsheet entirely when there's an
+  // existing file to protect and rows is empty.
   function loadDriveXlsx(rows, target) {
     var fileId = resolveDriveWriteTarget(target);
+    if (fileId && rows.length === 0) {
+      return fileId;
+    }
     var tempSpreadsheet = SpreadsheetApp.create('notsobigdata-xlsx-export-' + Utilities.getUuid());
     try {
       if (rows.length > 0) {
