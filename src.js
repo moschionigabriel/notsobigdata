@@ -397,14 +397,21 @@ var NotSoBigData = (function () {
     return DriveApp.getFolderById(target.folderId).createFile(target.fileName, content, mimeType).getId();
   }
 
-  // Both csv/json targets skip overwriting an *existing* file's content
-  // when rows is empty - same guarding principle as loadSheets/loadBigQuery
-  // above: an empty extract shouldn't silently wipe out real data. Creating
-  // a brand-new file (no fileId to protect yet) still goes ahead even with
-  // zero rows, since there's nothing at risk in that case.
+  // True when a drive target has an existing file to protect (a resolved
+  // fileId) and nothing was extracted to replace its content with - the
+  // case where loadDriveCsv/loadDriveJson/loadDriveXlsx should each skip
+  // their destructive write and hand the existing fileId back untouched,
+  // rather than overwriting real data with an empty file. A brand-new file
+  // (no fileId yet) still gets created even with zero rows, since there's
+  // no prior data at risk in that case - so this only fires when fileId is
+  // truthy.
+  function isEmptyDriveOverwrite(fileId, rows) {
+    return !!(fileId && rows.length === 0);
+  }
+
   function loadDriveCsv(rows, target) {
     var fileId = resolveDriveWriteTarget(target);
-    if (fileId && rows.length === 0) {
+    if (isEmptyDriveOverwrite(fileId, rows)) {
       return fileId;
     }
     return writeDriveText(fileId, target, rowsToCsv(rows), MimeType.CSV);
@@ -412,7 +419,7 @@ var NotSoBigData = (function () {
 
   function loadDriveJson(rows, target) {
     var fileId = resolveDriveWriteTarget(target);
-    if (fileId && rows.length === 0) {
+    if (isEmptyDriveOverwrite(fileId, rows)) {
       return fileId;
     }
     return writeDriveText(fileId, target, JSON.stringify(rowsToObjects(rows)), MimeType.PLAIN_TEXT);
@@ -451,7 +458,7 @@ var NotSoBigData = (function () {
   // existing file to protect and rows is empty.
   function loadDriveXlsx(rows, target) {
     var fileId = resolveDriveWriteTarget(target);
-    if (fileId && rows.length === 0) {
+    if (isEmptyDriveOverwrite(fileId, rows)) {
       return fileId;
     }
     var tempSpreadsheet = SpreadsheetApp.create('notsobigdata-xlsx-export-' + Utilities.getUuid());
