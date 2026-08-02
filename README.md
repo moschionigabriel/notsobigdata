@@ -88,19 +88,22 @@ move({ source: { type: 'custom', fn: myCustomExtract } })
 ```
 
 For `drive` and `api` sources, a JSON array of objects is flattened into a
-header row plus data rows using the **first object's keys** as the column
-list — later objects missing a key just get a blank cell there. `xlsx`
+header row plus data rows using the **union of every object's keys** as the
+column list — any object missing a given key just gets a blank cell there.
+`xlsx`
 files are converted to a temporary Google Sheet under the hood (Apps
 Script has no native XLSX parser), read, and the temporary copy is deleted
 immediately after — this requires the Advanced Drive Service enabled in
 your Apps Script project.
 
 For `bigquery` sources, `table`/`query`/`queryFileId` are mutually
-exclusive — pick one. `query` and `queryFileId` must be a read-only
-`SELECT` (a leading `WITH` is fine, for CTEs); anything else is rejected
-before it reaches BigQuery. This isn't a hard security boundary, just a
-keyword check to keep `move()` read-only — declaring transformations that
-write or modify data is `model()`'s job, not `move()`'s.
+exclusive — pick one (`table` also requires `dataset`). `query` and
+`queryFileId` must be a single, read-only `SELECT` (a leading `WITH` is
+fine, for CTEs) — a multi-statement script (statements separated by `;`)
+or anything other than a read is rejected before it reaches BigQuery. This
+isn't a hard security boundary, just a keyword/shape check to keep
+`move()` read-only — declaring transformations that write or modify data
+is `model()`'s job, not `move()`'s.
 
 For `custom` sources, `fn` is a direct reference to a function you've
 already defined elsewhere in your Apps Script project — not a function
