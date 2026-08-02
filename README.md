@@ -176,15 +176,19 @@ common case is refreshing a sheet to reflect the latest extract, and
 undoing an accidental overwrite in a spreadsheet is cheap.
 
 - `target.range` (optional) scopes both modes to part of the sheet instead
-  of the whole tab, the same way `source.range` does on the extract side.
-  In `overwrite` mode, only that literal range gets cleared — not the
-  entire sheet, which might hold other tables or notes — and writing
-  starts at the range's top-left cell. In `append` mode it only pins the
-  starting *column*; the starting row still always comes from the sheet's
-  actual last row. Worth knowing: since only the literal given range gets
-  cleared, if a previous run wrote more rows than this run does, cells
-  past the range from that earlier run won't get cleared — that's the
-  tradeoff for not wiping the rest of the sheet on every overwrite.
+  of the whole tab — the same idea as `source.range` on the extract side,
+  but *not* the same notation: give it a plain, sheet-relative range like
+  `'B2:D10'`, with no `'SheetName!'` prefix — `target.sheetName` above
+  already picked the sheet, and re-adding a sheet-qualified `source.range`
+  string here will fail. In `overwrite` mode, only that literal range gets
+  cleared — not the entire sheet, which might hold other tables or notes —
+  and writing starts at the range's top-left cell. In `append` mode it
+  only pins the starting *column*; the starting row still always comes
+  from the sheet's actual last row. Worth knowing: since only the literal
+  given range gets cleared, if a previous run wrote more rows than this
+  run does, cells past the range from that earlier run won't get cleared
+  — that's the tradeoff for not wiping the rest of the sheet on every
+  overwrite.
 - `target.includeHeader` (default `true`) only matters in `append` mode:
   set it to `false` to append just the data rows, skipping the header row
   `move()` always puts at `rows[0]` — otherwise every append duplicates

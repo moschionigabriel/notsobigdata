@@ -244,7 +244,11 @@ var NotSoBigData = (function () {
   // reason.
   //
   // target.range scopes both modes to part of the sheet instead of the
-  // whole tab, mirroring source.range on the extract side: in "overwrite"
+  // whole tab, the same idea as source.range on the extract side - but
+  // NOT the same notation: this is resolved via sheet.getRange(), which
+  // (unlike spreadsheet.getRange(), what source.range uses) only accepts
+  // a plain, sheet-relative range like "B2:D10" - no "SheetName!" prefix,
+  // since target.sheetName above already picked the sheet. In "overwrite"
   // mode only that literal range is cleared, not the entire sheet (which
   // may hold other tables or notes); in "append" mode it only pins the
   // starting column, since the starting row always comes from the sheet's
@@ -263,41 +267,39 @@ var NotSoBigData = (function () {
     if (!target.spreadsheetId) {
       throw new Error('move(): sheets target requires "spreadsheetId".');
     }
-    var spreadsheet = SpreadsheetApp.openById(target.spreadsheetId);
-    var sheet = target.sheetName
-      ? (spreadsheet.getSheetByName(target.sheetName) || spreadsheet.insertSheet(target.sheetName))
-      : spreadsheet.getActiveSheet();
     var mode = target.mode || 'overwrite';
     if (mode !== 'overwrite' && mode !== 'append') {
       throw new Error('move(): unsupported sheets target mode "' + mode + '". Expected "overwrite" or "append".');
     }
 
+    var spreadsheet = SpreadsheetApp.openById(target.spreadsheetId);
+    var sheet = target.sheetName
+      ? (spreadsheet.getSheetByName(target.sheetName) || spreadsheet.insertSheet(target.sheetName))
+      : spreadsheet.getActiveSheet();
+
     var startRow = 1;
     var startColumn = 1;
-    if (target.range) {
-      var anchor = sheet.getRange(target.range);
+    var anchor = target.range ? sheet.getRange(target.range) : null;
+    if (anchor) {
       startRow = anchor.getRow();
       startColumn = anchor.getColumn();
     }
 
     if (mode === 'overwrite') {
-      if (target.range) {
-        sheet.getRange(target.range).clearContent();
+      if (anchor) {
+        anchor.clearContent();
       } else {
         sheet.clearContents();
       }
     }
 
     var rowsToWrite = (mode === 'append' && target.includeHeader === false) ? rows.slice(1) : rows;
-    if (rowsToWrite.length === 0) {
-      return { spreadsheetId: target.spreadsheetId, sheetName: sheet.getName(), startRow: startRow, startColumn: startColumn, numRows: 0 };
-    }
-
-    if (mode === 'append') {
+    if (mode === 'append' && rowsToWrite.length > 0) {
       startRow = sheet.getLastRow() + 1;
     }
-
-    sheet.getRange(startRow, startColumn, rowsToWrite.length, rowsToWrite[0].length).setValues(rowsToWrite);
+    if (rowsToWrite.length > 0) {
+      sheet.getRange(startRow, startColumn, rowsToWrite.length, rowsToWrite[0].length).setValues(rowsToWrite);
+    }
     return { spreadsheetId: target.spreadsheetId, sheetName: sheet.getName(), startRow: startRow, startColumn: startColumn, numRows: rowsToWrite.length };
   }
 
@@ -360,30 +362,52 @@ var NotSoBigData = (function () {
     return fileId;
   }
 
-  // Writes text content to a drive target: overwrite an existing file
-  // (found via resolveDriveTargetFileId - either "fileId" directly or an
-  // "upsertByName" lookup), or create a new one from "folderId" +
-  // "fileName". Shared by the drive csv and json targets, which only
-  // differ in how they serialize rows and which mimeType they create a
-  // new file with.
-  function writeDriveText(target, content, mimeType) {
+  // Resolves a drive target down to either an existing file to overwrite
+  // (via resolveDriveTargetFileId above) or confirmation there's enough
+  // to create a new one instead ("folderId" + "fileName") - one shared
+  // validation for both cases, called before any expensive work (CSV/JSON
+  // serialization, building a temp xlsx export) so a misconfigured target
+  // throws before that work happens rather than after. Returns the file
+  // id to overwrite, or null when the caller should create a new file.
+  function resolveDriveWriteTarget(target) {
     var fileId = resolveDriveTargetFileId(target);
+    if (!fileId && (!target.folderId || !target.fileName)) {
+      throw new Error('move(): drive target requires either "fileId" (to overwrite an existing file) or both "folderId" and "fileName" (to create - or with "upsertByName", find-or-create - one).');
+    }
+    return fileId;
+  }
+
+  // Writes text content to an already-resolved drive target: overwrite
+  // fileId if given, otherwise create a new file from target.folderId +
+  // target.fileName (both already validated by resolveDriveWriteTarget).
+  // Shared by the drive csv and json targets, which only differ in how
+  // they serialize rows and which mimeType they create a new file with.
+  function writeDriveText(fileId, target, content, mimeType) {
     if (fileId) {
       DriveApp.getFileById(fileId).setContent(content);
       return fileId;
-    }
-    if (!target.folderId || !target.fileName) {
-      throw new Error('move(): drive target requires either "fileId" (to overwrite an existing file) or both "folderId" and "fileName" (to create - or with "upsertByName", find-or-create - one).');
     }
     return DriveApp.getFolderById(target.folderId).createFile(target.fileName, content, mimeType).getId();
   }
 
   function loadDriveCsv(rows, target) {
-    return writeDriveText(target, rowsToCsv(rows), MimeType.CSV);
+    var fileId = resolveDriveWriteTarget(target);
+    return writeDriveText(fileId, target, rowsToCsv(rows), MimeType.CSV);
   }
 
   function loadDriveJson(rows, target) {
-    return writeDriveText(target, JSON.stringify(rowsToObjects(rows)), MimeType.PLAIN_TEXT);
+    var fileId = resolveDriveWriteTarget(target);
+    return writeDriveText(fileId, target, JSON.stringify(rowsToObjects(rows)), MimeType.PLAIN_TEXT);
+  }
+
+  // Throws a descriptive move() error if a UrlFetchApp response wasn't a
+  // 2xx. Shared by loadDriveXlsx's xlsx export fetch below and loadApi
+  // further down.
+  function assertHttpOk(response, messagePrefix) {
+    var responseCode = response.getResponseCode();
+    if (responseCode < 200 || responseCode >= 300) {
+      throw new Error(messagePrefix + ' (HTTP ' + responseCode + ').');
+    }
   }
 
   // Builds the xlsx file via a temporary Google Sheet (Apps Script has no
@@ -397,12 +421,15 @@ var NotSoBigData = (function () {
   // already carries Drive scope regardless, from this file's other
   // Drive.Files.* calls (Apps Script scopes the whole project, not per
   // function), so this doesn't add a new permission requirement.
-  // Overwriting an existing file (via resolveDriveTargetFileId, same as
+  // Overwriting an existing file (via resolveDriveWriteTarget, same as
   // the csv/json targets) does need the Advanced Drive Service, though -
   // unlike csv/json, DriveApp has no way to replace a file's binary
   // content in place, only Drive.Files.update() does. The temp sheet is
-  // always deleted afterward, including on error.
+  // always deleted afterward (permanently, via Drive.Files.remove - the
+  // same cleanup extractDriveXlsx uses for its own temp copy), including
+  // on error.
   function loadDriveXlsx(rows, target) {
+    var fileId = resolveDriveWriteTarget(target);
     var tempSpreadsheet = SpreadsheetApp.create('notsobigdata-xlsx-export-' + Utilities.getUuid());
     try {
       if (rows.length > 0) {
@@ -411,22 +438,15 @@ var NotSoBigData = (function () {
       SpreadsheetApp.flush();
       var exportUrl = 'https://docs.google.com/spreadsheets/d/' + tempSpreadsheet.getId() + '/export?format=xlsx';
       var response = UrlFetchApp.fetch(exportUrl, { headers: { Authorization: 'Bearer ' + ScriptApp.getOAuthToken() } });
-      var responseCode = response.getResponseCode();
-      if (responseCode < 200 || responseCode >= 300) {
-        throw new Error('move(): failed to export the temporary sheet as xlsx (HTTP ' + responseCode + ').');
-      }
+      assertHttpOk(response, 'move(): failed to export the temporary sheet as xlsx');
       var blob = response.getBlob();
-      var fileId = resolveDriveTargetFileId(target);
       if (fileId) {
         Drive.Files.update({}, fileId, blob);
         return fileId;
       }
-      if (!target.folderId || !target.fileName) {
-        throw new Error('move(): drive target requires either "fileId" (to overwrite an existing file) or both "folderId" and "fileName" (to create - or with "upsertByName", find-or-create - one).');
-      }
       return DriveApp.getFolderById(target.folderId).createFile(blob.setName(target.fileName)).getId();
     } finally {
-      DriveApp.getFileById(tempSpreadsheet.getId()).setTrashed(true);
+      Drive.Files.remove(tempSpreadsheet.getId());
     }
   }
 
@@ -450,8 +470,9 @@ var NotSoBigData = (function () {
   // truncating a real table is destructive and hard to undo, so that mode
   // must be opted into explicitly rather than risked by a missing "mode"
   // key. Jobs.insert here doesn't long-poll the way getQueryResults does
-  // in extractBigQuery, so this polls job status itself with a short
-  // sleep between checks.
+  // in extractBigQuery, so this polls job status itself, backing off the
+  // sleep between checks (500ms up to a 5s cap) so a longer-running load
+  // job doesn't cost dozens of Jobs.get round trips at a fixed interval.
   //
   // target.schema is an optional array of BigQuery field defs (e.g.
   // [{name: 'order_id', type: 'STRING'}]) to use instead of
@@ -492,8 +513,10 @@ var NotSoBigData = (function () {
     var jobId = insertedJob.jobReference.jobId;
     result.jobId = jobId;
     var status = insertedJob.status;
+    var pollIntervalMs = 500;
     while (status.state !== 'DONE') {
-      Utilities.sleep(500);
+      Utilities.sleep(pollIntervalMs);
+      pollIntervalMs = Math.min(pollIntervalMs * 2, 5000);
       status = BigQuery.Jobs.get(target.projectId, jobId).status;
     }
     if (status.errorResult) {
@@ -523,11 +546,8 @@ var NotSoBigData = (function () {
       });
     }
     var response = UrlFetchApp.fetch(target.url, options);
-    var responseCode = response.getResponseCode();
-    if (responseCode < 200 || responseCode >= 300) {
-      throw new Error('move(): api target request to "' + target.url + '" failed with HTTP ' + responseCode + '.');
-    }
-    return { statusCode: responseCode, body: response.getContentText() };
+    assertHttpOk(response, 'move(): api target request to "' + target.url + '" failed');
+    return { statusCode: response.getResponseCode(), body: response.getContentText() };
   }
 
   // Runs a user-supplied loader function from the caller's own Apps
