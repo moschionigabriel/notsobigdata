@@ -224,6 +224,19 @@ a CSV load job.
   which can guess wrong for things like a zero-padded id column (`"007"`)
   silently becoming an `INTEGER` — pass `target.schema` when that matters.
 
+Every target except `api`/`custom` (which have no "existing state" to
+protect - a POST is a POST, and a custom `fn` is on you) skips its
+destructive step when `rows` is empty, rather than wiping out real data for
+nothing: `sheets` (`overwrite` mode) leaves the target range/sheet
+untouched instead of clearing it; `drive` (all three `fileType`s) leaves an
+existing file's content untouched instead of overwriting it with an empty
+file - though it still *creates* a new file from `folderId`+`fileName` even
+with zero rows, since there's no prior data at risk there; `bigquery`
+skips the load job entirely instead of running `WRITE_TRUNCATE`/`WRITE_APPEND`
+against nothing. This matters most for unattended runs (a flaky source API,
+an empty query result, a misconfigured range) where nobody's watching to
+catch a real table or sheet getting silently blanked out.
+
 For `api` targets, `target.options` is merged in after the defaults
 (`method: 'post'`, JSON content type, JSON body), so you can override any
 of them — a different HTTP method, extra headers, or a different payload
