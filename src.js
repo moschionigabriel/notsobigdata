@@ -322,19 +322,33 @@ var NotSoBigData = (function () {
 
   // Builds the xlsx file via a temporary Google Sheet (Apps Script has no
   // native XLSX writer, mirroring extractDriveXlsx's use of a temp copy in
-  // the opposite direction) and DriveApp's built-in getAs() converter, no
-  // Advanced Drive Service needed for that part. Overwriting an existing
-  // file by "fileId" does need the Advanced Drive Service, though - unlike
-  // csv/json, DriveApp has no way to replace a file's binary content in
-  // place, only Drive.Files.update() does. The temp sheet is always
-  // deleted afterward, including on error.
+  // the opposite direction). DriveApp's getAs() converter does NOT support
+  // Google Sheets -> xlsx (confirmed by hand: it throws "Converting from
+  // application/vnd.google-apps.spreadsheet ... is not supported"), even
+  // though the Sheets UI's own File > Download > .xlsx does the same
+  // conversion - so this fetches the same export endpoint the UI uses
+  // instead, authenticated with the script's own OAuth token. That token
+  // already carries Drive scope regardless, from this file's other
+  // Drive.Files.* calls (Apps Script scopes the whole project, not per
+  // function), so this doesn't add a new permission requirement.
+  // Overwriting an existing file by "fileId" does need the Advanced Drive
+  // Service, though - unlike csv/json, DriveApp has no way to replace a
+  // file's binary content in place, only Drive.Files.update() does. The
+  // temp sheet is always deleted afterward, including on error.
   function loadDriveXlsx(rows, target) {
     var tempSpreadsheet = SpreadsheetApp.create('notsobigdata-xlsx-export-' + Utilities.getUuid());
     try {
       if (rows.length > 0) {
         tempSpreadsheet.getActiveSheet().getRange(1, 1, rows.length, rows[0].length).setValues(rows);
       }
-      var blob = DriveApp.getFileById(tempSpreadsheet.getId()).getAs(MimeType.MICROSOFT_EXCEL);
+      SpreadsheetApp.flush();
+      var exportUrl = 'https://docs.google.com/spreadsheets/d/' + tempSpreadsheet.getId() + '/export?format=xlsx';
+      var response = UrlFetchApp.fetch(exportUrl, { headers: { Authorization: 'Bearer ' + ScriptApp.getOAuthToken() } });
+      var responseCode = response.getResponseCode();
+      if (responseCode < 200 || responseCode >= 300) {
+        throw new Error('move(): failed to export the temporary sheet as xlsx (HTTP ' + responseCode + ').');
+      }
+      var blob = response.getBlob();
       if (target.fileId) {
         Drive.Files.update({}, target.fileId, blob);
         return target.fileId;
