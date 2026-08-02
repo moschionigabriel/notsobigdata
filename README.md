@@ -5,13 +5,11 @@ SQL, and orchestrate the whole pipeline, entirely inside a tool you
 probably already have open.
 
 > **Status: early-stage / pre-alpha.**
-> This library is still taking shape. `move()` currently implements the
-> **extract** half only — reading a source into a 2D array — for Sheets,
-> Drive (CSV/XLSX/JSON), BigQuery, external APIs, and your own custom
-> extractor functions. Writing that array
-> into a target ("load") isn't implemented yet, so `move()` today only
-> takes a `source`, not a `target`. `model()` and `orchestrate()` are not
-> implemented yet either. Watch this repo for progress.
+> This library is still taking shape. `move()` implements both halves of
+> "EL" — extract (reading a source into a 2D array) and load (writing that
+> array into a target) — for Sheets, Drive (CSV/XLSX/JSON), BigQuery,
+> external APIs, and your own custom functions. `model()` and
+> `orchestrate()` are not implemented yet. Watch this repo for progress.
 
 ## What is this for?
 
@@ -55,14 +53,14 @@ eval(UrlFetchApp.fetch('https://raw.githubusercontent.com/moschionigabriel/notso
 ## Planned usage
 
 The `model()` and `orchestrate()` examples below are illustrative of the
-intended API shape — not final, and not usable yet. `move()`'s extract side
-is implemented as shown.
+intended API shape — not final, and not usable yet. `move()` is implemented
+as shown.
 
 ### move()
 
-`move()` extracts a source into a 2D array — the same shape Apps Script
-already uses for Sheets ranges — regardless of where the source data comes
-from:
+`move()` extracts a `source` into a 2D array — the same shape Apps Script
+already uses for Sheets ranges — and, if you also give it a `target`, loads
+that array there too:
 
 ```javascript
 // Google Sheets — range is optional; omit it to read the whole active sheet
@@ -115,11 +113,83 @@ shape every other extract function produces — but does not check cell
 types or that every row is the same length. Getting that part right is on
 you, just like it's on you to get a `bigquery` `query` string right.
 
-**Loading the extracted array into a `target` is not implemented yet** —
-`move()` only accepts `source` for now. Writing to Sheets/Drive/BigQuery
-targets is planned for a follow-up change. Planned connectors are the same
-on both sides once load lands: Google Sheets, Drive files (CSV/XLSX/JSON),
-BigQuery tables, and external APIs via `UrlFetchApp`.
+### move() — load
+
+`target` is optional — omit it and `move()` behaves exactly like an
+extract-only call, returning the rows without writing them anywhere. Give
+it a `target` and those same rows get loaded there too; `move()` always
+returns the extracted rows either way, so you can inspect or reuse them
+regardless of whether a target was given:
+
+```javascript
+// Google Sheets — sheetName is optional (defaults to the active sheet,
+// created if it doesn't exist yet); mode defaults to 'overwrite'
+move({
+  source: { type: 'bigquery', projectId: '...', dataset: 'staging', table: 'orders' },
+  target: { type: 'sheets', spreadsheetId: '...', sheetName: 'Orders', mode: 'overwrite' }
+})
+
+// Drive file — fileId overwrites an existing file; folderId + fileName
+// creates a new one instead
+move({
+  source: { type: 'sheets', spreadsheetId: '...' },
+  target: { type: 'drive', fileType: 'csv', folderId: '...', fileName: 'orders.csv' }
+})
+
+// BigQuery — mode defaults to 'append' (WRITE_APPEND); 'overwrite'
+// (WRITE_TRUNCATE) must be opted into explicitly
+move({
+  source: { type: 'drive', fileId: '...', fileType: 'csv' },
+  target: { type: 'bigquery', projectId: '...', dataset: 'staging', table: 'orders', mode: 'append' }
+})
+
+// External API — rows are POSTed as a JSON array of objects
+move({
+  source: { type: 'sheets', spreadsheetId: '...' },
+  target: { type: 'api', url: 'https://...', options: { /* UrlFetchApp params */ } }
+})
+
+// Custom — fn is a function you already defined; move() calls it as
+// fn(rows, target) and doesn't use its return value
+function myCustomLoad(rows, target) {
+  // write rows wherever you want
+}
+move({
+  source: { type: 'sheets', spreadsheetId: '...' },
+  target: { type: 'custom', fn: myCustomLoad }
+})
+```
+
+For `sheets` targets, `mode: 'overwrite'` (the default) clears the whole
+sheet before writing; `mode: 'append'` writes after the current last row,
+leaving existing content alone. Overwrite is the default here because the
+common case is refreshing a sheet to reflect the latest extract, and
+undoing an accidental overwrite in a spreadsheet is cheap.
+
+For `drive` targets, `csv` and `json` overwrite an existing file's content
+directly by `fileId`. `xlsx` can do the same, but overwriting an existing
+file's binary content needs the Advanced Drive Service (the same one the
+`xlsx` *source* already depends on) — creating a new file via
+`folderId`/`fileName` doesn't. `json` targets write the same
+array-of-objects shape `drive`/`api` sources read back in — the header row
+becomes each object's keys.
+
+For `bigquery` targets, `mode` defaults to `'append'` rather than
+`'overwrite'` — the opposite default from `sheets` — because truncating a
+real table is destructive and hard to undo, so that has to be requested
+explicitly rather than risked by a missing `mode` key. Rows are uploaded as
+a CSV load job with the schema autodetected from the header row.
+
+For `api` targets, `target.options` is merged in after the defaults
+(`method: 'post'`, JSON content type, JSON body), so you can override any
+of them — a different HTTP method, extra headers, or a different payload
+shape entirely.
+
+For `custom` targets, `fn` is called as `fn(rows, target)` — the extracted
+rows plus the whole target object, in case your function needs extra
+config keys you attached to it — same trust model as a `custom` source's
+`fn`: it's a direct function reference from your own project, not a
+name to look up.
 
 ### model()
 
