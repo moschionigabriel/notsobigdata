@@ -73,15 +73,50 @@ var NotSoBigData = (function () {
     }
   }
 
-  // Reads a full BigQuery table via the Advanced BigQuery Service. The
-  // table identifier is backtick-quoted since it's interpolated into SQL
-  // text, even though it's the pipeline author's own declared config, not
-  // runtime user input — move() never accepts arbitrary SQL, that stays
-  // model()'s job.
+  // Resolves the SQL text for a bigquery source: a whole table (existing
+  // behavior, backward compatible), a raw query string, or a query read
+  // from a Drive .sql file. Exactly one of table/query/queryFileId must be
+  // given - mixing modes is almost certainly a config mistake worth
+  // surfacing rather than silently picking one.
+  function resolveBigQuerySql(source) {
+    var modes = ['table', 'query', 'queryFileId'].filter(function (key) { return !!source[key]; });
+    if (modes.length !== 1) {
+      throw new Error('move(): bigquery source needs exactly one of "table" (with "dataset"), "query", or "queryFileId" - got ' + (modes.length === 0 ? 'none' : modes.join(', ')) + '.');
+    }
+    if (source.table) {
+      return 'SELECT * FROM `' + source.projectId + '.' + source.dataset + '.' + source.table + '`';
+    }
+    if (source.query) {
+      return source.query;
+    }
+    return DriveApp.getFileById(source.queryFileId).getBlob().getDataAsString();
+  }
+
+  // Guards against a bigquery source running anything other than a read.
+  // This is a footgun-preventing keyword check, not a security boundary:
+  // it only strips comments and looks at the leading keyword, so it won't
+  // catch e.g. a SELECT that calls a mutating stored routine. move()'s job
+  // is extracting data - transforming/writing it belongs in model().
+  function assertReadOnlySelect(sql) {
+    var stripped = sql
+      .replace(/--[^\n]*/g, '')
+      .replace(/\/\*[\s\S]*?\*\//g, '')
+      .trim();
+    if (!/^(select|with)\b/i.test(stripped)) {
+      throw new Error('move(): bigquery source.query/queryFileId must be a read-only SELECT (optionally starting with WITH). move() only extracts data - transform or write logic belongs in model().');
+    }
+  }
+
+  // Reads from BigQuery via the Advanced BigQuery Service - either a whole
+  // table or the result of a read-only query. The table identifier is
+  // backtick-quoted since it's interpolated into SQL text, even though
+  // it's the pipeline author's own declared config, not runtime user
+  // input.
   function extractBigQuery(source) {
-    var tableRef = '`' + source.projectId + '.' + source.dataset + '.' + source.table + '`';
+    var sql = resolveBigQuerySql(source);
+    assertReadOnlySelect(sql);
     var queryRequest = {
-      query: 'SELECT * FROM ' + tableRef,
+      query: sql,
       useLegacySql: false
     };
     var queryResults = BigQuery.Jobs.query(queryRequest, source.projectId);
