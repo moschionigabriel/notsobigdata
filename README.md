@@ -5,12 +5,13 @@ SQL, and orchestrate the whole pipeline, entirely inside a tool you
 probably already have open.
 
 > **Status: early-stage / pre-alpha.**
-> This library is still in the design phase. `move()`, `model()`, and
-> `orchestrate()` are not implemented yet. `src.js` currently contains only
-> a minimal smoke-test module (`NotSoBigData.helloWorld()`) that validates
-> the `eval(UrlFetchApp.fetch(...))` loading pattern described below —
-> everything else in this README describes the intended design, not
-> something you can run today. Watch this repo for progress.
+> This library is still taking shape. `move()` currently implements the
+> **extract** half only — reading a source into a 2D array — for Sheets,
+> Drive (CSV/XLSX/JSON), BigQuery, external APIs, and your own custom
+> extractor functions. Writing that array
+> into a target ("load") isn't implemented yet, so `move()` today only
+> takes a `source`, not a `target`. `model()` and `orchestrate()` are not
+> implemented yet either. Watch this repo for progress.
 
 ## What is this for?
 
@@ -53,21 +54,71 @@ eval(UrlFetchApp.fetch('https://raw.githubusercontent.com/moschionigabriel/notso
 
 ## Planned usage
 
-The examples below are illustrative of the intended API shape — not final,
-and not usable yet.
+The `model()` and `orchestrate()` examples below are illustrative of the
+intended API shape — not final, and not usable yet. `move()`'s extract side
+is implemented as shown.
 
 ### move()
 
+`move()` extracts a source into a 2D array — the same shape Apps Script
+already uses for Sheets ranges — regardless of where the source data comes
+from:
+
 ```javascript
-move({
-  source: { type: 'sheets', spreadsheetId: '...', range: 'Orders!A1:F' },
-  target: { type: 'bigquery', dataset: 'staging', table: 'orders' }
-})
+// Google Sheets — range is optional; omit it to read the whole active sheet
+move({ source: { type: 'sheets', spreadsheetId: '...', range: 'Orders!A1:F' } })
+
+// Drive file — fileType selects the parser: 'csv', 'xlsx', or 'json'
+move({ source: { type: 'drive', fileId: '...', fileType: 'csv' } })
+
+// BigQuery — exactly one of table, query, or queryFileId
+move({ source: { type: 'bigquery', projectId: '...', dataset: 'staging', table: 'orders' } })
+move({ source: { type: 'bigquery', projectId: '...', query: 'SELECT customer, SUM(amount) AS total FROM staging.orders GROUP BY 1' } })
+move({ source: { type: 'bigquery', projectId: '...', queryFileId: '<drive file id of a .sql file>' } })
+
+// External API — expects a JSON array of objects in the response body
+move({ source: { type: 'api', url: 'https://...', options: { /* UrlFetchApp params */ } } })
+
+// Custom — fn is a function you already defined in your own Apps Script
+// project; move() calls it as fn(source) and uses its return value directly
+function myCustomExtract(source) {
+  return [['col1', 'col2'], ['a', 1], ['b', 2]];
+}
+move({ source: { type: 'custom', fn: myCustomExtract } })
 ```
 
-Data always passes through as a 2D array internally — the same shape Apps
-Script already uses for Sheets ranges — so any source can feed any target.
-Planned connectors for v1: Google Sheets, Drive files (CSV/XLSX/JSON),
+For `drive` and `api` sources, a JSON array of objects is flattened into a
+header row plus data rows using the **union of every object's keys** as the
+column list — any object missing a given key just gets a blank cell there.
+`xlsx`
+files are converted to a temporary Google Sheet under the hood (Apps
+Script has no native XLSX parser), read, and the temporary copy is deleted
+immediately after — this requires the Advanced Drive Service enabled in
+your Apps Script project.
+
+For `bigquery` sources, `table`/`query`/`queryFileId` are mutually
+exclusive — pick one (`table` also requires `dataset`). `query` and
+`queryFileId` must be a single, read-only `SELECT` (a leading `WITH` is
+fine, for CTEs) — a multi-statement script (statements separated by `;`)
+or anything other than a read is rejected before it reaches BigQuery. This
+isn't a hard security boundary, just a keyword/shape check to keep
+`move()` read-only — declaring transformations that write or modify data
+is `model()`'s job, not `move()`'s.
+
+For `custom` sources, `fn` is a direct reference to a function you've
+already defined elsewhere in your Apps Script project — not a function
+name to look up, so there's no global-scope lookup or `eval` involved.
+`move()` calls it as `fn(source)`, passing the whole source object back in
+case your function needs any extra config keys you attached to it, and
+checks that the return value is an array of arrays — the same 2D-array
+shape every other extract function produces — but does not check cell
+types or that every row is the same length. Getting that part right is on
+you, just like it's on you to get a `bigquery` `query` string right.
+
+**Loading the extracted array into a `target` is not implemented yet** —
+`move()` only accepts `source` for now. Writing to Sheets/Drive/BigQuery
+targets is planned for a follow-up change. Planned connectors are the same
+on both sides once load lands: Google Sheets, Drive files (CSV/XLSX/JSON),
 BigQuery tables, and external APIs via `UrlFetchApp`.
 
 ### model()
