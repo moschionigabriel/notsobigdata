@@ -234,14 +234,252 @@ var NotSoBigData = (function () {
     }
   }
 
-  // Extracts a source into a 2D array. Loading into a target is not
-  // implemented yet — that half of "EL" lands in a follow-up change, so
-  // move() only accepts a source for now.
+  // Writes a 2D array into a sheet - either "overwrite" (default: clear
+  // the whole sheet, then write rows starting at A1) or "append" (write
+  // rows after the current last row, leaving existing content alone).
+  // Overwrite is the default here because the common case is refreshing a
+  // sheet to reflect the latest extract, and undoing an accidental
+  // overwrite in a spreadsheet is cheap - unlike loadBigQuery below, whose
+  // default leans the other way for exactly the opposite reason.
+  function loadSheets(rows, target) {
+    if (!target.spreadsheetId) {
+      throw new Error('move(): sheets target requires "spreadsheetId".');
+    }
+    var spreadsheet = SpreadsheetApp.openById(target.spreadsheetId);
+    var sheet = target.sheetName
+      ? (spreadsheet.getSheetByName(target.sheetName) || spreadsheet.insertSheet(target.sheetName))
+      : spreadsheet.getActiveSheet();
+    var mode = target.mode || 'overwrite';
+    if (mode !== 'overwrite' && mode !== 'append') {
+      throw new Error('move(): unsupported sheets target mode "' + mode + '". Expected "overwrite" or "append".');
+    }
+    if (mode === 'overwrite') {
+      sheet.clearContents();
+    }
+    if (rows.length === 0) {
+      return;
+    }
+    var startRow = mode === 'append' ? sheet.getLastRow() + 1 : 1;
+    sheet.getRange(startRow, 1, rows.length, rows[0].length).setValues(rows);
+  }
+
+  // Serializes a 2D array to CSV text, quoting only cells that need it.
+  // Shared by the drive csv target and the bigquery load job below, which
+  // uploads its data as CSV too.
+  function rowsToCsv(rows) {
+    return rows.map(function (row) {
+      return row.map(function (cell) {
+        var value = cell === null || cell === undefined ? '' : String(cell);
+        if (/[",\n]/.test(value)) {
+          value = '"' + value.replace(/"/g, '""') + '"';
+        }
+        return value;
+      }).join(',');
+    }).join('\n');
+  }
+
+  // Reverses objectsToRows: turns a header row + data rows back into an
+  // array of plain objects, keyed by the header. Shared by the drive json
+  // target and the api target, which both expect objects rather than raw
+  // rows on the way out - mirroring what their extract-side counterparts
+  // expect on the way in.
+  function rowsToObjects(rows) {
+    if (rows.length === 0) {
+      return [];
+    }
+    var headers = rows[0];
+    return rows.slice(1).map(function (row) {
+      var obj = {};
+      headers.forEach(function (key, i) {
+        obj[key] = row[i];
+      });
+      return obj;
+    });
+  }
+
+  // Writes text content to a drive target: overwrite an existing file by
+  // "fileId", or create a new one from "folderId" + "fileName". Shared by
+  // the drive csv and json targets, which only differ in how they
+  // serialize rows and which mimeType they create a new file with.
+  function writeDriveText(target, content, mimeType) {
+    if (target.fileId) {
+      DriveApp.getFileById(target.fileId).setContent(content);
+      return target.fileId;
+    }
+    if (!target.folderId || !target.fileName) {
+      throw new Error('move(): drive target requires either "fileId" (to overwrite an existing file) or both "folderId" and "fileName" (to create a new one).');
+    }
+    return DriveApp.getFolderById(target.folderId).createFile(target.fileName, content, mimeType).getId();
+  }
+
+  function loadDriveCsv(rows, target) {
+    return writeDriveText(target, rowsToCsv(rows), MimeType.CSV);
+  }
+
+  function loadDriveJson(rows, target) {
+    return writeDriveText(target, JSON.stringify(rowsToObjects(rows)), MimeType.PLAIN_TEXT);
+  }
+
+  // Builds the xlsx file via a temporary Google Sheet (Apps Script has no
+  // native XLSX writer, mirroring extractDriveXlsx's use of a temp copy in
+  // the opposite direction) and DriveApp's built-in getAs() converter, no
+  // Advanced Drive Service needed for that part. Overwriting an existing
+  // file by "fileId" does need the Advanced Drive Service, though - unlike
+  // csv/json, DriveApp has no way to replace a file's binary content in
+  // place, only Drive.Files.update() does. The temp sheet is always
+  // deleted afterward, including on error.
+  function loadDriveXlsx(rows, target) {
+    var tempSpreadsheet = SpreadsheetApp.create('notsobigdata-xlsx-export-' + Utilities.getUuid());
+    try {
+      if (rows.length > 0) {
+        tempSpreadsheet.getActiveSheet().getRange(1, 1, rows.length, rows[0].length).setValues(rows);
+      }
+      var blob = DriveApp.getFileById(tempSpreadsheet.getId()).getAs(MimeType.MICROSOFT_EXCEL);
+      if (target.fileId) {
+        Drive.Files.update({}, target.fileId, blob);
+        return target.fileId;
+      }
+      if (!target.folderId || !target.fileName) {
+        throw new Error('move(): drive target requires either "fileId" (to overwrite an existing file) or both "folderId" and "fileName" (to create a new one).');
+      }
+      return DriveApp.getFolderById(target.folderId).createFile(blob.setName(target.fileName)).getId();
+    } finally {
+      DriveApp.getFileById(tempSpreadsheet.getId()).setTrashed(true);
+    }
+  }
+
+  function loadDrive(rows, target) {
+    switch (target.fileType) {
+      case 'csv':
+        return loadDriveCsv(rows, target);
+      case 'json':
+        return loadDriveJson(rows, target);
+      case 'xlsx':
+        return loadDriveXlsx(rows, target);
+      default:
+        throw new Error('move(): unsupported drive target fileType "' + target.fileType + '". Expected "csv", "json", or "xlsx".');
+    }
+  }
+
+  // Loads rows into a BigQuery table via a load job (data uploaded as CSV,
+  // schema autodetected from the header row) rather than INSERT statements
+  // - the same approach BigQuery's own tooling uses for bulk loads, and it
+  // avoids building a manual schema. Defaults to "append" (WRITE_APPEND)
+  // rather than "overwrite" (WRITE_TRUNCATE): unlike loadSheets above,
+  // truncating a real table is destructive and hard to undo, so that mode
+  // must be opted into explicitly rather than risked by a missing
+  // "mode" key. Jobs.insert here doesn't long-poll the way
+  // getQueryResults does in extractBigQuery, so this polls job status
+  // itself with a short sleep between checks.
+  function loadBigQuery(rows, target) {
+    if (!target.projectId || !target.dataset || !target.table) {
+      throw new Error('move(): bigquery target requires "projectId", "dataset", and "table".');
+    }
+    var mode = target.mode || 'append';
+    var writeDisposition = mode === 'overwrite' ? 'WRITE_TRUNCATE' : mode === 'append' ? 'WRITE_APPEND' : null;
+    if (!writeDisposition) {
+      throw new Error('move(): unsupported bigquery target mode "' + mode + '". Expected "overwrite" or "append".');
+    }
+    if (rows.length === 0) {
+      return;
+    }
+    var blob = Utilities.newBlob(rowsToCsv(rows), 'text/csv');
+    var job = {
+      configuration: {
+        load: {
+          destinationTable: {
+            projectId: target.projectId,
+            datasetId: target.dataset,
+            tableId: target.table
+          },
+          sourceFormat: 'CSV',
+          skipLeadingRows: 1,
+          autodetect: true,
+          writeDisposition: writeDisposition
+        }
+      }
+    };
+    var insertedJob = BigQuery.Jobs.insert(job, target.projectId, blob);
+    var jobId = insertedJob.jobReference.jobId;
+    var status = insertedJob.status;
+    while (status.state !== 'DONE') {
+      Utilities.sleep(500);
+      status = BigQuery.Jobs.get(target.projectId, jobId).status;
+    }
+    if (status.errorResult) {
+      throw new Error('move(): bigquery load job failed - ' + status.errorResult.message);
+    }
+  }
+
+  // POSTs rows to an API endpoint as a JSON array of objects - the same
+  // shape extractApi expects to receive, so round-tripping data out to an
+  // API and back in stays symmetric. target.options can override the
+  // defaults (e.g. a different method or extra headers) since it's merged
+  // in after them.
+  function loadApi(rows, target) {
+    if (!target.url) {
+      throw new Error('move(): api target requires "url".');
+    }
+    var options = {
+      method: 'post',
+      contentType: 'application/json',
+      payload: JSON.stringify(rowsToObjects(rows))
+    };
+    if (target.options) {
+      Object.keys(target.options).forEach(function (key) {
+        options[key] = target.options[key];
+      });
+    }
+    var response = UrlFetchApp.fetch(target.url, options);
+    var responseCode = response.getResponseCode();
+    if (responseCode < 200 || responseCode >= 300) {
+      throw new Error('move(): api target request to "' + target.url + '" failed with HTTP ' + responseCode + '.');
+    }
+  }
+
+  // Runs a user-supplied loader function from the caller's own Apps
+  // Script project, same trust model as extractCustom: target.fn is a
+  // direct function reference, called as fn(rows, target) so it gets both
+  // the extracted data and whatever extra config keys the caller attached
+  // to the target.
+  function loadCustom(rows, target) {
+    if (typeof target.fn !== 'function') {
+      throw new Error('move(): custom target requires "fn" to be a function - got ' + typeof target.fn + '.');
+    }
+    target.fn(rows, target);
+  }
+
+  function load(rows, target) {
+    switch (target.type) {
+      case 'sheets':
+        return loadSheets(rows, target);
+      case 'drive':
+        return loadDrive(rows, target);
+      case 'bigquery':
+        return loadBigQuery(rows, target);
+      case 'api':
+        return loadApi(rows, target);
+      case 'custom':
+        return loadCustom(rows, target);
+      default:
+        throw new Error('move(): unsupported target type "' + target.type + '". Expected "sheets", "drive", "bigquery", "api", or "custom".');
+    }
+  }
+
+  // Extracts a source into a 2D array and, if a target is given, loads it
+  // there too. config.target is optional so extract-only calls keep
+  // working exactly as before - move() always returns the extracted rows
+  // either way, so a caller can inspect what was loaded or use it purely
+  // for extraction.
   function move(config) {
     if (!config || !config.source) {
       throw new Error('move(): config.source is required.');
     }
-    return extract(config.source);
+    var rows = extract(config.source);
+    if (config.target) {
+      load(rows, config.target);
+    }
+    return rows;
   }
 
   return {
