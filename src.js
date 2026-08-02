@@ -150,6 +150,25 @@ var NotSoBigData = (function () {
     return objectsToRows(parsed);
   }
 
+  // Runs a user-supplied extractor function from the caller's own Apps
+  // Script project. source.fn is a direct function reference (not a name
+  // to look up in global scope) since the config object is built in the
+  // same scope where the user's function already lives - no eval/global
+  // lookup needed. The user owns making sure fn's logic is correct; move()
+  // only checks the return value has the right outer shape (array of
+  // arrays), the same 2D-array contract every other extract function
+  // honors - it does not check cell types or that rows are equal length.
+  function extractCustom(source) {
+    if (typeof source.fn !== 'function') {
+      throw new Error('move(): custom source requires "fn" to be a function - got ' + typeof source.fn + '.');
+    }
+    var result = source.fn(source);
+    if (!Array.isArray(result) || !result.every(function (row) { return Array.isArray(row); })) {
+      throw new Error('move(): custom source\'s "fn" must return a 2D array (an array of arrays), just like every other move() extractor.');
+    }
+    return result;
+  }
+
   function extract(source) {
     switch (source.type) {
       case 'sheets':
@@ -160,8 +179,10 @@ var NotSoBigData = (function () {
         return extractBigQuery(source);
       case 'api':
         return extractApi(source);
+      case 'custom':
+        return extractCustom(source);
       default:
-        throw new Error('move(): unsupported source type "' + source.type + '". Expected "sheets", "drive", "bigquery", or "api".');
+        throw new Error('move(): unsupported source type "' + source.type + '". Expected "sheets", "drive", "bigquery", "api", or "custom".');
     }
   }
 
