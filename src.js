@@ -999,8 +999,9 @@ var NotSoBigData = (function () {
   function cli(input) {
     var parsed = parseCommand(input);
     if (parsed.command === 'help') {
-      Logger.log(usage());
-      return usage();
+      var helpText = usage();
+      Logger.log(helpText);
+      return helpText;
     }
     if (parsed.command === 'hello') {
       return hello();
