@@ -654,21 +654,206 @@ function load(rows, target) {
   }
 }
 
-// Extracts a source into a 2D array and, if a target is given, loads it
-// there too. config.target is optional so extract-only calls keep
-// working exactly as before - move() always returns the extracted rows
-// either way (a plain array, so rows.length/rows[i]/JSON.stringify(rows)
-// are all unaffected), so a caller can inspect what was loaded or use it
-// purely for extraction. When a target was given, whatever that load
-// function returned (a file id, a BigQuery job id, ...) is attached as
-// rows.loadResult - an extra property on the array, not a new element,
-// so it doesn't show up in rows.length or get serialized by
-// JSON.stringify(rows).
+// Per-cell test checks: given one cell's value (and the test's own extra
+// config, e.g. "values" for accepted_values), each returns pass/fail.
+// "unique" isn't here - it needs to see every value in the column before
+// it can say which ones repeat, so runOneTest below handles it separately
+// rather than forcing a stateful check into this one-cell-at-a-time shape.
+var CELL_CHECKS = {
+  not_null: function (value) {
+    return value !== '' && value !== null && value !== undefined;
+  },
+  accepted_values: function (value, test) {
+    return test.values.indexOf(value) !== -1;
+  },
+  min: function (value, test) {
+    return Number(value) >= test.value;
+  },
+  max: function (value, test) {
+    return Number(value) <= test.value;
+  },
+  regex: function (value, test) {
+    return new RegExp(test.pattern).test(String(value));
+  }
+};
+
+// Extra config key each check needs beyond "column"/"check", so a typo'd
+// or missing one (e.g. an accepted_values test with no "values") throws a
+// clear "move(): ..." message from validateTest below instead of a raw
+// TypeError from inside CELL_CHECKS two calls later.
+var TEST_CHECK_REQUIRES = {
+  accepted_values: 'values',
+  min: 'value',
+  max: 'value',
+  regex: 'pattern'
+};
+
+// Confirms one entry in config.tests is well-formed before it's run:
+// column/check present, check is one this file knows, the check's own
+// required extra key is there, and onFailure (if given) is a mode this
+// file supports. All of this is checked up front, for every test, rather
+// than discovered mid-run - a bad test should never pass silently just
+// because the rows it would have flagged happened not to appear.
+function validateTest(test) {
+  if (!test || typeof test.column !== 'string' || !test.column) {
+    throw new Error('move(): every entry in "tests" needs a "column" (a non-empty string).');
+  }
+  if (typeof test.check !== 'string' || (!CELL_CHECKS[test.check] && test.check !== 'unique')) {
+    throw new Error('move(): test on column "' + test.column + '" has an unsupported "check" ("' + test.check + '"). Expected one of: not_null, unique, accepted_values, min, max, regex.');
+  }
+  var requiredKey = TEST_CHECK_REQUIRES[test.check];
+  if (requiredKey && test[requiredKey] === undefined) {
+    throw new Error('move(): test on column "' + test.column + '" (check "' + test.check + '") requires "' + requiredKey + '".');
+  }
+  if (test.check === 'accepted_values' && !Array.isArray(test.values)) {
+    throw new Error('move(): test on column "' + test.column + '" (check "accepted_values") requires "values" to be an array.');
+  }
+  if (test.onFailure !== undefined && test.onFailure !== 'raise' && test.onFailure !== 'discard_row') {
+    throw new Error('move(): test on column "' + test.column + '" has an unsupported "onFailure" ("' + test.onFailure + '"). Expected "raise" or "discard_row".');
+  }
+}
+
+// Resolves a test's "column" to its index in the header row. A column
+// name that doesn't exist is a config mistake, not a silent no-op - same
+// posture as every other misconfiguration in this file.
+function resolveTestColumn(headers, test) {
+  var index = headers.indexOf(test.column);
+  if (index === -1) {
+    throw new Error('move(): test on column "' + test.column + '" (check "' + test.check + '") - no such column. Columns: ' + headers.join(', ') + '.');
+  }
+  return index;
+}
+
+// Runs one test against every data row (header already stripped), and
+// returns the 0-based indexes into dataRows that failed it. "unique" is
+// evaluated here rather than through CELL_CHECKS since it needs state
+// across rows: a null-prototype map of values seen so far, so a value
+// that happens to be "toString" or "__proto__" can't collide with the
+// map's own prototype. Blank/null cells are exempt from "unique" - "no
+// value" isn't a duplicate, and not_null already owns that check.
+function runOneTest(dataRows, columnIndex, test) {
+  var failing = [];
+  if (test.check === 'unique') {
+    var seen = Object.create(null);
+    dataRows.forEach(function (row, i) {
+      var value = row[columnIndex];
+      if (value === '' || value === null || value === undefined) {
+        return;
+      }
+      var key = String(value);
+      if (seen[key]) {
+        failing.push(i);
+      } else {
+        seen[key] = true;
+      }
+    });
+    return failing;
+  }
+  var check = CELL_CHECKS[test.check];
+  dataRows.forEach(function (row, i) {
+    if (!check(row[columnIndex], test)) {
+      failing.push(i);
+    }
+  });
+  return failing;
+}
+
+// Validates the rows a node is about to load, with a per-test severity,
+// instead of finding out only after bad data has landed. Every declared
+// test runs regardless of severity - failing that first, rather than
+// stopping at the first "raise" - so one call surfaces every violation at
+// once instead of finding them one run at a time.
+//
+// "raise" (the default here, and every test's default unless it or
+// config.onTestFailure says otherwise) throws one combined error naming
+// every failing test - matching the fail-fast posture everywhere else in
+// this file. "discard_row" drops just the rows that failed it and lets
+// the rest through unchanged; a row failing more than one discard_row
+// test is still only dropped once. Skipped entirely when there are no
+// tests or no data rows - same "empty means nothing to check" convention
+// as the rest of move().
+//
+// Row numbers in thrown/reported messages are 1-indexed with the header
+// counted as row 1 (dataRows[0] is row 2) - the same numbering a human
+// would see looking at this data in a spreadsheet.
+function runTests(rows, tests, defaultOnFailure) {
+  if (!Array.isArray(tests)) {
+    throw new Error('move(): "tests" must be an array of test objects.');
+  }
+  if (defaultOnFailure !== undefined && defaultOnFailure !== 'raise' && defaultOnFailure !== 'discard_row') {
+    throw new Error('move(): "onTestFailure" has an unsupported value ("' + defaultOnFailure + '"). Expected "raise" or "discard_row".');
+  }
+  if (!tests.length || rows.length === 0) {
+    return rows;
+  }
+
+  var headers = rows[0];
+  var dataRows = rows.slice(1);
+  var raiseFailures = [];
+  var discardedRows = Object.create(null);
+  var discardedCount = 0;
+
+  tests.forEach(function (test) {
+    validateTest(test);
+    var columnIndex = resolveTestColumn(headers, test);
+    var failing = runOneTest(dataRows, columnIndex, test);
+    if (!failing.length) {
+      return;
+    }
+    var onFailure = test.onFailure || defaultOnFailure || 'raise';
+    if (onFailure === 'raise') {
+      raiseFailures.push({
+        column: test.column,
+        check: test.check,
+        count: failing.length,
+        exampleRows: failing.slice(0, 5).map(function (i) { return i + 2; })
+      });
+    } else {
+      failing.forEach(function (i) {
+        if (!discardedRows[i]) {
+          discardedRows[i] = true;
+          discardedCount += 1;
+        }
+      });
+    }
+  });
+
+  if (raiseFailures.length) {
+    var summary = raiseFailures.map(function (f) {
+      return '"' + f.column + '" failed "' + f.check + '" on ' + f.count + ' row(s) (e.g. row ' + f.exampleRows.join(', ') + ')';
+    }).join('; ');
+    throw new Error('move(): data test(s) failed - ' + summary + '.');
+  }
+
+  if (discardedCount === 0) {
+    rows.testResults = { ran: tests.length, discarded: 0 };
+    return rows;
+  }
+
+  var kept = dataRows.filter(function (row, i) { return !discardedRows[i]; });
+  var result = [headers].concat(kept);
+  result.testResults = { ran: tests.length, discarded: discardedCount };
+  return result;
+}
+
+// Extracts a source into a 2D array, optionally checks it against
+// config.tests, and, if a target is given, loads it there too.
+// config.target is optional so extract-only calls keep working exactly as
+// before - move() always returns the (possibly test-filtered) rows either
+// way, so a caller can inspect or reuse them regardless. When a target
+// *was* given, whatever that load function returned (a file id, a
+// BigQuery job id, ...) is attached as rows.loadResult; when tests ran,
+// the pass/discard summary is attached as rows.testResults - both extra
+// properties on the array, not new elements, so they never show up in
+// rows.length or get serialized by JSON.stringify(rows).
 function move(config) {
   if (!config || !config.source) {
     throw new Error('move(): config.source is required.');
   }
   var rows = extract(config.source);
+  if (config.tests) {
+    rows = runTests(rows, config.tests, config.onTestFailure);
+  }
   if (config.target) {
     rows.loadResult = load(rows, config.target);
   }
