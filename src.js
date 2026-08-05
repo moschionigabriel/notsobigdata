@@ -1,4 +1,13 @@
+// GENERATED FILE - do not edit.
+//
+// Built from src/ by ./build.sh. Edit the modules there and rebuild;
+// any change made here directly is lost on the next build.
+//
+// Modules, in order: move.js model.js cli.js
 var NotSoBigData = (function () {
+  // ==================================================================
+  //   src/move.js
+  // ==================================================================
   // Flattens an array of plain objects into a 2D array: a header row made
   // from the union of every element's keys (not just the first element's —
   // JSON/API payloads commonly have optional fields that only show up on
@@ -629,14 +638,55 @@ var NotSoBigData = (function () {
   }
 
   // ==================================================================
-  // cli() - the library's single public entrypoint
+  //   src/model.js
   // ==================================================================
+  // model - the "T" of ELT. NOT IMPLEMENTED YET.
   //
-  // Everything above this line is machinery for moving data. Everything
-  // below is the declarative layer on top of it: instead of calling
-  // move() yourself, once per step, in the right order, you *declare*
-  // plain objects at the top level of your script and let cli() find
-  // them, order them by their dependencies, and run them. Same idea as
+  // This module is deliberately empty of code: it is the slot the model kind
+  // will fill, so adding it later is filling a file rather than rearranging
+  // the library. Because there is nothing executable here, the built src.js
+  // behaves exactly as if this file did not exist.
+  //
+  // The intended shape, for whoever writes it (see README.md's "The model
+  // kind" section for the user-facing version):
+  //
+  //   - A model is SQL, stored in an Apps Script .html file - one <script
+  //     type="text/sql"> tag per model - because .html is the only way to
+  //     keep a plain-text blob inside a GAS project, and HtmlService can
+  //     read it back at run time.
+  //
+  //   - Models reference each other dbt-style, with {{ ref('other_model') }}
+  //     placeholders inside the SQL. Those refs *are* the dependency
+  //     declaration: a model node derives its edges by parsing its own SQL
+  //     rather than repeating them in a hand-written dependsOn, and they get
+  //     substituted from the resolved graph just before the SQL runs.
+  //
+  //   - A declared node therefore looks like:
+  //       var ordersSummary = { kind: 'model', sqlFile: 'models/orders_summary.sql.html' };
+  //
+  // Wiring it up is one line in cli.js: add `model: model` to EXECUTORS.
+  // Everything else in cli.js - discovery, selection, ordering, the run
+  // loop - is kind-agnostic and needs no change. The one exception is
+  // dependency derivation: today discoverNodes() reads dependsOn off the
+  // config, so parsing {{ ref() }} into the same field is the one hook the
+  // model kind will need.
+  //
+  // Security note for whoever implements this: {{ ref() }} substitution is
+  // string interpolation into SQL. Only ever substitute a name that resolved
+  // to a known node in the graph - never interpolate arbitrary user text -
+  // or this becomes a SQL injection surface running under the script
+  // owner's live BigQuery credentials.
+
+  // ==================================================================
+  //   src/cli.js
+  // ==================================================================
+  // cli() - the library's single public entrypoint.
+  //
+  // The kind modules (move.js, model.js) are machinery for doing one step's
+  // work. This module is the declarative layer on top of them: instead of
+  // calling move() yourself, once per step, in the right order, you
+  // *declare* plain objects at the top level of your script and let cli()
+  // find them, order them by their dependencies, and run them. Same idea as
   // dbt, where you don't call each model - you write models and run
   // "dbt run --select ...".
 

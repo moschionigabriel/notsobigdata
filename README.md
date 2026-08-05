@@ -419,3 +419,9 @@ This is a clean-slate redesign, informed by an earlier prototype,
 [tinydeskdata](https://github.com/moschionigabriel/tinydeskdata), that
 proved out the same idea. Contribution guidelines and development workflow
 live in `CLAUDE.md` for now.
+
+If you're working *on* the library rather than with it: `src.js` is a
+generated file, built by `./build.sh` from the modules in `src/`
+(`move.js`, `model.js`, `cli.js`). Edit those and rebuild — edits made to
+`src.js` directly are overwritten by the next build. It stays committed so
+that installing remains a single `eval()` of a single URL.
