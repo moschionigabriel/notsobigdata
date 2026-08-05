@@ -98,6 +98,14 @@ eval(UrlFetchApp.fetch('https://raw.githubusercontent.com/moschionigabriel/notso
 > Declare your nodes at the top level of a file, and run `cli('hello')` if
 > you're ever unsure what the library can actually see.
 
+**A note on what you're trusting.** That URL points at the `main` branch,
+which means your project runs whatever `main` says today, with your OAuth
+access to your Drive, Sheets and BigQuery. That's the tradeoff for having no
+build step and no package manager: you get fixes automatically, and you're
+trusting this repo continuously rather than once. If you'd rather pin, swap
+`main` for a tag or a commit SHA in the URL and update it deliberately —
+same install, one word different.
+
 ## cli()
 
 `cli()` is the library's only public function. It takes one command string:
@@ -119,6 +127,12 @@ node **names**, so `--select move` means "every move node" and
 `--select=a,b` work. A token matching neither a kind nor a name is an error
 rather than an empty run — silently doing nothing is the failure this design
 guards against hardest.
+
+A token matching **both** — a node you named `move`, say, since a node's name
+defaults to its variable name — is also an error, for the same reason.
+Preferring the kind there would make `--exclude move` quietly drop every move
+node in the project when you meant to drop one. Rename the node, or name the
+ones you mean explicitly.
 
 `--select` selects exactly what it names; it does **not** pull in upstream
 dependencies, which are assumed to have run already. (dbt spells that
@@ -187,8 +201,13 @@ from or writes to.
 Node names must be unique, and every `dependsOn` entry must name a node that
 exists — both are checked before anything runs, against every declared node
 rather than just the selected ones, so narrowing a run with `--select` can
-never turn a typo into a silently ignored dependency. A dependency cycle is
-caught before anything runs too, and the error names the nodes involved.
+never turn a typo into a silently ignored dependency.
+
+A dependency cycle is caught before anything runs too, and the error names
+the nodes involved. Cycle detection runs against the *selected* nodes rather
+than all of them — edges pointing outside the selection are dropped, since
+running a subset means assuming its upstreams already ran, so a cycle passing
+through an unselected node can't deadlock the run anyway.
 
 ## The `move` kind — extract
 
@@ -358,6 +377,16 @@ skips the load job entirely instead of running `WRITE_TRUNCATE`/`WRITE_APPEND`
 against nothing. This matters most for unattended runs (a flaky source API,
 an empty query result, a misconfigured range) where nobody's watching to
 catch a real table or sheet getting silently blanked out.
+
+"Empty" means **no data rows**, and every source normalizes to the same
+thing: an extract with nothing in it returns `[]`. That's worth stating
+because the underlying APIs don't agree — a BigQuery query that matches no
+rows still returns its schema, and Sheets hands back `[['']]` (one row, one
+blank cell) for an empty sheet or a misconfigured range, as does parsing an
+empty CSV. Counted naively those look like one row of data and would sail
+straight past the protections above, so the extractors flatten them to `[]`
+first. One consequence worth knowing: a source holding *only* a header row
+is indistinguishable from an empty one, and is treated as empty.
 
 For `api` targets, `target.options` is merged in after the defaults
 (`method: 'post'`, JSON content type, JSON body), so you can override any

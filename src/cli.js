@@ -40,6 +40,27 @@ function has(map, key) {
   return Object.prototype.hasOwnProperty.call(map, key);
 }
 
+// Every lookup map below is built with this rather than {}, because has()
+// only fixes half the problem. It guards the *read* side; this guards the
+// *write* side, and the write side has a worse failure. Assigning
+// obj['__proto__'] = value on a plain object doesn't create an own property
+// at all - it sets the prototype - so a node named "__proto__" silently
+// vanishes from every map it was added to. The symptoms are absurd: a node
+// with no dependencies at all gets reported as a cycle, and a dependency on
+// it is reported as "not a declared node" while it sits right there in the
+// graph. A null prototype has no __proto__ setter to hijack, so the key
+// stores like any other.
+function emptyMap() {
+  return Object.create(null);
+}
+
+// Node lists appear in three different error messages and in hello()'s
+// output. Going through one helper keeps them rendering identically by
+// construction rather than by coincidence.
+function nodeNames(nodes) {
+  return nodes.map(function (node) { return node.name; });
+}
+
 var COMMANDS = ['run', 'list', 'hello', 'help'];
 
 function usage() {
@@ -66,10 +87,16 @@ function usage() {
 // "--select a,b" and "--select=a,b" are accepted because both spellings
 // are muscle memory for anyone who has used a real CLI.
 function parseCommand(input) {
-  if (typeof input !== 'string' || !input.replace(/\s/g, '')) {
+  var text = typeof input === 'string' ? input.trim() : '';
+  if (!text) {
     throw new Error('cli(): a command is required, e.g. cli("run").\n\n' + usage());
   }
-  var tokens = input.replace(/^\s+|\s+$/g, '').split(/\s+/);
+  // Collapse whitespace around commas before splitting on whitespace.
+  // Without this, "--select a, b" tokenizes as "--select", "a," and "b",
+  // and the parser rejects "b" as an unknown option - a confusing message
+  // for an input people write by reflex. A comma is the list separator, so
+  // it can never be part of a node name; closing the gap costs nothing.
+  var tokens = text.replace(/\s*,\s*/g, ',').split(/\s+/);
   var command = tokens.shift();
   if (COMMANDS.indexOf(command) === -1) {
     throw new Error('cli(): unknown command "' + command + '".\n\n' + usage());
@@ -91,13 +118,15 @@ function parseCommand(input) {
       value = tokens.length && tokens[0].indexOf('--') !== 0 ? tokens.shift() : '';
     }
     var list = value.split(',')
-      .map(function (item) { return item.replace(/^\s+|\s+$/g, ''); })
+      .map(function (item) { return item.trim(); })
       .filter(function (item) { return !!item; });
     if (!list.length) {
       throw new Error('cli(): "' + flag + '" needs a comma-separated value, e.g. ' + flag + ' orders,customers.');
     }
-    parsed[flag === '--select' ? 'select' : 'exclude'] =
-      parsed[flag === '--select' ? 'select' : 'exclude'].concat(list);
+    // Both flags are "--" plus the key they fill, and flag was validated
+    // above, so this is the key rather than a lookup that could miss.
+    var key = flag.slice(2);
+    parsed[key] = parsed[key].concat(list);
   }
   return parsed;
 }
@@ -130,21 +159,21 @@ function discoverNodes() {
   }
   var nodes = [];
   var ignored = [];
-  var claimedNames = {};
+  var claimedNames = emptyMap();
   keys.forEach(function (key) {
     var value;
-    try {
-      value = scope[key];
-    } catch (error) {
-      return;
-    }
-    if (!value || typeof value !== 'object' || Array.isArray(value)) {
-      return;
-    }
     var kind;
     var declaredName;
     var dependsOn;
+    // One guard covering every read of a global this library didn't
+    // declare: the property itself may throw on access, and so may any of
+    // its keys. Either way the answer is the same - it isn't one of ours,
+    // move on - so there's no reason to distinguish the two cases.
     try {
+      value = scope[key];
+      if (!value || typeof value !== 'object' || Array.isArray(value)) {
+        return;
+      }
       kind = value.kind;
       declaredName = value.name;
       dependsOn = value.dependsOn;
@@ -170,7 +199,11 @@ function discoverNodes() {
     if (dependsOn !== undefined && !Array.isArray(dependsOn)) {
       throw new Error('cli(): node "' + name + '" has a "dependsOn" that is not an array - got ' + typeof dependsOn + '.');
     }
-    (dependsOn || []).forEach(function (dependency) {
+    // Normalized once, here, so "no dependsOn means no edges" is stated in
+    // one place instead of at each use. The copy matters: the node's edges
+    // must not alias the caller's array, which they could mutate later.
+    var edges = dependsOn ? dependsOn.slice() : [];
+    edges.forEach(function (dependency) {
       if (typeof dependency !== 'string' || !dependency) {
         throw new Error('cli(): node "' + name + '" has a "dependsOn" entry that is not a node name string.');
       }
@@ -180,7 +213,7 @@ function discoverNodes() {
       kind: kind,
       variable: key,
       config: value,
-      dependsOn: (dependsOn || []).slice()
+      dependsOn: edges
     });
   });
   return { nodes: nodes, ignored: ignored };
@@ -191,12 +224,12 @@ function discoverNodes() {
 // "--select" narrowing what runs never turns a real typo into a
 // silently-ignored dependency.
 function assertDependenciesExist(nodes) {
-  var byName = {};
+  var byName = emptyMap();
   nodes.forEach(function (node) { byName[node.name] = true; });
   nodes.forEach(function (node) {
     node.dependsOn.forEach(function (dependency) {
       if (!has(byName, dependency)) {
-        throw new Error('cli(): node "' + node.name + '" dependsOn "' + dependency + '", which is not a declared node. Known nodes: ' + Object.keys(byName).join(', ') + '.');
+        throw new Error('cli(): node "' + node.name + '" dependsOn "' + dependency + '", which is not a declared node. Known nodes: ' + nodeNames(nodes).join(', ') + '.');
       }
     });
   });
@@ -209,14 +242,33 @@ function assertDependenciesExist(nodes) {
 // failure mode this whole design has to guard against hardest.
 function resolveSelector(nodes, token) {
   var byKind = nodes.filter(function (node) { return node.kind === token; });
-  if (byKind.length) {
-    return byKind.map(function (node) { return node.name; });
-  }
   var byName = nodes.filter(function (node) { return node.name === token; });
-  if (byName.length) {
-    return byName.map(function (node) { return node.name; });
+  // Matching both is ambiguous, and quietly preferring the kind is the one
+  // selector mistake in this design that wouldn't announce itself. A node's
+  // name defaults to its variable name, so "var move = { kind: 'move' }" is
+  // an easy thing to write - and then "--exclude move" drops every move
+  // node in the project instead of that one. Everything else here fails
+  // loudly; so does this.
+  if (byKind.length && byName.length) {
+    throw new Error('cli(): "' + token + '" is ambiguous - it is both a kind and the name of a declared node. Rename the node, or name the ones you mean explicitly: ' + nodeNames(byKind).join(', ') + '.');
   }
-  throw new Error('cli(): "' + token + '" matched no kind and no node name. Kinds: ' + knownKinds().join(', ') + '. Nodes: ' + nodes.map(function (node) { return node.name; }).join(', ') + '.');
+  var matches = byKind.length ? byKind : byName;
+  if (!matches.length) {
+    throw new Error('cli(): "' + token + '" matched no kind and no node name. Kinds: ' + knownKinds().join(', ') + '. Nodes: ' + nodeNames(nodes).join(', ') + '.');
+  }
+  return nodeNames(matches);
+}
+
+// Turns a list of selector tokens into a name lookup map. Shared by both
+// --select and --exclude so the two can't drift in how they resolve a
+// token - which is exactly what would happen the day dbt's "+" operators
+// get added to one branch and not the other.
+function namesMatching(nodes, tokens) {
+  var names = emptyMap();
+  tokens.forEach(function (token) {
+    resolveSelector(nodes, token).forEach(function (name) { names[name] = true; });
+  });
+  return names;
 }
 
 // Applies --select then --exclude. Note --select selects exactly what it
@@ -226,17 +278,11 @@ function resolveSelector(nodes, token) {
 function applySelection(nodes, select, exclude) {
   var selected = nodes;
   if (select.length) {
-    var wanted = {};
-    select.forEach(function (token) {
-      resolveSelector(nodes, token).forEach(function (name) { wanted[name] = true; });
-    });
+    var wanted = namesMatching(nodes, select);
     selected = selected.filter(function (node) { return has(wanted, node.name); });
   }
   if (exclude.length) {
-    var unwanted = {};
-    exclude.forEach(function (token) {
-      resolveSelector(nodes, token).forEach(function (name) { unwanted[name] = true; });
-    });
+    var unwanted = namesMatching(nodes, exclude);
     selected = selected.filter(function (node) { return !has(unwanted, node.name); });
   }
   return selected;
@@ -253,9 +299,9 @@ function applySelection(nodes, select, exclude) {
 // were validated to exist by assertDependenciesExist, and running a
 // subset means deliberately assuming its upstreams already ran.
 function orderNodes(nodes) {
-  var byName = {};
-  var waitingOn = {};
-  var dependents = {};
+  var byName = emptyMap();
+  var waitingOn = emptyMap();
+  var dependents = emptyMap();
   nodes.forEach(function (node) {
     byName[node.name] = node;
     waitingOn[node.name] = 0;
@@ -285,9 +331,12 @@ function orderNodes(nodes) {
     });
   }
   if (ordered.length !== nodes.length) {
-    var stuck = nodes
-      .filter(function (node) { return ordered.indexOf(node) === -1; })
-      .map(function (node) { return node.name; });
+    // A node is unplaced exactly when its counter never reached zero, which
+    // waitingOn already knows - no need to re-derive it by searching the
+    // ordered list for what's missing.
+    var stuck = nodeNames(nodes.filter(function (node) {
+      return waitingOn[node.name] > 0;
+    }));
     throw new Error('cli(): dependsOn forms a cycle - these nodes each wait on another one in the group: ' + stuck.join(', ') + '.');
   }
   return ordered;
@@ -308,7 +357,7 @@ function orderNodes(nodes) {
 // data the user would rather not have sitting in an execution log.
 function runNodes(nodes, dryRun) {
   var results = [];
-  var blocked = {};
+  var blocked = emptyMap();
   nodes.forEach(function (node) {
     var blockers = node.dependsOn.filter(function (dependency) { return has(blocked, dependency); });
     if (blockers.length) {
@@ -345,23 +394,24 @@ function runNodes(nodes, dryRun) {
 // scan can see the caller's declared nodes.
 function hello() {
   var lines = ['notsobigdata loaded OK. Kinds available: ' + knownKinds().join(', ') + '.'];
-  var discovered;
+  var discovered = null;
   try {
     discovered = discoverNodes();
   } catch (error) {
     lines.push('But discovering nodes failed: ' + error.message);
-    var failureMessage = lines.join('\n');
-    Logger.log(failureMessage);
-    return failureMessage;
   }
-  if (discovered.nodes.length) {
+  // Single exit below rather than an early return on the failure path, so
+  // there is only one place that decides how this message is logged and
+  // returned - two copies of that tail would drift the first time the
+  // format changes.
+  if (discovered && discovered.nodes.length) {
     lines.push('Discovered ' + discovered.nodes.length + ' node(s): ' + discovered.nodes.map(function (node) {
       return node.name + ' (' + node.kind + ')';
     }).join(', ') + '.');
-  } else {
+  } else if (discovered) {
     lines.push('Discovered 0 nodes. If you expected some, check they are declared as top-level "var"s - a config object declared inside a function is invisible to cli().');
   }
-  if (discovered.ignored.length) {
+  if (discovered && discovered.ignored.length) {
     lines.push('Ignored ' + discovered.ignored.length + ' object(s) with an unknown kind: ' + discovered.ignored.map(function (node) {
       return node.variable + ' (kind: "' + node.kind + '")';
     }).join(', ') + '.');

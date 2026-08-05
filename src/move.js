@@ -4,7 +4,22 @@
 // some records), followed by one row per element. Keys an element doesn't
 // have become blank cells rather than throwing.
 function objectsToRows(objects) {
-  if (!objects || objects.length === 0) {
+  // Checked before the emptiness test, not after: an envelope like
+  // {"data": [...]} - the most common JSON API shape there is - has no
+  // .length, so it slips past an emptiness check and dies inside reduce()
+  // with "objects.reduce is not a function". Every other misconfiguration
+  // in this file reports itself with a "move(): ..." message; this one
+  // should too, since the fix (unwrap the envelope) isn't obvious from a
+  // raw TypeError.
+  if (!Array.isArray(objects)) {
+    throw new Error(
+      'move(): expected a JSON array of objects, got ' +
+      (objects === null ? 'null' : typeof objects) +
+      '. If the payload wraps its rows in an envelope like {"data": [...]}, ' +
+      'unwrap it first with a "custom" source.'
+    );
+  }
+  if (objects.length === 0) {
     return [];
   }
   var headers = objects.reduce(function (keys, obj) {
@@ -24,6 +39,27 @@ function objectsToRows(objects) {
   return rows;
 }
 
+// True when a grid holds no actual content - either no rows at all, or
+// nothing but blank cells.
+//
+// This exists because "no data" doesn't arrive as [] from every source.
+// Sheets never hands back an empty grid: getValues() on an empty sheet or
+// a misconfigured range returns [['']] - one row, one blank cell - and
+// Utilities.parseCsv('') does the same. Counted naively that is "1 row of
+// data", which sails straight past the guards below that stop a target
+// being wiped by an empty extract (they all test rows.length === 0).
+//
+// So every extractor that can produce this shape normalizes it to [],
+// which is already what the objectsToRows path returns for an empty
+// payload. One contract, one meaning: an extract with no data is [].
+function isBlankGrid(rows) {
+  return !rows.length || rows.every(function (row) {
+    return row.every(function (cell) {
+      return cell === '' || cell === null || cell === undefined;
+    });
+  });
+}
+
 function extractSheets(source) {
   if (!source.spreadsheetId) {
     throw new Error('move(): sheets source requires "spreadsheetId".');
@@ -32,7 +68,8 @@ function extractSheets(source) {
   var range = source.range
     ? spreadsheet.getRange(source.range)
     : spreadsheet.getActiveSheet().getDataRange();
-  return range.getValues();
+  var values = range.getValues();
+  return isBlankGrid(values) ? [] : values;
 }
 
 // Reads a Drive file's full text content. Shared by the drive csv/json
@@ -43,7 +80,8 @@ function readDriveFileText(fileId) {
 }
 
 function extractDriveCsv(fileId) {
-  return Utilities.parseCsv(readDriveFileText(fileId));
+  var values = Utilities.parseCsv(readDriveFileText(fileId));
+  return isBlankGrid(values) ? [] : values;
 }
 
 function extractDriveJson(fileId) {
@@ -66,7 +104,8 @@ function extractDriveXlsx(fileId) {
   );
   try {
     var spreadsheet = SpreadsheetApp.openById(tempFileMetadata.id);
-    return spreadsheet.getActiveSheet().getDataRange().getValues();
+    var values = spreadsheet.getActiveSheet().getDataRange().getValues();
+    return isBlankGrid(values) ? [] : values;
   } finally {
     Drive.Files.remove(tempFileMetadata.id);
   }
@@ -170,6 +209,15 @@ function extractBigQuery(source) {
     pageToken = queryResults.pageToken;
   } while (pageToken);
 
+  // A query that matched nothing still comes back with a schema, so rows is
+  // [headers] at this point: one row, zero data. Left as-is it would defeat
+  // every empty-extract guard downstream and let a WRITE_TRUNCATE load job
+  // empty the destination table on the morning an upstream source is late -
+  // exactly the unattended-run scenario those guards exist for. Same
+  // contract as everywhere else: no data means [].
+  if (rows.length === 1) {
+    return [];
+  }
   return rows;
 }
 
