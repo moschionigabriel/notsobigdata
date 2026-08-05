@@ -9,9 +9,19 @@
 // "dbt run --select ...".
 
 // Maps a node's "kind" to the function that executes one node's config.
-// This is the only place a kind is registered: discovery, selection,
-// ordering and the run loop below are all kind-agnostic, so adding
-// model() later means adding one entry here and nothing else.
+// This is the only place a kind is registered for *execution*: selection,
+// ordering and the run loop below are all kind-agnostic, and knownKinds()
+// feeds the help text, the selector errors and hello(), so all of those
+// pick up a new kind from this map alone.
+//
+// One honest caveat, so nobody discovers it mid-change: discovery is
+// kind-agnostic only for kinds whose edges are hand-written. discoverNodes()
+// below reads dependencies straight off config.dependsOn, and the planned
+// model kind derives its edges by parsing {{ ref() }} out of its SQL
+// instead. So adding model() means an entry here *plus* a per-kind hook for
+// deriving dependsOn. That hook doesn't exist yet - it isn't written
+// speculatively, because the kind that needs it isn't written either, and
+// guessing its shape now is how you get the wrong abstraction.
 var EXECUTORS = {
   move: move
 };

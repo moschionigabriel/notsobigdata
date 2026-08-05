@@ -47,6 +47,18 @@ for file in $MODULES; do
   fi
 done
 
+# The footer below hardcodes the one name the library exports: cli. That is a
+# deliberate design decision ("exactly one public function"), but it means a
+# rename or typo in cli.js would still build cleanly, still pass --check
+# (which only diffs the output against a fresh build of the same source), and
+# then throw ReferenceError inside every consumer's Apps Script project at
+# eval time - findable only by a human running GAS by hand, the slowest
+# feedback loop this project has. One grep closes that gap here instead.
+if ! grep -q '^function cli(' src/cli.js; then
+  echo "build.sh: src/cli.js does not declare 'function cli(' - the built file exports cli, so this would produce a src.js that throws ReferenceError on load." >&2
+  exit 1
+fi
+
 build() {
   local dest="$1"
   {
@@ -85,9 +97,9 @@ if [ "${1:-}" = "--check" ]; then
   expected="$(mktemp)"
   trap 'rm -f "$expected"' EXIT
   build "$expected"
-  if ! diff -u "$OUTPUT" "$expected" > /dev/null 2>&1; then
+  if ! delta="$(diff -u "$OUTPUT" "$expected")"; then
     echo "build.sh: $OUTPUT is stale - it does not match src/. Run ./build.sh and commit the result." >&2
-    diff -u "$OUTPUT" "$expected" >&2 || true
+    printf '%s\n' "$delta" >&2
     exit 1
   fi
   echo "build.sh: $OUTPUT is up to date."
@@ -99,5 +111,15 @@ if [ $# -gt 0 ]; then
   exit 1
 fi
 
-build "$OUTPUT"
+# Build to a temp file and move it into place, rather than redirecting into
+# src.js directly. A direct redirect truncates the target before writing, so
+# a mid-build failure (an unreadable module, a disk error) would leave a
+# half-written src.js on disk - and src.js is the file consumers eval(), so
+# "broken but present" is the worst possible state to fail into. The mv is
+# atomic within a filesystem: either the old file or the complete new one.
+staged="$(mktemp)"
+trap 'rm -f "$staged"' EXIT
+build "$staged"
+mv "$staged" "$OUTPUT"
+trap - EXIT
 echo "build.sh: wrote $OUTPUT from src/ ($MODULES)."

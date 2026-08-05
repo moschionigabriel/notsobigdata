@@ -664,12 +664,18 @@ var NotSoBigData = (function () {
   //   - A declared node therefore looks like:
   //       var ordersSummary = { kind: 'model', sqlFile: 'models/orders_summary.sql.html' };
   //
-  // Wiring it up is one line in cli.js: add `model: model` to EXECUTORS.
-  // Everything else in cli.js - discovery, selection, ordering, the run
-  // loop - is kind-agnostic and needs no change. The one exception is
-  // dependency derivation: today discoverNodes() reads dependsOn off the
-  // config, so parsing {{ ref() }} into the same field is the one hook the
-  // model kind will need.
+  // Wiring it up takes two changes in cli.js, not one:
+  //
+  //   1. Add `model: model` to EXECUTORS. That covers execution, and it also
+  //      gets the kind into the help text, the selector errors and hello(),
+  //      which all read knownKinds() off that map.
+  //
+  //   2. Add a per-kind hook for deriving dependencies. discoverNodes() reads
+  //      dependsOn straight off the config today, which is right for move but
+  //      wrong for model - a model's edges come from parsing {{ ref() }} out
+  //      of its SQL. Selection, ordering and the run loop stay untouched:
+  //      they only need the derived edges, not knowledge of where they came
+  //      from. Keep it that way; the hook is the whole kind-specific surface.
   //
   // Security note for whoever implements this: {{ ref() }} substitution is
   // string interpolation into SQL. Only ever substitute a name that resolved
@@ -691,9 +697,19 @@ var NotSoBigData = (function () {
   // "dbt run --select ...".
 
   // Maps a node's "kind" to the function that executes one node's config.
-  // This is the only place a kind is registered: discovery, selection,
-  // ordering and the run loop below are all kind-agnostic, so adding
-  // model() later means adding one entry here and nothing else.
+  // This is the only place a kind is registered for *execution*: selection,
+  // ordering and the run loop below are all kind-agnostic, and knownKinds()
+  // feeds the help text, the selector errors and hello(), so all of those
+  // pick up a new kind from this map alone.
+  //
+  // One honest caveat, so nobody discovers it mid-change: discovery is
+  // kind-agnostic only for kinds whose edges are hand-written. discoverNodes()
+  // below reads dependencies straight off config.dependsOn, and the planned
+  // model kind derives its edges by parsing {{ ref() }} out of its SQL
+  // instead. So adding model() means an entry here *plus* a per-kind hook for
+  // deriving dependsOn. That hook doesn't exist yet - it isn't written
+  // speculatively, because the kind that needs it isn't written either, and
+  // guessing its shape now is how you get the wrong abstraction.
   var EXECUTORS = {
     move: move
   };
