@@ -230,6 +230,19 @@ source: { type: 'bigquery', projectId: '...', queryFileId: '<drive file id of a 
 // External API — expects a JSON array of objects in the response body
 source: { type: 'api', url: 'https://...', options: { /* UrlFetchApp params */ } }
 
+// External API, enveloped and paginated — e.g. the YouTube Data API v3,
+// whose responses look like {"items": [...], "nextPageToken": "..."}.
+// "envelope" points at the array inside the body; "pagination" repeats the
+// request with the resolved token attached as a query param until the API
+// stops returning one, up to "maxPages"
+source: {
+  type: 'api',
+  url: 'https://www.googleapis.com/youtube/v3/search?part=snippet&channelId=UCxxxx&maxResults=50',
+  options: { headers: { Authorization: 'Bearer ' + ScriptApp.getOAuthToken() } },
+  envelope: 'items',
+  pagination: { param: 'pageToken', tokenPath: 'nextPageToken', maxPages: 10 }
+}
+
 // Custom — fn is a function you already defined in your own Apps Script
 // project; it's called as fn(source) and its return value is used directly
 function myCustomExtract(source) {
@@ -246,6 +259,29 @@ column list — any object missing a given key just gets a blank cell there.
 Script has no native XLSX parser), read, and the temporary copy is deleted
 immediately after — this requires the Advanced Drive Service enabled in
 your Apps Script project.
+
+`api` sources also accept two optional keys for REST APIs that don't hand
+back a bare JSON array — both omittable, and omitting both keeps the
+behavior above unchanged:
+
+- `envelope`: a dot-path (`'items'`, `'data.results'`) to where the array
+  actually lives in the response body, for a payload shaped like
+  `{"items": [...]}` instead of a bare `[...]`.
+- `pagination`: `{ param, tokenPath, maxPages }` to follow a cursor across
+  multiple pages instead of reading just the first one. After each fetch,
+  `tokenPath` (another dot-path) is looked up in that page's body; if it
+  resolves to something truthy, the next request repeats with that value
+  attached to the URL as the `param` query parameter, and so on until
+  `tokenPath` comes back empty (the normal end-of-results signal) or
+  `maxPages` requests have been made, whichever comes first. `maxPages` is
+  required whenever `pagination` is given — there's no default, since a
+  paginated request with no cap is a request that can, in principle, never
+  stop. Every page's rows are combined into one result, with one header row
+  that's the union of every page's keys, same as a non-paginated response.
+
+This is exactly the shape of the YouTube Data API v3 (and most Google
+REST APIs): `envelope: 'items'`, `pagination: { param: 'pageToken',
+tokenPath: 'nextPageToken', maxPages: N }`, shown above.
 
 For `bigquery` sources, `table`/`query`/`queryFileId` are mutually
 exclusive — pick one (`table` also requires `dataset`). `query` and
@@ -268,6 +304,16 @@ config keys you attached to it, and the return value is checked to be an
 array of arrays — the same 2D-array shape every other extract produces —
 but cell types and row lengths aren't checked. Getting that right is on
 you, just like getting a `bigquery` `query` string right is.
+
+A `custom` source is also the way to reach a Google **Advanced Service** —
+`YouTube.Search.list()`, Analytics, Calendar, and so on — instead of a raw
+REST call: those are native Apps Script method calls, not URL fetches, so
+they can never go through an `api` source's `url`. Note this library's own
+internals (including the pagination-walking logic behind the `api`
+source's `pagination` key, above) aren't reachable from a `custom` `fn` —
+`cli()` is the library's only exposed function — so an
+Advanced-Service-backed source that needs to page through results has to
+walk them itself inside `fn`.
 
 ## The `move` kind — load
 
