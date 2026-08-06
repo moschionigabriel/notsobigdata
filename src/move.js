@@ -39,6 +39,20 @@ function objectsToRows(objects) {
   return rows;
 }
 
+// Looks up a dot-path ('items', 'data.results') inside a parsed JSON
+// value. Shared by the api source's "envelope" (where the row array lives
+// in the response body) and "pagination.tokenPath" (where the next-page
+// token lives) - both are "find this value somewhere inside a nested
+// object" in the same way, just pointed at different paths. Walks off the
+// end of a missing branch by returning undefined rather than throwing, so
+// a token path that's absent on the last page (the normal way a paginated
+// API says "no more pages") reads as "no next token" instead of a crash.
+function resolvePath(obj, path) {
+  return path.split('.').reduce(function (value, key) {
+    return (value === null || value === undefined) ? undefined : value[key];
+  }, obj);
+}
+
 // True when a grid holds no actual content - either no rows at all, or
 // nothing but blank cells.
 //
@@ -221,19 +235,97 @@ function extractBigQuery(source) {
   return rows;
 }
 
-// Expects the API to respond with a JSON array of objects, using the
-// same key-union flattening as Drive JSON sources.
+// Adds a query-string parameter to a URL, whether or not it already has
+// one - used to attach a resolved pagination token to each page after the
+// first. Both the param name and value are URI-encoded since a token is
+// server-generated, opaque data, not something move()'s caller composed
+// by hand.
+function appendQueryParam(url, param, value) {
+  var separator = url.indexOf('?') === -1 ? '?' : '&';
+  return url + separator + encodeURIComponent(param) + '=' + encodeURIComponent(value);
+}
+
+// Walks a cursor-paginated API: calls fetchPage(token) - undefined on the
+// first call, then whatever resolvePath(page, options.tokenPath) found on
+// the page before it - until that token comes back falsy (the normal
+// end-of-results signal) or options.maxPages pages have been fetched,
+// whichever comes first. Deliberately knows nothing about HTTP: fetchPage
+// just has to hand back one page's parsed body, so this same loop works
+// for extractApi's UrlFetchApp calls below and equally for a "custom"
+// source wrapping a native Advanced Service call (e.g. YouTube.Search.list,
+// which returns the same enveloped/paginated shape but isn't a URL fetch
+// at all) - see README.md's api source section for that pattern. Every
+// page's rows are accumulated as plain objects and only turned into a 2D
+// array once, at the end, via one objectsToRows() call - so the header
+// row is the union of every page's keys, the same "optional fields don't
+// throw" behavior objectsToRows already gives a single page.
+//
+// options.maxPages is required, not defaulted, the same fail-loud posture
+// as assertReadOnlySelect/resolveBigQuerySql: an API that never stops
+// returning a next-page token (a bug on its end, or a misconfigured
+// tokenPath that keeps re-reading the same value) would otherwise loop
+// until Apps Script's own execution-time limit kills the run.
+function extractPaginated(fetchPage, options) {
+  if (!options || typeof options.tokenPath !== 'string' || !options.tokenPath) {
+    throw new Error('move(): pagination requires "tokenPath".');
+  }
+  if (typeof options.maxPages !== 'number' || options.maxPages < 1) {
+    throw new Error('move(): pagination requires "maxPages" (a positive number) as a safety cap on how many pages to fetch.');
+  }
+  var allObjects = [];
+  var token;
+  var pageCount = 0;
+  do {
+    var page = fetchPage(token);
+    var pageObjects = options.envelope ? resolvePath(page, options.envelope) : page;
+    if (!Array.isArray(pageObjects)) {
+      throw new Error('move(): pagination envelope "' + options.envelope + '" did not resolve to an array on page ' + (pageCount + 1) + '.');
+    }
+    allObjects = allObjects.concat(pageObjects);
+    token = resolvePath(page, options.tokenPath);
+    pageCount++;
+  } while (token && pageCount < options.maxPages);
+  return objectsToRows(allObjects);
+}
+
+// Expects the API to respond with a JSON array of objects, using the same
+// key-union flattening as Drive JSON sources - unless "envelope" says the
+// array lives somewhere else in the body (e.g. 'items' for a response
+// shaped {"items": [...]}), which resolvePath digs out first. Omitting
+// "envelope" is byte-identical to this function's original behavior: the
+// body itself must already be the array, and objectsToRows' own error
+// message is what points a caller at "envelope" (or a "custom" source) if
+// it isn't.
+//
+// "pagination" (optional: {param, tokenPath, maxPages}) hands the actual
+// page-walking off to extractPaginated above - this function's only job
+// is supplying fetchPage: build the next page's URL by attaching the
+// previous page's resolved token as a query param (the first call has no
+// token yet, so it fetches source.url unchanged), fetch it, and parse the
+// JSON body. See extractPaginated's own comment for why maxPages is
+// required whenever pagination is used at all.
 function extractApi(source) {
   if (!source.url) {
     throw new Error('move(): api source requires "url".');
   }
-  var response = UrlFetchApp.fetch(source.url, source.options || {});
-  var responseCode = response.getResponseCode();
-  if (responseCode < 200 || responseCode >= 300) {
-    throw new Error('move(): api source request to "' + source.url + '" failed with HTTP ' + responseCode + '.');
+  function fetchOnePage(token) {
+    var url = token === undefined ? source.url : appendQueryParam(source.url, source.pagination.param, token);
+    var response = UrlFetchApp.fetch(url, source.options || {});
+    assertHttpOk(response, 'move(): api source request to "' + url + '" failed');
+    return JSON.parse(response.getContentText());
   }
-  var parsed = JSON.parse(response.getContentText());
-  return objectsToRows(parsed);
+  if (source.pagination) {
+    if (!source.pagination.param) {
+      throw new Error('move(): api source "pagination" requires "param" (the query-string parameter to set with the resolved token on subsequent requests).');
+    }
+    return extractPaginated(fetchOnePage, {
+      envelope: source.envelope,
+      tokenPath: source.pagination.tokenPath,
+      maxPages: source.pagination.maxPages
+    });
+  }
+  var parsed = fetchOnePage();
+  return objectsToRows(source.envelope ? resolvePath(parsed, source.envelope) : parsed);
 }
 
 // Runs a user-supplied extractor function from the caller's own Apps
