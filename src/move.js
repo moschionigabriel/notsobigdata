@@ -260,17 +260,18 @@ function appendQueryParam(url, param, value) {
 // first call, then whatever resolvePath(page, options.tokenPath) found on
 // the page before it - until that token comes back undefined (tokenPath
 // wasn't present on that page at all - the normal end-of-results signal)
-// or options.maxPages pages have been fetched,
-// whichever comes first. Deliberately knows nothing about HTTP: fetchPage
-// just has to hand back one page's parsed body, so this same loop works
-// for extractApi's UrlFetchApp calls below and equally for a "custom"
-// source wrapping a native Advanced Service call (e.g. YouTube.Search.list,
-// which returns the same enveloped/paginated shape but isn't a URL fetch
-// at all) - see README.md's api source section for that pattern. Every
-// page's rows are accumulated as plain objects and only turned into a 2D
-// array once, at the end, via one objectsToRows() call - so the header
-// row is the union of every page's keys, the same "optional fields don't
-// throw" behavior objectsToRows already gives a single page.
+// or options.maxPages pages have been fetched, whichever comes first.
+// Written knowing nothing about HTTP on purpose - fetchPage just has to
+// hand back one page's parsed body - even though extractApi below is
+// currently its only caller: cli.js's IIFE exposes only cli() (see
+// CLAUDE.md, "One public entrypoint"), so this function itself is not
+// reachable from a "custom" source's fn the way extractApi's other pieces
+// aren't either; a custom source wrapping a native Advanced Service call
+// (e.g. YouTube.Search.list()) would have to walk its own pages by hand.
+// Every page's rows are accumulated as plain objects and only turned into
+// a 2D array once, at the end, via one objectsToRows() call - so the
+// header row is the union of every page's keys, the same "optional
+// fields don't throw" behavior objectsToRows already gives a single page.
 //
 // options.maxPages is required, not defaulted, the same fail-loud posture
 // as assertReadOnlySelect/resolveBigQuerySql: an API that never stops

@@ -305,31 +305,15 @@ array of arrays — the same 2D-array shape every other extract produces —
 but cell types and row lengths aren't checked. Getting that right is on
 you, just like getting a `bigquery` `query` string right is.
 
-A `custom` source is also how you reach a Google **Advanced Service** —
+A `custom` source is also the way to reach a Google **Advanced Service** —
 `YouTube.Search.list()`, Analytics, Calendar, and so on — instead of a raw
 REST call: those are native Apps Script method calls, not URL fetches, so
-they can never go through an `api` source's `url`. They tend to come back
-in the same enveloped/paginated shape a REST API does, though, so rather
-than hand-writing that loop, a `custom` source can call `extractPaginated`
-directly — the same function the `api` source's own `pagination` support
-(above) is built on. `extractPaginated` doesn't know anything about
-`UrlFetchApp`; it just calls a `fetchPage(token)` function you supply,
-which for an Advanced Service is a single method call:
-
-```javascript
-source: {
-  type: 'custom',
-  fn: function () {
-    return extractPaginated(function (token) {
-      return YouTube.Search.list('snippet', { channelId: 'UCxxxx', maxResults: 50, pageToken: token || undefined });
-    }, { envelope: 'items', tokenPath: 'nextPageToken', maxPages: 10 });
-  }
-}
-```
-
-This works with no import or export step, because every function in the
-library and every config object you write share one global scope once
-`eval()` has run — see "Installation" below.
+they can never go through an `api` source's `url`. Note this library's own
+internals (including the pagination-walking logic behind the `api`
+source's `pagination` key, above) aren't reachable from a `custom` `fn` —
+`cli()` is the library's only exposed function — so an
+Advanced-Service-backed source that needs to page through results has to
+walk them itself inside `fn`.
 
 ## The `move` kind — load
 
