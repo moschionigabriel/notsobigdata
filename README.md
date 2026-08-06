@@ -400,6 +400,73 @@ config keys you attached to it — same trust model as a `custom` source's
 name to look up. Its return value becomes `.loadResult`, mirroring how a
 `custom` *source*'s return value becomes the extracted rows.
 
+## The `move` kind — tests
+
+`tests` is an optional array of checks run against the extracted rows,
+before a `target` (if any) is loaded — validate what's about to be
+written, with a declared severity, instead of finding out only after bad
+data has landed. Each entry names a `column` (by header) and a `check`:
+
+```javascript
+tests: [
+  { column: 'order_id', check: 'not_null' },
+  { column: 'order_id', check: 'unique' },
+  { column: 'status', check: 'accepted_values', values: ['open', 'closed', 'refunded'] },
+  { column: 'amount', check: 'min', value: 0 },
+  { column: 'discount', check: 'max', value: 1 },
+  { column: 'email', check: 'regex', pattern: '^[^@]+@[^@]+\\.[^@]+$' }
+]
+```
+
+`accepted_values` needs `values` (an array) and checks each cell against
+it with exact equality, no type coercion — a numeric or boolean cell from
+a typed source (Sheets, BigQuery) won't match a config array of strings,
+so stringify `values` (or the source column) if that matters for your
+data. `min`/`max` need `value` (a number — cells are coerced with
+`Number()` before comparing) and, like `not_null` and `unique`, treat a
+blank/`null`/`undefined` cell as "no value" rather than `0` — a blank cell
+fails a `min`/`max` test instead of silently satisfying it. `regex` needs
+`pattern` (a string); it's validated and compiled once when the node
+runs, not once per cell, so an invalid pattern is a clear `move(): ...`
+config error the moment you run it rather than a raw `SyntaxError` buried
+inside a failing row. `unique` skips blank cells rather than counting
+repeats of "nothing" as a duplicate, since `not_null` already owns that
+check.
+
+Every test's own shape — a known `check`, its required extra key, a
+`regex` pattern that actually compiles — is validated the moment the node
+runs, even if the extract came back with zero data rows to check: a
+misconfigured test throws immediately rather than staying silent until a
+run happens to see real data. Once there is data, every test still runs
+regardless of outcome, before any decision is made — one `move()` call
+reports every violation at once rather than stopping at the first
+failure. What happens to a failing test is controlled by `onFailure`,
+settable per test or once for the whole node via `onTestFailure`
+(node-level is the fallback when a test doesn't set its own); the default
+is `'raise'` either way:
+
+- `'raise'` — throws one combined `move(): ...` error listing every
+  failing test, its failure count, and a few example row numbers (1-indexed
+  as a human would read them in a spreadsheet, header counted as row 1).
+  The error aborts the node like any other `move()` misconfiguration, so
+  `cli()`'s existing failure propagation applies: any node that
+  `dependsOn` this one is skipped, not just this one failing — see
+  "What cli() returns" above.
+- `'discard_row'` — drops just the rows that failed it and lets the rest
+  load normally; a row failing more than one `discard_row` test is only
+  dropped once. The node still reports `'success'`, so nothing downstream
+  is blocked — pick this only for checks where loading the good 99% and
+  quietly dropping the bad 1% is actually the outcome you want.
+
+Either way, a pass/discard summary is attached as `result.testResults`
+(`{ ran, discarded }`) — an extra property on the returned rows array,
+same non-intrusive pattern as `.loadResult`. Tests are skipped entirely
+when there are no data rows to check, consistent with "empty means `[]`"
+everywhere else in `move`.
+
+Referential checks across tables (dbt's `relationships` test) are out of
+scope — they'd need to query another table, which isn't `move`'s job.
+
 ## The `model` kind — not implemented yet
 
 The plan, illustrative of the intended shape and not usable today: SQL
