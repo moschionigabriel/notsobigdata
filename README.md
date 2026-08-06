@@ -418,19 +418,32 @@ tests: [
 ]
 ```
 
-`accepted_values` needs `values` (an array), `min`/`max` need `value` (a
-number — cells are coerced with `Number()` before comparing), and `regex`
-needs `pattern` (a string, compiled with `new RegExp()`). `unique` and
-`not_null` treat a blank/`null`/`undefined` cell as "no value" — `unique`
-skips those cells rather than counting repeats of "nothing" as a
-duplicate, since `not_null` already owns that check.
+`accepted_values` needs `values` (an array) and checks each cell against
+it with exact equality, no type coercion — a numeric or boolean cell from
+a typed source (Sheets, BigQuery) won't match a config array of strings,
+so stringify `values` (or the source column) if that matters for your
+data. `min`/`max` need `value` (a number — cells are coerced with
+`Number()` before comparing) and, like `not_null` and `unique`, treat a
+blank/`null`/`undefined` cell as "no value" rather than `0` — a blank cell
+fails a `min`/`max` test instead of silently satisfying it. `regex` needs
+`pattern` (a string); it's validated and compiled once when the node
+runs, not once per cell, so an invalid pattern is a clear `move(): ...`
+config error the moment you run it rather than a raw `SyntaxError` buried
+inside a failing row. `unique` skips blank cells rather than counting
+repeats of "nothing" as a duplicate, since `not_null` already owns that
+check.
 
-Every test runs, regardless of outcome, before any decision is made — one
-`move()` call reports every violation at once rather than stopping at the
-first failure. What happens to a failing test is controlled by
-`onFailure`, settable per test or once for the whole node via
-`onTestFailure` (node-level is the fallback when a test doesn't set its
-own); the default is `'raise'` either way:
+Every test's own shape — a known `check`, its required extra key, a
+`regex` pattern that actually compiles — is validated the moment the node
+runs, even if the extract came back with zero data rows to check: a
+misconfigured test throws immediately rather than staying silent until a
+run happens to see real data. Once there is data, every test still runs
+regardless of outcome, before any decision is made — one `move()` call
+reports every violation at once rather than stopping at the first
+failure. What happens to a failing test is controlled by `onFailure`,
+settable per test or once for the whole node via `onTestFailure`
+(node-level is the fallback when a test doesn't set its own); the default
+is `'raise'` either way:
 
 - `'raise'` — throws one combined `move(): ...` error listing every
   failing test, its failure count, and a few example row numbers (1-indexed
