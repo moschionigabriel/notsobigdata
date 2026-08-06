@@ -47,9 +47,20 @@ function objectsToRows(objects) {
 // end of a missing branch by returning undefined rather than throwing, so
 // a token path that's absent on the last page (the normal way a paginated
 // API says "no more pages") reads as "no next token" instead of a crash.
+//
+// Checked with hasOwnProperty rather than a plain value[key] lookup - a
+// path segment that names an inherited Object.prototype member (a real
+// page shaped {"nextPageToken": ...} has no key literally called
+// "constructor", but a tokenPath typo'd or copy-pasted as "constructor"
+// would otherwise resolve to the built-in Object constructor instead of
+// undefined) must still read as "not found", the same lesson this file
+// already learned once from CELL_CHECKS/KNOWN_CHECKS (see move.md).
 function resolvePath(obj, path) {
   return path.split('.').reduce(function (value, key) {
-    return (value === null || value === undefined) ? undefined : value[key];
+    if (value === null || value === undefined || !Object.prototype.hasOwnProperty.call(value, key)) {
+      return undefined;
+    }
+    return value[key];
   }, obj);
 }
 
@@ -247,8 +258,9 @@ function appendQueryParam(url, param, value) {
 
 // Walks a cursor-paginated API: calls fetchPage(token) - undefined on the
 // first call, then whatever resolvePath(page, options.tokenPath) found on
-// the page before it - until that token comes back falsy (the normal
-// end-of-results signal) or options.maxPages pages have been fetched,
+// the page before it - until that token comes back undefined (tokenPath
+// wasn't present on that page at all - the normal end-of-results signal)
+// or options.maxPages pages have been fetched,
 // whichever comes first. Deliberately knows nothing about HTTP: fetchPage
 // just has to hand back one page's parsed body, so this same loop works
 // for extractApi's UrlFetchApp calls below and equally for a "custom"
@@ -284,7 +296,7 @@ function extractPaginated(fetchPage, options) {
     allObjects = allObjects.concat(pageObjects);
     token = resolvePath(page, options.tokenPath);
     pageCount++;
-  } while (token && pageCount < options.maxPages);
+  } while (token !== undefined && pageCount < options.maxPages);
   return objectsToRows(allObjects);
 }
 
