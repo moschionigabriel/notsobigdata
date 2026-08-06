@@ -169,7 +169,8 @@ a report:
     { name: 'rawCustomers', kind: 'move', status: 'failed',  ms: 210,  error: 'move(): ...' },
     { name: 'ordersReport', kind: 'move', status: 'skipped', blockedBy: ['rawCustomers'] }
   ],
-  ignored: []
+  ignored: [],
+  manifest: { written: true, fileId: '...' }
 }
 ```
 
@@ -179,7 +180,57 @@ its own dependents too), and **unrelated branches still run**. That matters
 more here than in a normal scheduler: each run is you clicking Run in the
 Apps Script editor and waiting, so seeing every independent failure in one
 pass beats fixing them one run at a time. Under `list`, every node's status
-is `planned` and nothing executes.
+is `planned` and nothing executes — and there's no `manifest` field, since
+`list` doesn't run anything worth recording (see below).
+
+`manifest` is present only on `run`, and is always one of:
+
+```javascript
+{ written: true, fileId: '...' }                      // wrote/overwrote the manifest file
+{ written: false, reason: 'disabled' }                 // notsobigdataManifest.enabled is false
+{ written: false, reason: 'error', error: '...' }      // Drive write failed - never throws, never affects ok
+```
+
+## The run manifest
+
+Every `cli('run ...')` writes a small JSON file to Drive — a dbt-`manifest.json`-
+style record of what happened, meant to be opened and read by a human. It's
+overwritten in place on every run (not appended to), so it always reflects
+the most recent run, not a history:
+
+```json
+{
+  "notsobigdata": "manifest",
+  "version": 1,
+  "generatedAt": "2026-08-06T12:34:56.789Z",
+  "command": "run --select move",
+  "ok": false,
+  "nodes": [
+    { "name": "rawOrders", "kind": "move", "status": "success", "ms": 1840, "rowCount": 1200, "columnCount": 8 },
+    { "name": "rawCustomers", "kind": "move", "status": "failed", "ms": 210, "error": "move(): ..." },
+    { "name": "ordersReport", "kind": "move", "status": "skipped", "blockedBy": ["rawCustomers"] }
+  ],
+  "ignored": []
+}
+```
+
+It never contains the actual rows a node moved — only their shape
+(`rowCount`/`columnCount`) plus each target's own small `loadResult`/
+`testResults`, if present. This keeps the file's size independent of how
+much data your pipeline actually moves.
+
+On by default. Configure it with an optional top-level `var`, same
+declaration style as a node:
+
+```javascript
+var notsobigdataManifest = {
+  enabled: true,                           // set false to turn it off entirely
+  folderId: null,                          // default: auto-detected, the folder the Apps Script project itself lives in
+  fileName: 'notsobigdata-manifest.json'   // default filename inside that folder
+};
+```
+
+All three keys are optional — omit the whole `var` to get every default.
 
 ## Declaring a node
 
