@@ -306,6 +306,15 @@ source: { type: 'custom', fn: myCustomExtract }
 For `drive` and `api` sources, a JSON array of objects is flattened into a
 header row plus data rows using the **union of every object's keys** as the
 column list — any object missing a given key just gets a blank cell there.
+A value that's itself an object or array — a nested field like the YouTube
+Data API's `snippet`/`statistics` — isn't flattened into further columns;
+it's `JSON.stringify`'d into that one cell instead, so it survives every
+target as readable JSON text rather than silently collapsing to the literal
+string `"[object Object]"` once it reaches a CSV-based target (`bigquery`,
+drive `csv`). If a table shaped like that also has too little type
+contrast between its header and data rows for BigQuery's `autodetect` to
+reliably find the header row, pass `target.schema` (see the `bigquery`
+target section below) instead of relying on autodetect.
 `xlsx` files are converted to a temporary Google Sheet under the hood (Apps
 Script has no native XLSX parser), read, and the temporary copy is deleted
 immediately after — this requires the Advanced Drive Service enabled in

@@ -2,7 +2,10 @@
 // from the union of every element's keys (not just the first element's —
 // JSON/API payloads commonly have optional fields that only show up on
 // some records), followed by one row per element. Keys an element doesn't
-// have become blank cells rather than throwing.
+// have become blank cells rather than throwing. A value that's itself an
+// object or array (a nested field like the YouTube Data API's snippet/
+// statistics) is JSON.stringify'd into its cell rather than flattened
+// into further columns - see the comment inline below for why.
 function objectsToRows(objects) {
   // Checked before the emptiness test, not after: an envelope like
   // {"data": [...]} - the most common JSON API shape there is - has no
@@ -33,7 +36,25 @@ function objectsToRows(objects) {
   var rows = [headers].concat(objects.map(function (obj) {
     return headers.map(function (key) {
       var value = obj[key];
-      return value === undefined ? '' : value;
+      if (value === undefined) {
+        return '';
+      }
+      // Nested object/array values pass straight through the
+      // union-of-keys flattening above - it only looks at top-level
+      // keys. Left as a raw JS object, the cell is lossy everywhere
+      // downstream: rowsToCsv() stringifies with String(), which turns
+      // any object into the literal text "[object Object]" - not an
+      // error, just silently wrong data reaching the bigquery/drive-csv
+      // targets - and Range.setValues() (sheets/drive-xlsx) has no
+      // defined behavior for a raw object cell either. JSON.stringify
+      // keeps the value inspectable as real JSON text and turns the
+      // cell into a plain string primitive before it reaches any
+      // target, fixing every exposure at once. null is excluded on
+      // purpose - JSON.stringify(null) is the text "null", which would
+      // replace today's correct behavior (a raw null renders as a
+      // blank cell in rowsToCsv) with the literal word "null" showing
+      // up instead.
+      return (typeof value === 'object' && value !== null) ? JSON.stringify(value) : value;
     });
   }));
   return rows;
