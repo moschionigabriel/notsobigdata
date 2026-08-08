@@ -499,6 +499,14 @@ function buildManifest(commandText, ok, results, ignored) {
 // node results actually being reported, so every path is caught and
 // turned into one of three report.manifest shapes instead.
 //
+// Every outcome also gets a Logger.log line, same as every other outcome
+// in a run (the call-level START/DONE, each node's START/OK/FAIL/SKIP/PLAN).
+// Without it, a failed write was only visible in the returned
+// report.manifest - which the documented usage pattern (Logger.log(report.ok))
+// never inspects - so a human watching the Apps Script execution log, the
+// one place CLAUDE.md's testing section says they actually look, had no way
+// to tell a manifest failed to write from one that succeeded silently.
+//
 // Reuses resolveDriveWriteTarget/writeDriveText from move.js rather than
 // re-implementing "resolve an existing file or create one" a second
 // time - the first helper call to cross the move.js/cli.js boundary, and
@@ -507,6 +515,7 @@ function buildManifest(commandText, ok, results, ignored) {
 function writeManifest(commandText, ok, results, ignored) {
   var config = resolveManifestConfig();
   if (!config.enabled) {
+    Logger.log('MANIFEST skipped - notsobigdataManifest.enabled is false');
     return { written: false, reason: 'disabled' };
   }
   try {
@@ -515,8 +524,10 @@ function writeManifest(commandText, ok, results, ignored) {
     var target = { folderId: folderId, fileName: config.fileName, upsertByName: true };
     var fileId = resolveDriveWriteTarget(target);
     fileId = writeDriveText(fileId, target, JSON.stringify(manifest, null, 2), MimeType.PLAIN_TEXT);
+    Logger.log('MANIFEST written to ' + fileId);
     return { written: true, fileId: fileId };
   } catch (error) {
+    Logger.log('MANIFEST failed - ' + error.message);
     return { written: false, reason: 'error', error: error.message };
   }
 }

@@ -196,7 +196,10 @@ is `planned` and nothing executes — and there's no `manifest` field, since
 Every `cli('run ...')` writes a small JSON file to Drive — a dbt-`manifest.json`-
 style record of what happened, meant to be opened and read by a human. It's
 overwritten in place on every run (not appended to), so it always reflects
-the most recent run, not a history:
+the most recent run, not a history. If it can't find the file afterward, the
+execution log has a `MANIFEST written to <id>` / `MANIFEST skipped - ...` /
+`MANIFEST failed - ...` line saying exactly what happened — no need to
+inspect `report.manifest` in code just to find out:
 
 ```json
 {
