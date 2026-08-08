@@ -355,10 +355,20 @@ function orderNodes(nodes) {
 // Logged output stays deliberately small - names, statuses, row counts -
 // never the extracted rows themselves, which can be huge and may hold
 // data the user would rather not have sitting in an execution log.
+//
+// Every node gets its own START/outcome bookend pair - START right before
+// it's handled, then OK/FAIL/SKIP/PLAN once its outcome is known - mirroring
+// the START/DONE pair cli() itself logs around the whole call below. Without
+// a per-node START, a human watching the Apps Script log during a long run
+// can only see which nodes have already finished, never which one is
+// currently in flight. START logs unconditionally, even for nodes that turn
+// out skipped or merely planned, so every node in the ordered list produces
+// a matching pair - not just the ones that reach EXECUTORS.
 function runNodes(nodes, dryRun) {
   var results = [];
   var blocked = emptyMap();
   nodes.forEach(function (node) {
+    Logger.log('START ' + node.name + ' (' + node.kind + ')');
     var blockers = node.dependsOn.filter(function (dependency) { return has(blocked, dependency); });
     if (blockers.length) {
       blocked[node.name] = true;
