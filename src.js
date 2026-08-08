@@ -690,6 +690,24 @@ var NotSoBigData = (function () {
   // which can guess wrong for things like a zero-padded id column
   // ("007") silently becoming an INTEGER - pass target.schema when that
   // matters; omit it and behavior is unchanged.
+  //
+  // target.allowSchemaEvolution (optional, default false) is BigQuery's
+  // own schemaUpdateOptions, opted into explicitly - same posture as
+  // "overwrite" mode above: destructive-adjacent behavior needs an
+  // explicit flag, not a default. Without it, a source that has grown a
+  // column the destination table doesn't have fails the load job outright
+  // (safe, but a hard stop until a human ALTERs the table by hand). With
+  // it, in "append" mode only, BigQuery is allowed to ALLOW_FIELD_ADDITION
+  // (a new column can appear) and ALLOW_FIELD_RELAXATION (an existing
+  // REQUIRED column can loosen to NULLABLE) as part of the load job -
+  // additive changes only. A real type change or a renamed/dropped column
+  // still fails the job either way; BigQuery itself has no
+  // schemaUpdateOptions for those, and silently coercing or dropping data
+  // would be worse than today's loud failure. Gated on "append"
+  // specifically because "overwrite" (WRITE_TRUNCATE) already replaces
+  // the destination schema wholesale every run - schemaUpdateOptions
+  // would be a no-op there, so it's simply not attached rather than
+  // throwing on a harmless combination.
   function loadBigQuery(rows, target) {
     if (!target.projectId || !target.dataset || !target.table) {
       throw new Error('move(): bigquery target requires "projectId", "dataset", and "table".');
@@ -718,6 +736,9 @@ var NotSoBigData = (function () {
       loadConfig.schema = { fields: target.schema };
     } else {
       loadConfig.autodetect = true;
+    }
+    if (target.allowSchemaEvolution && mode === 'append') {
+      loadConfig.schemaUpdateOptions = ['ALLOW_FIELD_ADDITION', 'ALLOW_FIELD_RELAXATION'];
     }
     var insertedJob = BigQuery.Jobs.insert({ configuration: { load: loadConfig } }, target.projectId, blob);
     var jobId = insertedJob.jobReference.jobId;

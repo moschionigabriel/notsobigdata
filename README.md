@@ -470,6 +470,17 @@ a CSV load job.
   `autodetect: true`. Autodetect infers types from the CSV header/values,
   which can guess wrong for things like a zero-padded id column (`"007"`)
   silently becoming an `INTEGER` — pass `target.schema` when that matters.
+- `target.allowSchemaEvolution` (optional, default `false`) — without it,
+  a source that has grown a column the destination table doesn't have
+  fails the load job outright (safe, but a hard stop until someone
+  manually alters the table). Set it `true` and, in `mode: 'append'`
+  only, BigQuery is allowed to add a new nullable column and to loosen an
+  existing `REQUIRED` column to `NULLABLE` as part of the load — additive
+  changes only. A real type change, or a renamed/dropped column, still
+  fails the job either way; BigQuery has no schema-evolution option for
+  those, and silently coercing or dropping data would be worse than a
+  loud failure. Ignored in `mode: 'overwrite'`, since `WRITE_TRUNCATE`
+  already replaces the destination schema wholesale on every run.
 
 Every target except `api`/`custom` (which have no "existing state" to
 protect - a POST is a POST, and a custom `fn` is on you) skips its
