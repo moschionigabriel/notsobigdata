@@ -518,8 +518,12 @@ With `sqlTests` set, a `move()` call to this target:
    zero rows back means that check passed, mirroring dbt's own generic
    test contract.
 3. Only if every check passes, promotes the staged data into the real
-   target table via a BigQuery copy job, honoring `mode`/
-   `allowSchemaEvolution` exactly like a direct load would.
+   target table via a BigQuery copy job, honoring `mode`. With
+   `allowSchemaEvolution` also set, a new column on the staged table is
+   added to the real table first (BigQuery's copy jobs don't accept
+   `schemaUpdateOptions` the way load jobs do, so this widens the
+   destination directly instead of relying on the copy job to do it) —
+   additive only, same as the direct-load path.
 4. Deletes the staging table either way, success or failure.
 
 If any check fails, `move()` throws one combined error (naming every

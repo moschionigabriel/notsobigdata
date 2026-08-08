@@ -738,17 +738,20 @@ var NotSoBigData = (function () {
   }
 
   // Resolves target.allowSchemaEvolution + a job's writeDisposition down to
-  // the schemaUpdateOptions array to attach (or undefined to attach
-  // nothing) - shared by loadBigQuery's direct load job and
-  // loadBigQueryStaged's promotion copy job below, the same "one decision,
-  // two job kinds" shape resolveBigQueryWriteDisposition above already
-  // covers for mode. Takes writeDisposition rather than mode directly:
-  // "append" and "WRITE_APPEND" carry the same fact, and writeDisposition
-  // is already what both call sites have in hand by the time they need
-  // this. Gated to WRITE_APPEND specifically because WRITE_TRUNCATE
-  // already replaces the destination schema wholesale every run - the
-  // option would be a no-op there, so it's simply not attached rather than
-  // thrown on as a harmless combination.
+  // the schemaUpdateOptions array to attach to a load job's config (or
+  // undefined to attach nothing) - used only by loadBigQuery's direct load
+  // path below. NOT used by loadBigQueryStaged's promotion copy job:
+  // schemaUpdateOptions was tried there too originally, but confirmed by
+  // hand (against a real project) not to work on a copy job the way it
+  // does on a load job - see widenDestinationTableForPromotion above,
+  // which is what the staged path actually uses instead. Takes
+  // writeDisposition rather than mode directly: "append" and
+  // "WRITE_APPEND" carry the same fact, and writeDisposition is already
+  // what the caller has in hand by the time it needs this. Gated to
+  // WRITE_APPEND specifically because WRITE_TRUNCATE already replaces the
+  // destination schema wholesale every run - the option would be a no-op
+  // there, so it's simply not attached rather than thrown on as a
+  // harmless combination.
   function resolveBigQuerySchemaUpdateOptions(target, writeDisposition) {
     return (target.allowSchemaEvolution && writeDisposition === 'WRITE_APPEND')
       ? ['ALLOW_FIELD_ADDITION', 'ALLOW_FIELD_RELAXATION']
@@ -841,6 +844,49 @@ var NotSoBigData = (function () {
     return { ran: sqlTests.length };
   }
 
+  // Widens the real destination table's schema to include any column the
+  // staged table has that it doesn't, by patching the table directly
+  // (Tables.patch) before loadBigQueryStaged's promotion copy job runs -
+  // not via the copy job's own schemaUpdateOptions, which was tried first
+  // and confirmed by hand, against a real project, not to work the way a
+  // load job's does: a copy job still rejected a schema mismatch with
+  // schemaUpdateOptions set, failing with "Provided Schema does not match
+  // Table ... Cannot add fields". Patching the destination ahead of time
+  // means the copy job never sees a mismatch to reject in the first
+  // place.
+  //
+  // Only additive (a new column, appended as NULLABLE - the only mode
+  // Tables.patch can add a column as). Does not attempt
+  // ALLOW_FIELD_RELAXATION's REQUIRED-to-NULLABLE case here - that was
+  // never confirmed working on either job kind (the schema-evolution
+  // feature's own GAS test only exercises field addition too) and isn't
+  // the bug this fixes. Don't assume it works without separately
+  // verifying it.
+  //
+  // If the destination table doesn't exist yet, Tables.get throws and this
+  // returns without patching anything - there's nothing to widen, and the
+  // copy job below creates the table fresh from the staged schema, the
+  // same as a load job would for a brand-new table.
+  function widenDestinationTableForPromotion(target, stagingTable) {
+    var destination;
+    try {
+      destination = BigQuery.Tables.get(target.projectId, target.dataset, target.table);
+    } catch (error) {
+      return;
+    }
+    var existingNames = {};
+    destination.schema.fields.forEach(function (field) { existingNames[field.name] = true; });
+    var stagedFields = BigQuery.Tables.get(target.projectId, target.dataset, stagingTable).schema.fields;
+    var newFields = stagedFields.filter(function (field) { return !existingNames[field.name]; });
+    if (!newFields.length) {
+      return;
+    }
+    BigQuery.Tables.patch(
+      { schema: { fields: destination.schema.fields.concat(newFields) } },
+      target.projectId, target.dataset, target.table
+    );
+  }
+
   // Stages rows into a brand-new scratch table, runs target.sqlTests
   // against it, and only if every test passes promotes - via a BigQuery
   // copy job, not a second CSV upload - into the real target. A failing
@@ -881,15 +927,15 @@ var NotSoBigData = (function () {
 
       var testResults = runSqlTests(target.sqlTests, { projectId: target.projectId, dataset: target.dataset, table: stagingTable });
 
+      if (target.allowSchemaEvolution && writeDisposition === 'WRITE_APPEND') {
+        widenDestinationTableForPromotion(target, stagingTable);
+      }
+
       var copyConfig = {
         sourceTable: { projectId: target.projectId, datasetId: target.dataset, tableId: stagingTable },
         destinationTable: { projectId: target.projectId, datasetId: target.dataset, tableId: target.table },
         writeDisposition: writeDisposition
       };
-      var copySchemaUpdateOptions = resolveBigQuerySchemaUpdateOptions(target, writeDisposition);
-      if (copySchemaUpdateOptions) {
-        copyConfig.schemaUpdateOptions = copySchemaUpdateOptions;
-      }
       var promoteJobId = runBigQueryJob({ configuration: { copy: copyConfig } }, target.projectId, null, 'copy');
 
       return {
