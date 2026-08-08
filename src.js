@@ -1682,6 +1682,30 @@ var NotSoBigData = (function () {
     return results;
   }
 
+  // Counts each status in a runNodes() result set, and renders it as the
+  // "DONE" summary line cli() logs at the end of a run/list - see there.
+  // Kept as two small functions rather than one, the same split
+  // summarizeNodeResult()/buildManifest() already use elsewhere in this
+  // file, so the counting logic is testable independent of its one string
+  // format.
+  function summarizeStatusCounts(results) {
+    var counts = { success: 0, failed: 0, skipped: 0, planned: 0 };
+    results.forEach(function (result) { counts[result.status] += 1; });
+    return counts;
+  }
+
+  // Only non-zero counts are rendered - a "list" run (every node
+  // "planned") would otherwise print "0 passed, 0 failed, 0 skipped, 5
+  // planned", which buries the one number that matters in noise nobody
+  // asked about.
+  function formatStatusCounts(counts) {
+    var labels = { success: 'passed', failed: 'failed', skipped: 'skipped', planned: 'planned' };
+    var parts = ['success', 'failed', 'skipped', 'planned']
+      .filter(function (status) { return counts[status] > 0; })
+      .map(function (status) { return counts[status] + ' ' + labels[status]; });
+    return parts.length ? parts.join(', ') : 'nothing to do';
+  }
+
   // Reads the optional notsobigdataManifest global the same guarded way
   // discoverNodes() reads every other global - the read must never throw
   // because of something this library doesn't own. Every field is
@@ -1825,7 +1849,18 @@ var NotSoBigData = (function () {
   // The single public entrypoint. Takes one command string and returns
   // either a run report (for "run"/"list") or a message string (for
   // "hello"/"help").
+  //
+  // Logs "START"/"DONE" bookends around every call, padded to the same
+  // six characters as runNodes()'s own "OK"/"FAIL"/"SKIP"/"PLAN" labels so
+  // every line in the execution log lines up. "START" is the very first
+  // thing this function does, before parseCommand() - so a call that
+  // throws immediately (an unknown command, zero discovered nodes) still
+  // leaves a marker that cli() actually ran, not silence up to the error.
+  // "DONE" only fires for "run"/"list": hello()/help() already log their
+  // own single result line and have no per-node pass/fail/skip status to
+  // roll up. Both are pure Logger.log side effects - report is unchanged.
   function cli(input) {
+    Logger.log('START cli("' + input + '")');
     var parsed = parseCommand(input);
     if (parsed.command === 'help') {
       var helpText = usage();
@@ -1847,6 +1882,7 @@ var NotSoBigData = (function () {
     var ordered = orderNodes(selected);
     var results = runNodes(ordered, parsed.command === 'list');
     var ok = results.every(function (result) { return result.status !== 'failed' && result.status !== 'skipped'; });
+    Logger.log('DONE  cli("' + input + '") - ' + formatStatusCounts(summarizeStatusCounts(results)) + ' (' + results.length + ' total).');
     var report = {
       ok: ok,
       command: parsed.command,
