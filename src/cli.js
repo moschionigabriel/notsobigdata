@@ -15,15 +15,18 @@
 // pick up a new kind from this map alone.
 //
 // One honest caveat, so nobody discovers it mid-change: discovery is
-// kind-agnostic only for kinds whose edges are hand-written. discoverNodes()
-// below reads dependencies straight off config.dependsOn, and the planned
-// model kind derives its edges by parsing {{ ref() }} out of its SQL
-// instead. So adding model() means an entry here *plus* a per-kind hook for
-// deriving dependsOn. That hook doesn't exist yet - it isn't written
-// speculatively, because the kind that needs it isn't written either, and
-// guessing its shape now is how you get the wrong abstraction.
+// kind-agnostic only for kinds whose *edges* are hand-written. move's
+// dependsOn is read straight off its config below; model's isn't - a
+// model derives its edges by parsing {{ ref() }} out of its own SQL, and
+// its nodes don't even come from a top-level var each (see
+// discoverNodes() below) - they're expanded from the single
+// notsobigdataModels registry by model.js's expandModelNodes(). Both of
+// those are model-specific hooks, kept as narrow as the kind that needed
+// them; a third kind needing something similar gets its own hook, not a
+// generalized version of this one.
 var EXECUTORS = {
-  move: move
+  move: move,
+  model: model
 };
 
 function knownKinds() {
@@ -223,6 +226,21 @@ function discoverNodes() {
       config: value,
       dependsOn: edges
     });
+  });
+  // model nodes don't come from the scan above at all - see the EXECUTORS
+  // comment. expandModelNodes() (model.js) turns the single
+  // notsobigdataModels registry into one fully-formed node per entry,
+  // already carrying config and dependsOn; folding them in here, right
+  // where the var-scan finishes, means every downstream step
+  // (assertDependenciesExist, selection, ordering, running) sees one flat
+  // node list and never has to know two different discovery mechanisms
+  // produced it.
+  expandModelNodes().forEach(function (node) {
+    if (has(claimedNames, node.name)) {
+      throw new Error('cli(): two nodes are both named "' + node.name + '" (declared as "' + claimedNames[node.name] + '" and "' + node.variable + '"). Node names must be unique - set an explicit "name" on one of them.');
+    }
+    claimedNames[node.name] = node.variable;
+    nodes.push(node);
   });
   return { nodes: nodes, ignored: ignored };
 }
