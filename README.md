@@ -402,6 +402,8 @@ target: { type: 'drive', fileType: 'csv', folderId: '...', fileName: 'orders.csv
 // (WRITE_TRUNCATE) must be opted into explicitly
 target: { type: 'bigquery', projectId: '...', dataset: 'staging', table: 'orders', mode: 'append' }
 // .loadResult -> { projectId, dataset, table, jobId }
+// ...with target.sqlTests set (see below), .loadResult also gets
+// { staged: { table, jobId }, sqlTestResults: { ran } }
 
 // External API — rows are POSTed as a JSON array of objects
 target: { type: 'api', url: 'https://...', options: { /* UrlFetchApp params */ } }
@@ -481,6 +483,58 @@ a CSV load job.
   those, and silently coercing or dropping data would be worse than a
   loud failure. Ignored in `mode: 'overwrite'`, since `WRITE_TRUNCATE`
   already replaces the destination schema wholesale on every run.
+
+`target.sqlTests` (optional array of `{ name, query }`) is a `bigquery`-only
+extension of `tests` above, for checks that need the data to already be
+queryable as a table — referential integrity, an aggregate/volume check,
+anything SQL can express that a per-cell JS check can't. Its presence is
+what triggers the behavior, the same way `tests` itself does — omit it
+(or leave it an empty array) and a `bigquery` target's load is
+byte-for-byte what it always was:
+
+```javascript
+target: {
+  type: 'bigquery', projectId: '...', dataset: 'raw', table: 'orders', mode: 'append',
+  sqlTests: [
+    {
+      name: 'customer_id_exists_in_customers',
+      query: 'SELECT s.customer_id FROM {{ this }} s ' +
+             'LEFT JOIN `project.raw.customers` c ON s.customer_id = c.customer_id ' +
+             'WHERE c.customer_id IS NULL'
+    }
+  ]
+}
+```
+
+With `sqlTests` set, a `move()` call to this target:
+
+1. Loads the extracted rows into a brand-new, temporary staging table
+   instead of the real one (same `target.schema`/autodetect behavior as a
+   direct load).
+2. Runs every `sqlTests` query against that staged table, substituting
+   `{{ this }}` with the staged table's fully-qualified name — deliberately
+   the same placeholder dbt uses for "the table this check is about".
+   Each query is expected to return the *offending rows* (any columns);
+   zero rows back means that check passed, mirroring dbt's own generic
+   test contract.
+3. Only if every check passes, promotes the staged data into the real
+   target table via a BigQuery copy job, honoring `mode`/
+   `allowSchemaEvolution` exactly like a direct load would.
+4. Deletes the staging table either way, success or failure.
+
+If any check fails, `move()` throws one combined error (naming every
+failing check, its failing-row count, and a few example rows) and the
+real target table is **never touched** — the whole point of staging
+first. There's no `discard_row` option here (yet): unlike `tests`, which
+filters an in-memory array, discarding just the offending staged rows
+would need its own delete-then-promote logic that no real use case has
+asked for yet.
+
+This costs more than a direct load — a staging table, an extra load job,
+one query job per check, and a copy job — so it's opt-in per target, not
+a default. `sqlTests[].query` is gated the same read-only-`SELECT` check
+a `bigquery` source's query is; it runs under the script's own live
+OAuth, so it can read anything that OAuth can, but can't mutate anything.
 
 Every target except `api`/`custom` (which have no "existing state" to
 protect - a POST is a POST, and a custom `fn` is on you) skips its
@@ -582,7 +636,11 @@ when there are no data rows to check, consistent with "empty means `[]`"
 everywhere else in `move`.
 
 Referential checks across tables (dbt's `relationships` test) are out of
-scope — they'd need to query another table, which isn't `move`'s job.
+scope for `tests` — they'd need to query another table, which a check
+running against an in-memory 2D array can't do. For a `bigquery` target
+specifically, `target.sqlTests` (below) covers that case instead, by
+running SQL against the data after it's staged in BigQuery rather than
+against the extracted rows in Apps Script memory.
 
 ## The `model` kind — not implemented yet
 
