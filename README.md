@@ -169,7 +169,8 @@ a report:
     { name: 'rawCustomers', kind: 'move', status: 'failed',  ms: 210,  error: 'move(): ...' },
     { name: 'ordersReport', kind: 'move', status: 'skipped', blockedBy: ['rawCustomers'] }
   ],
-  ignored: []
+  ignored: [],
+  manifest: { written: true, fileId: '...' }
 }
 ```
 
@@ -179,7 +180,57 @@ its own dependents too), and **unrelated branches still run**. That matters
 more here than in a normal scheduler: each run is you clicking Run in the
 Apps Script editor and waiting, so seeing every independent failure in one
 pass beats fixing them one run at a time. Under `list`, every node's status
-is `planned` and nothing executes.
+is `planned` and nothing executes — and there's no `manifest` field, since
+`list` doesn't run anything worth recording (see below).
+
+`manifest` is present only on `run`, and is always one of:
+
+```javascript
+{ written: true, fileId: '...' }                      // wrote/overwrote the manifest file
+{ written: false, reason: 'disabled' }                 // notsobigdataManifest.enabled is false
+{ written: false, reason: 'error', error: '...' }      // Drive write failed - never throws, never affects ok
+```
+
+## The run manifest
+
+Every `cli('run ...')` writes a small JSON file to Drive — a dbt-`manifest.json`-
+style record of what happened, meant to be opened and read by a human. It's
+overwritten in place on every run (not appended to), so it always reflects
+the most recent run, not a history:
+
+```json
+{
+  "notsobigdata": "manifest",
+  "version": 1,
+  "generatedAt": "2026-08-06T12:34:56.789Z",
+  "command": "run --select move",
+  "ok": false,
+  "nodes": [
+    { "name": "rawOrders", "kind": "move", "status": "success", "ms": 1840, "rowCount": 1200, "columnCount": 8 },
+    { "name": "rawCustomers", "kind": "move", "status": "failed", "ms": 210, "error": "move(): ..." },
+    { "name": "ordersReport", "kind": "move", "status": "skipped", "blockedBy": ["rawCustomers"] }
+  ],
+  "ignored": []
+}
+```
+
+It never contains the actual rows a node moved — only their shape
+(`rowCount`/`columnCount`) plus each target's own small `loadResult`/
+`testResults`, if present. This keeps the file's size independent of how
+much data your pipeline actually moves.
+
+On by default. Configure it with an optional top-level `var`, same
+declaration style as a node:
+
+```javascript
+var notsobigdataManifest = {
+  enabled: true,                           // set false to turn it off entirely
+  folderId: null,                          // default: auto-detected, the folder the Apps Script project itself lives in
+  fileName: 'notsobigdata-manifest.json'   // default filename inside that folder
+};
+```
+
+All three keys are optional — omit the whole `var` to get every default.
 
 ## Declaring a node
 
@@ -230,6 +281,19 @@ source: { type: 'bigquery', projectId: '...', queryFileId: '<drive file id of a 
 // External API — expects a JSON array of objects in the response body
 source: { type: 'api', url: 'https://...', options: { /* UrlFetchApp params */ } }
 
+// External API, enveloped and paginated — e.g. the YouTube Data API v3,
+// whose responses look like {"items": [...], "nextPageToken": "..."}.
+// "envelope" points at the array inside the body; "pagination" repeats the
+// request with the resolved token attached as a query param until the API
+// stops returning one, up to "maxPages"
+source: {
+  type: 'api',
+  url: 'https://www.googleapis.com/youtube/v3/search?part=snippet&channelId=UCxxxx&maxResults=50',
+  options: { headers: { Authorization: 'Bearer ' + ScriptApp.getOAuthToken() } },
+  envelope: 'items',
+  pagination: { param: 'pageToken', tokenPath: 'nextPageToken', maxPages: 10 }
+}
+
 // Custom — fn is a function you already defined in your own Apps Script
 // project; it's called as fn(source) and its return value is used directly
 function myCustomExtract(source) {
@@ -242,10 +306,42 @@ source: { type: 'custom', fn: myCustomExtract }
 For `drive` and `api` sources, a JSON array of objects is flattened into a
 header row plus data rows using the **union of every object's keys** as the
 column list — any object missing a given key just gets a blank cell there.
+A value that's itself an object or array — a nested field like the YouTube
+Data API's `snippet`/`statistics` — isn't flattened into further columns;
+it's `JSON.stringify`'d into that one cell instead, so it survives every
+target as readable JSON text rather than silently collapsing to the literal
+string `"[object Object]"` once it reaches a CSV-based target (`bigquery`,
+drive `csv`). If a table shaped like that also has too little type
+contrast between its header and data rows for BigQuery's `autodetect` to
+reliably find the header row, pass `target.schema` (see the `bigquery`
+target section below) instead of relying on autodetect.
 `xlsx` files are converted to a temporary Google Sheet under the hood (Apps
 Script has no native XLSX parser), read, and the temporary copy is deleted
 immediately after — this requires the Advanced Drive Service enabled in
 your Apps Script project.
+
+`api` sources also accept two optional keys for REST APIs that don't hand
+back a bare JSON array — both omittable, and omitting both keeps the
+behavior above unchanged:
+
+- `envelope`: a dot-path (`'items'`, `'data.results'`) to where the array
+  actually lives in the response body, for a payload shaped like
+  `{"items": [...]}` instead of a bare `[...]`.
+- `pagination`: `{ param, tokenPath, maxPages }` to follow a cursor across
+  multiple pages instead of reading just the first one. After each fetch,
+  `tokenPath` (another dot-path) is looked up in that page's body; if it
+  resolves to something truthy, the next request repeats with that value
+  attached to the URL as the `param` query parameter, and so on until
+  `tokenPath` comes back empty (the normal end-of-results signal) or
+  `maxPages` requests have been made, whichever comes first. `maxPages` is
+  required whenever `pagination` is given — there's no default, since a
+  paginated request with no cap is a request that can, in principle, never
+  stop. Every page's rows are combined into one result, with one header row
+  that's the union of every page's keys, same as a non-paginated response.
+
+This is exactly the shape of the YouTube Data API v3 (and most Google
+REST APIs): `envelope: 'items'`, `pagination: { param: 'pageToken',
+tokenPath: 'nextPageToken', maxPages: N }`, shown above.
 
 For `bigquery` sources, `table`/`query`/`queryFileId` are mutually
 exclusive — pick one (`table` also requires `dataset`). `query` and
@@ -268,6 +364,16 @@ config keys you attached to it, and the return value is checked to be an
 array of arrays — the same 2D-array shape every other extract produces —
 but cell types and row lengths aren't checked. Getting that right is on
 you, just like getting a `bigquery` `query` string right is.
+
+A `custom` source is also the way to reach a Google **Advanced Service** —
+`YouTube.Search.list()`, Analytics, Calendar, and so on — instead of a raw
+REST call: those are native Apps Script method calls, not URL fetches, so
+they can never go through an `api` source's `url`. Note this library's own
+internals (including the pagination-walking logic behind the `api`
+source's `pagination` key, above) aren't reachable from a `custom` `fn` —
+`cli()` is the library's only exposed function — so an
+Advanced-Service-backed source that needs to page through results has to
+walk them itself inside `fn`.
 
 ## The `move` kind — load
 
@@ -296,6 +402,8 @@ target: { type: 'drive', fileType: 'csv', folderId: '...', fileName: 'orders.csv
 // (WRITE_TRUNCATE) must be opted into explicitly
 target: { type: 'bigquery', projectId: '...', dataset: 'staging', table: 'orders', mode: 'append' }
 // .loadResult -> { projectId, dataset, table, jobId }
+// ...with target.sqlTests set (see below), .loadResult also gets
+// { staged: { table, jobId }, sqlTestResults: { ran } }
 
 // External API — rows are POSTed as a JSON array of objects
 target: { type: 'api', url: 'https://...', options: { /* UrlFetchApp params */ } }
@@ -364,6 +472,73 @@ a CSV load job.
   `autodetect: true`. Autodetect infers types from the CSV header/values,
   which can guess wrong for things like a zero-padded id column (`"007"`)
   silently becoming an `INTEGER` — pass `target.schema` when that matters.
+- `target.allowSchemaEvolution` (optional, default `false`) — without it,
+  a source that has grown a column the destination table doesn't have
+  fails the load job outright (safe, but a hard stop until someone
+  manually alters the table). Set it `true` and, in `mode: 'append'`
+  only, BigQuery is allowed to add a new nullable column and to loosen an
+  existing `REQUIRED` column to `NULLABLE` as part of the load — additive
+  changes only. A real type change, or a renamed/dropped column, still
+  fails the job either way; BigQuery has no schema-evolution option for
+  those, and silently coercing or dropping data would be worse than a
+  loud failure. Ignored in `mode: 'overwrite'`, since `WRITE_TRUNCATE`
+  already replaces the destination schema wholesale on every run.
+
+`target.sqlTests` (optional array of `{ name, query }`) is a `bigquery`-only
+extension of `tests` above, for checks that need the data to already be
+queryable as a table — referential integrity, an aggregate/volume check,
+anything SQL can express that a per-cell JS check can't. Its presence is
+what triggers the behavior, the same way `tests` itself does — omit it
+(or leave it an empty array) and a `bigquery` target's load is
+byte-for-byte what it always was:
+
+```javascript
+target: {
+  type: 'bigquery', projectId: '...', dataset: 'raw', table: 'orders', mode: 'append',
+  sqlTests: [
+    {
+      name: 'customer_id_exists_in_customers',
+      query: 'SELECT s.customer_id FROM {{ this }} s ' +
+             'LEFT JOIN `project.raw.customers` c ON s.customer_id = c.customer_id ' +
+             'WHERE c.customer_id IS NULL'
+    }
+  ]
+}
+```
+
+With `sqlTests` set, a `move()` call to this target:
+
+1. Loads the extracted rows into a brand-new, temporary staging table
+   instead of the real one (same `target.schema`/autodetect behavior as a
+   direct load).
+2. Runs every `sqlTests` query against that staged table, substituting
+   `{{ this }}` with the staged table's fully-qualified name — deliberately
+   the same placeholder dbt uses for "the table this check is about".
+   Each query is expected to return the *offending rows* (any columns);
+   zero rows back means that check passed, mirroring dbt's own generic
+   test contract.
+3. Only if every check passes, promotes the staged data into the real
+   target table via a BigQuery copy job, honoring `mode`. With
+   `allowSchemaEvolution` also set, a new column on the staged table is
+   added to the real table first (BigQuery's copy jobs don't accept
+   `schemaUpdateOptions` the way load jobs do, so this widens the
+   destination directly instead of relying on the copy job to do it) —
+   additive only, same as the direct-load path.
+4. Deletes the staging table either way, success or failure.
+
+If any check fails, `move()` throws one combined error (naming every
+failing check, its failing-row count, and a few example rows) and the
+real target table is **never touched** — the whole point of staging
+first. There's no `discard_row` option here (yet): unlike `tests`, which
+filters an in-memory array, discarding just the offending staged rows
+would need its own delete-then-promote logic that no real use case has
+asked for yet.
+
+This costs more than a direct load — a staging table, an extra load job,
+one query job per check, and a copy job — so it's opt-in per target, not
+a default. `sqlTests[].query` is gated the same read-only-`SELECT` check
+a `bigquery` source's query is; it runs under the script's own live
+OAuth, so it can read anything that OAuth can, but can't mutate anything.
 
 Every target except `api`/`custom` (which have no "existing state" to
 protect - a POST is a POST, and a custom `fn` is on you) skips its
@@ -465,7 +640,11 @@ when there are no data rows to check, consistent with "empty means `[]`"
 everywhere else in `move`.
 
 Referential checks across tables (dbt's `relationships` test) are out of
-scope — they'd need to query another table, which isn't `move`'s job.
+scope for `tests` — they'd need to query another table, which a check
+running against an in-memory 2D array can't do. For a `bigquery` target
+specifically, `target.sqlTests` (below) covers that case instead, by
+running SQL against the data after it's staged in BigQuery rather than
+against the extracted rows in Apps Script memory.
 
 ## The `model` kind — not implemented yet
 

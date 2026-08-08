@@ -12,7 +12,10 @@ var NotSoBigData = (function () {
   // from the union of every element's keys (not just the first element's —
   // JSON/API payloads commonly have optional fields that only show up on
   // some records), followed by one row per element. Keys an element doesn't
-  // have become blank cells rather than throwing.
+  // have become blank cells rather than throwing. A value that's itself an
+  // object or array (a nested field like the YouTube Data API's snippet/
+  // statistics) is JSON.stringify'd into its cell rather than flattened
+  // into further columns - see the comment inline below for why.
   function objectsToRows(objects) {
     // Checked before the emptiness test, not after: an envelope like
     // {"data": [...]} - the most common JSON API shape there is - has no
@@ -43,10 +46,53 @@ var NotSoBigData = (function () {
     var rows = [headers].concat(objects.map(function (obj) {
       return headers.map(function (key) {
         var value = obj[key];
-        return value === undefined ? '' : value;
+        if (value === undefined) {
+          return '';
+        }
+        // Nested object/array values pass straight through the
+        // union-of-keys flattening above - it only looks at top-level
+        // keys. Left as a raw JS object, the cell is lossy everywhere
+        // downstream: rowsToCsv() stringifies with String(), which turns
+        // any object into the literal text "[object Object]" - not an
+        // error, just silently wrong data reaching the bigquery/drive-csv
+        // targets - and Range.setValues() (sheets/drive-xlsx) has no
+        // defined behavior for a raw object cell either. JSON.stringify
+        // keeps the value inspectable as real JSON text and turns the
+        // cell into a plain string primitive before it reaches any
+        // target, fixing every exposure at once. null is excluded on
+        // purpose - JSON.stringify(null) is the text "null", which would
+        // replace today's correct behavior (a raw null renders as a
+        // blank cell in rowsToCsv) with the literal word "null" showing
+        // up instead.
+        return (typeof value === 'object' && value !== null) ? JSON.stringify(value) : value;
       });
     }));
     return rows;
+  }
+
+  // Looks up a dot-path ('items', 'data.results') inside a parsed JSON
+  // value. Shared by the api source's "envelope" (where the row array lives
+  // in the response body) and "pagination.tokenPath" (where the next-page
+  // token lives) - both are "find this value somewhere inside a nested
+  // object" in the same way, just pointed at different paths. Walks off the
+  // end of a missing branch by returning undefined rather than throwing, so
+  // a token path that's absent on the last page (the normal way a paginated
+  // API says "no more pages") reads as "no next token" instead of a crash.
+  //
+  // Checked with hasOwnProperty rather than a plain value[key] lookup - a
+  // path segment that names an inherited Object.prototype member (a real
+  // page shaped {"nextPageToken": ...} has no key literally called
+  // "constructor", but a tokenPath typo'd or copy-pasted as "constructor"
+  // would otherwise resolve to the built-in Object constructor instead of
+  // undefined) must still read as "not found", the same lesson this file
+  // already learned once from CELL_CHECKS/KNOWN_CHECKS (see move.md).
+  function resolvePath(obj, path) {
+    return path.split('.').reduce(function (value, key) {
+      if (value === null || value === undefined || !Object.prototype.hasOwnProperty.call(value, key)) {
+        return undefined;
+      }
+      return value[key];
+    }, obj);
   }
 
   // True when a grid holds no actual content - either no rows at all, or
@@ -162,48 +208,70 @@ var NotSoBigData = (function () {
     return readDriveFileText(source.queryFileId);
   }
 
-  // Guards against a bigquery source running anything other than a single
-  // read statement. This is a footgun-preventing keyword/shape check, not a
-  // security boundary: it only strips comments, looks at the leading
-  // keyword, and rejects multiple ";"-separated statements, so it won't
-  // catch e.g. a SELECT that calls a mutating stored routine. move()'s job
-  // is extracting data - transforming/writing it belongs in model().
-  function assertReadOnlySelect(sql) {
+  // Guards against a piece of pipeline-author-supplied SQL doing anything
+  // other than a single read statement. This is a footgun-preventing
+  // keyword/shape check, not a security boundary: it only strips comments,
+  // looks at the leading keyword, and rejects multiple ";"-separated
+  // statements, so it won't catch e.g. a SELECT that calls a mutating
+  // stored routine. move()'s job is extracting/asserting on data -
+  // transforming/writing it belongs in model().
+  //
+  // "context" is only used to phrase the thrown message - shared by every
+  // call site that hands move() raw SQL to run under the script's live
+  // OAuth (a bigquery source's query/queryFileId, and a bigquery target's
+  // sqlTests[].query) rather than each one repeating this same check with
+  // its own wording.
+  function assertReadOnlySelect(sql, context) {
     var stripped = sql
       .replace(/--[^\n]*/g, '')
       .replace(/\/\*[\s\S]*?\*\//g, '')
       .trim()
       .replace(/;\s*$/, '');
     if (!/^(select|with)\b/i.test(stripped)) {
-      throw new Error('move(): bigquery source.query/queryFileId must be a read-only SELECT (optionally starting with WITH). move() only extracts data - transform or write logic belongs in model().');
+      throw new Error('move(): ' + context + ' must be a read-only SELECT (optionally starting with WITH). move() only extracts/asserts on data - transform or write logic belongs in model().');
     }
     if (stripped.indexOf(';') !== -1) {
-      throw new Error('move(): bigquery source.query/queryFileId must be a single statement - multi-statement scripts (separated by ";") are not allowed.');
+      throw new Error('move(): ' + context + ' must be a single statement - multi-statement scripts (separated by ";") are not allowed.');
     }
+  }
+
+  // Runs a BigQuery query job (Jobs.query) to completion and returns
+  // whichever response - the initial Jobs.query call, or the last
+  // getQueryResults poll - ended up job-complete. A caller that wants more
+  // than that one page (extractBigQuery below) walks pageToken itself from
+  // there. getQueryResults itself long-polls (waits) for job completion up
+  // to its own timeout - unlike a load/copy job's plain status check,
+  // which is why runBigQueryJob above has to back off polling itself - so
+  // there's no need to sleep client-side between these calls too.
+  // queryRequest.maxResults, if given, is carried over to every poll call,
+  // not just the first: the point of setting it at all is a caller that
+  // only wants a bounded first page (runSqlTests below), and a maxResults
+  // that stopped applying the moment a job needed more than one poll to
+  // finish would defeat that.
+  function runBigQueryQueryJob(queryRequest, projectId) {
+    var queryResults = BigQuery.Jobs.query(queryRequest, projectId);
+    var jobId = queryResults.jobReference.jobId;
+    var pollParams = queryRequest.maxResults ? { maxResults: queryRequest.maxResults } : undefined;
+    while (!queryResults.jobComplete) {
+      queryResults = pollParams
+        ? BigQuery.Jobs.getQueryResults(projectId, jobId, pollParams)
+        : BigQuery.Jobs.getQueryResults(projectId, jobId);
+    }
+    return queryResults;
   }
 
   // Reads from BigQuery via the Advanced BigQuery Service - either a whole
   // table or the result of a read-only query. The table identifier is
   // backtick-quoted since it's interpolated into SQL text, even though
   // it's the pipeline author's own declared config, not runtime user
-  // input. getQueryResults itself long-polls (waits) for job completion up
-  // to its own timeout, so there's no need to sleep client-side between
-  // polls. Once the job is done, results are read page by page via
+  // input. Once the job is done, results are read page by page via
   // pageToken so a result set bigger than a single response page isn't
   // silently truncated.
   function extractBigQuery(source) {
     var sql = resolveBigQuerySql(source);
-    assertReadOnlySelect(sql);
-    var queryRequest = {
-      query: sql,
-      useLegacySql: false
-    };
-    var queryResults = BigQuery.Jobs.query(queryRequest, source.projectId);
-
+    assertReadOnlySelect(sql, 'bigquery source.query/queryFileId');
+    var queryResults = runBigQueryQueryJob({ query: sql, useLegacySql: false }, source.projectId);
     var jobId = queryResults.jobReference.jobId;
-    while (!queryResults.jobComplete) {
-      queryResults = BigQuery.Jobs.getQueryResults(source.projectId, jobId);
-    }
 
     var headers = queryResults.schema.fields.map(function (field) { return field.name; });
     var rows = [headers];
@@ -231,19 +299,102 @@ var NotSoBigData = (function () {
     return rows;
   }
 
-  // Expects the API to respond with a JSON array of objects, using the
-  // same key-union flattening as Drive JSON sources.
+  // Adds a query-string parameter to a URL, whether or not it already has
+  // one - used to attach a resolved pagination token to each page after the
+  // first. Both the param name and value are URI-encoded since a token is
+  // server-generated, opaque data, not something move()'s caller composed
+  // by hand.
+  function appendQueryParam(url, param, value) {
+    var separator = url.indexOf('?') === -1 ? '?' : '&';
+    return url + separator + encodeURIComponent(param) + '=' + encodeURIComponent(value);
+  }
+
+  // Walks a cursor-paginated API: calls fetchPage(token) - undefined on the
+  // first call, then whatever resolvePath(page, options.tokenPath) found on
+  // the page before it - until that token comes back undefined (tokenPath
+  // wasn't present on that page at all) or explicit null (tokenPath was
+  // present but the API set it to null - the other common way a
+  // cursor-paginated REST API signals "no more pages", alongside just
+  // omitting the field) - or options.maxPages pages have been fetched,
+  // whichever comes first.
+  // Written knowing nothing about HTTP on purpose - fetchPage just has to
+  // hand back one page's parsed body - even though extractApi below is
+  // currently its only caller: cli.js's IIFE exposes only cli() (see
+  // CLAUDE.md, "One public entrypoint"), so this function itself is not
+  // reachable from a "custom" source's fn the way extractApi's other pieces
+  // aren't either; a custom source wrapping a native Advanced Service call
+  // (e.g. YouTube.Search.list()) would have to walk its own pages by hand.
+  // Every page's rows are accumulated as plain objects and only turned into
+  // a 2D array once, at the end, via one objectsToRows() call - so the
+  // header row is the union of every page's keys, the same "optional
+  // fields don't throw" behavior objectsToRows already gives a single page.
+  //
+  // options.maxPages is required, not defaulted, the same fail-loud posture
+  // as assertReadOnlySelect/resolveBigQuerySql: an API that never stops
+  // returning a next-page token (a bug on its end, or a misconfigured
+  // tokenPath that keeps re-reading the same value) would otherwise loop
+  // until Apps Script's own execution-time limit kills the run.
+  function extractPaginated(fetchPage, options) {
+    if (!options || typeof options.tokenPath !== 'string' || !options.tokenPath) {
+      throw new Error('move(): pagination requires "tokenPath".');
+    }
+    if (typeof options.maxPages !== 'number' || options.maxPages < 1) {
+      throw new Error('move(): pagination requires "maxPages" (a positive number) as a safety cap on how many pages to fetch.');
+    }
+    var allObjects = [];
+    var token;
+    var pageCount = 0;
+    do {
+      var page = fetchPage(token);
+      var pageObjects = options.envelope ? resolvePath(page, options.envelope) : page;
+      if (!Array.isArray(pageObjects)) {
+        throw new Error('move(): pagination envelope "' + options.envelope + '" did not resolve to an array on page ' + (pageCount + 1) + '.');
+      }
+      allObjects = allObjects.concat(pageObjects);
+      token = resolvePath(page, options.tokenPath);
+      pageCount++;
+    } while (token !== undefined && token !== null && pageCount < options.maxPages);
+    return objectsToRows(allObjects);
+  }
+
+  // Expects the API to respond with a JSON array of objects, using the same
+  // key-union flattening as Drive JSON sources - unless "envelope" says the
+  // array lives somewhere else in the body (e.g. 'items' for a response
+  // shaped {"items": [...]}), which resolvePath digs out first. Omitting
+  // "envelope" is byte-identical to this function's original behavior: the
+  // body itself must already be the array, and objectsToRows' own error
+  // message is what points a caller at "envelope" (or a "custom" source) if
+  // it isn't.
+  //
+  // "pagination" (optional: {param, tokenPath, maxPages}) hands the actual
+  // page-walking off to extractPaginated above - this function's only job
+  // is supplying fetchPage: build the next page's URL by attaching the
+  // previous page's resolved token as a query param (the first call has no
+  // token yet, so it fetches source.url unchanged), fetch it, and parse the
+  // JSON body. See extractPaginated's own comment for why maxPages is
+  // required whenever pagination is used at all.
   function extractApi(source) {
     if (!source.url) {
       throw new Error('move(): api source requires "url".');
     }
-    var response = UrlFetchApp.fetch(source.url, source.options || {});
-    var responseCode = response.getResponseCode();
-    if (responseCode < 200 || responseCode >= 300) {
-      throw new Error('move(): api source request to "' + source.url + '" failed with HTTP ' + responseCode + '.');
+    function fetchOnePage(token) {
+      var url = token === undefined ? source.url : appendQueryParam(source.url, source.pagination.param, token);
+      var response = UrlFetchApp.fetch(url, source.options || {});
+      assertHttpOk(response, 'move(): api source request to "' + url + '" failed');
+      return JSON.parse(response.getContentText());
     }
-    var parsed = JSON.parse(response.getContentText());
-    return objectsToRows(parsed);
+    if (source.pagination) {
+      if (!source.pagination.param) {
+        throw new Error('move(): api source "pagination" requires "param" (the query-string parameter to set with the resolved token on subsequent requests).');
+      }
+      return extractPaginated(fetchOnePage, {
+        envelope: source.envelope,
+        tokenPath: source.pagination.tokenPath,
+        maxPages: source.pagination.maxPages
+      });
+    }
+    var parsed = fetchOnePage();
+    return objectsToRows(source.envelope ? resolvePath(parsed, source.envelope) : parsed);
   }
 
   // Runs a user-supplied extractor function from the caller's own Apps
@@ -547,16 +698,69 @@ var NotSoBigData = (function () {
     }
   }
 
-  // Loads rows into a BigQuery table via a load job (data uploaded as CSV)
-  // rather than INSERT statements - the same approach BigQuery's own
-  // tooling uses for bulk loads. Defaults to "append" (WRITE_APPEND)
-  // rather than "overwrite" (WRITE_TRUNCATE): unlike loadSheets above,
-  // truncating a real table is destructive and hard to undo, so that mode
-  // must be opted into explicitly rather than risked by a missing "mode"
-  // key. Jobs.insert here doesn't long-poll the way getQueryResults does
-  // in extractBigQuery, so this polls job status itself, backing off the
-  // sleep between checks (500ms up to a 5s cap) so a longer-running load
-  // job doesn't cost dozens of Jobs.get round trips at a fixed interval.
+  // Inserts a BigQuery load or copy job, then polls its status - backing
+  // off the sleep between checks (500ms up to a 5s cap) so a longer-running
+  // job doesn't cost dozens of Jobs.get round trips at a fixed interval -
+  // until it reaches DONE, throwing if it finished with an error. Shared by
+  // every place this file runs a BigQuery write-side job: loadBigQuery's
+  // direct load, and loadBigQueryStaged's staging load and promotion copy
+  // below. blob is only meaningful for a load job (a copy job has no data
+  // to upload, just table references) - pass null/undefined for a copy.
+  // jobKind ("load"/"copy") only shapes the thrown error message.
+  function runBigQueryJob(jobConfiguration, projectId, blob, jobKind) {
+    var insertedJob = blob
+      ? BigQuery.Jobs.insert(jobConfiguration, projectId, blob)
+      : BigQuery.Jobs.insert(jobConfiguration, projectId);
+    var jobId = insertedJob.jobReference.jobId;
+    var status = insertedJob.status;
+    var pollIntervalMs = 500;
+    while (status.state !== 'DONE') {
+      Utilities.sleep(pollIntervalMs);
+      pollIntervalMs = Math.min(pollIntervalMs * 2, 5000);
+      status = BigQuery.Jobs.get(projectId, jobId).status;
+    }
+    if (status.errorResult) {
+      throw new Error('move(): bigquery ' + jobKind + ' job failed - ' + status.errorResult.message);
+    }
+    return jobId;
+  }
+
+  // Resolves a bigquery target's "mode" down to the writeDisposition it
+  // maps to. Shared by loadBigQuery's direct path and loadBigQueryStaged's
+  // promotion copy below - both need the exact same append/overwrite
+  // decision, just applied to a different kind of job.
+  function resolveBigQueryWriteDisposition(mode) {
+    var writeDisposition = mode === 'overwrite' ? 'WRITE_TRUNCATE' : mode === 'append' ? 'WRITE_APPEND' : null;
+    if (!writeDisposition) {
+      throw new Error('move(): unsupported bigquery target mode "' + mode + '". Expected "overwrite" or "append".');
+    }
+    return writeDisposition;
+  }
+
+  // Resolves target.allowSchemaEvolution + a job's writeDisposition down to
+  // the schemaUpdateOptions array to attach to a load job's config (or
+  // undefined to attach nothing) - used only by loadBigQuery's direct load
+  // path below. NOT used by loadBigQueryStaged's promotion copy job:
+  // schemaUpdateOptions was tried there too originally, but confirmed by
+  // hand (against a real project) not to work on a copy job the way it
+  // does on a load job - see widenDestinationTableForPromotion above,
+  // which is what the staged path actually uses instead. Takes
+  // writeDisposition rather than mode directly: "append" and
+  // "WRITE_APPEND" carry the same fact, and writeDisposition is already
+  // what the caller has in hand by the time it needs this. Gated to
+  // WRITE_APPEND specifically because WRITE_TRUNCATE already replaces the
+  // destination schema wholesale every run - the option would be a no-op
+  // there, so it's simply not attached rather than thrown on as a
+  // harmless combination.
+  function resolveBigQuerySchemaUpdateOptions(target, writeDisposition) {
+    return (target.allowSchemaEvolution && writeDisposition === 'WRITE_APPEND')
+      ? ['ALLOW_FIELD_ADDITION', 'ALLOW_FIELD_RELAXATION']
+      : undefined;
+  }
+
+  // Builds a load job's "configuration.load" body: the shared shape both
+  // loadBigQuery's direct load and loadBigQueryStaged's staging load use,
+  // differing only in destination table and writeDisposition.
   //
   // target.schema is an optional array of BigQuery field defs (e.g.
   // [{name: 'order_id', type: 'STRING'}]) to use instead of
@@ -564,26 +768,9 @@ var NotSoBigData = (function () {
   // which can guess wrong for things like a zero-padded id column
   // ("007") silently becoming an INTEGER - pass target.schema when that
   // matters; omit it and behavior is unchanged.
-  function loadBigQuery(rows, target) {
-    if (!target.projectId || !target.dataset || !target.table) {
-      throw new Error('move(): bigquery target requires "projectId", "dataset", and "table".');
-    }
-    var mode = target.mode || 'append';
-    var writeDisposition = mode === 'overwrite' ? 'WRITE_TRUNCATE' : mode === 'append' ? 'WRITE_APPEND' : null;
-    if (!writeDisposition) {
-      throw new Error('move(): unsupported bigquery target mode "' + mode + '". Expected "overwrite" or "append".');
-    }
-    var result = { projectId: target.projectId, dataset: target.dataset, table: target.table, jobId: null };
-    if (rows.length === 0) {
-      return result;
-    }
-    var blob = Utilities.newBlob(rowsToCsv(rows), 'text/csv');
+  function buildBigQueryLoadConfig(destinationTable, writeDisposition, target) {
     var loadConfig = {
-      destinationTable: {
-        projectId: target.projectId,
-        datasetId: target.dataset,
-        tableId: target.table
-      },
+      destinationTable: destinationTable,
       sourceFormat: 'CSV',
       skipLeadingRows: 1,
       writeDisposition: writeDisposition
@@ -593,19 +780,229 @@ var NotSoBigData = (function () {
     } else {
       loadConfig.autodetect = true;
     }
-    var insertedJob = BigQuery.Jobs.insert({ configuration: { load: loadConfig } }, target.projectId, blob);
-    var jobId = insertedJob.jobReference.jobId;
+    return loadConfig;
+  }
+
+  // Builds a unique staging table id for loadBigQueryStaged below. BigQuery
+  // table ids only allow letters, digits, and underscores - unlike the
+  // Drive filenames this project already builds the same way
+  // (loadDriveXlsx's 'notsobigdata-xlsx-export-' + Utilities.getUuid(),
+  // where dashes are fine), so getUuid()'s dashes are stripped here.
+  function resolveStagingTableId(table) {
+    return '_notsobigdata_stage_' + table + '_' + Utilities.getUuid().replace(/-/g, '');
+  }
+
+  // Runs every target.sqlTests entry against the table loadBigQueryStaged
+  // just staged, substituting "{{ this }}" - deliberately reusing dbt's own
+  // name for "the table this test is about" - with the staged table's
+  // fully-qualified, backtick-quoted name. Each query is expected to
+  // return the rows that violate whatever it's checking (referential
+  // integrity, an aggregate/volume check, ...); zero rows back means the
+  // test passed, mirroring dbt's own generic-test contract. Gated through
+  // assertReadOnlySelect for the same reason a bigquery source's query is:
+  // this SQL runs under the script's live OAuth, and a sql test is
+  // pipeline-author-supplied text, not move()'s own.
+  //
+  // Only a bounded first page is read via runBigQueryQueryJob's
+  // maxResults - getQueryResults already reports totalRows regardless of
+  // page size, so answering "did any rows come back" (and showing a few
+  // examples) doesn't need to pull a potentially huge offending-row set
+  // over the wire just to keep 5 of them, the way an uncapped request
+  // would for a referential check that legitimately finds thousands of
+  // violations. Every declared test still runs even after one has already
+  // failed - collected, not thrown on first sight - so one call surfaces
+  // every failing test at once, the same posture runTests() takes for
+  // config.tests. There is no "discard_row" here (yet): a sql test finding
+  // bad rows can't cheaply un-stage just those rows the way runTests()
+  // filters an in-memory array, and no real user has needed it yet - the
+  // same "not built speculatively" call move.md already makes for
+  // referential checks in general.
+  function runSqlTests(sqlTests, stagedRef) {
+    var thisRef = '`' + stagedRef.projectId + '.' + stagedRef.dataset + '.' + stagedRef.table + '`';
+    var failures = [];
+    sqlTests.forEach(function (test) {
+      if (!test || typeof test.query !== 'string' || !test.query) {
+        throw new Error('move(): every entry in bigquery target.sqlTests needs a "query" (a non-empty string).');
+      }
+      var query = test.query.replace(/\{\{\s*this\s*\}\}/g, thisRef);
+      assertReadOnlySelect(query, 'bigquery target.sqlTests[].query');
+      var queryResults = runBigQueryQueryJob({ query: query, useLegacySql: false, maxResults: 5 }, stagedRef.projectId);
+      var totalRows = Number(queryResults.totalRows || 0);
+      if (totalRows > 0) {
+        var exampleRows = (queryResults.rows || []).slice(0, 5).map(function (row) {
+          return row.f.map(function (cell) { return cell.v; }).join(', ');
+        });
+        failures.push({ name: test.name || query, count: totalRows, exampleRows: exampleRows });
+      }
+    });
+    if (failures.length) {
+      var summary = failures.map(function (f) {
+        return '"' + f.name + '" returned ' + f.count + ' failing row(s) (e.g. ' + f.exampleRows.join(' | ') + ')';
+      }).join('; ');
+      throw new Error('move(): bigquery sql test(s) failed against the staged table - ' + summary + '.');
+    }
+    return { ran: sqlTests.length };
+  }
+
+  // Widens the real destination table's schema to include any column the
+  // staged table has that it doesn't, by patching the table directly
+  // (Tables.patch) before loadBigQueryStaged's promotion copy job runs -
+  // not via the copy job's own schemaUpdateOptions, which was tried first
+  // and confirmed by hand, against a real project, not to work the way a
+  // load job's does: a copy job still rejected a schema mismatch with
+  // schemaUpdateOptions set, failing with "Provided Schema does not match
+  // Table ... Cannot add fields". Patching the destination ahead of time
+  // means the copy job never sees a mismatch to reject in the first
+  // place.
+  //
+  // Only additive (a new column, appended as NULLABLE - the only mode
+  // Tables.patch can add a column as). Does not attempt
+  // ALLOW_FIELD_RELAXATION's REQUIRED-to-NULLABLE case here - that was
+  // never confirmed working on either job kind (the schema-evolution
+  // feature's own GAS test only exercises field addition too) and isn't
+  // the bug this fixes. Don't assume it works without separately
+  // verifying it.
+  //
+  // If the destination table doesn't exist yet, Tables.get throws and this
+  // returns without patching anything - there's nothing to widen, and the
+  // copy job below creates the table fresh from the staged schema, the
+  // same as a load job would for a brand-new table.
+  function widenDestinationTableForPromotion(target, stagingTable) {
+    var destination;
+    try {
+      destination = BigQuery.Tables.get(target.projectId, target.dataset, target.table);
+    } catch (error) {
+      return;
+    }
+    var existingNames = {};
+    destination.schema.fields.forEach(function (field) { existingNames[field.name] = true; });
+    var stagedFields = BigQuery.Tables.get(target.projectId, target.dataset, stagingTable).schema.fields;
+    var newFields = stagedFields.filter(function (field) { return !existingNames[field.name]; });
+    if (!newFields.length) {
+      return;
+    }
+    BigQuery.Tables.patch(
+      { schema: { fields: destination.schema.fields.concat(newFields) } },
+      target.projectId, target.dataset, target.table
+    );
+  }
+
+  // Stages rows into a brand-new scratch table, runs target.sqlTests
+  // against it, and only if every test passes promotes - via a BigQuery
+  // copy job, not a second CSV upload - into the real target. A failing
+  // sql test throws out of runSqlTests before promotion ever runs, so the
+  // table a pipeline actually reads from is never touched by a batch that
+  // failed its checks. See README.md's bigquery target section for the
+  // config shape.
+  //
+  // The staging table is created explicitly (BigQuery.Tables.insert)
+  // rather than left to the load job's own auto-create, specifically so an
+  // expirationTime can be set before any data lands - a durable,
+  // BigQuery-side cleanup guarantee that doesn't depend on this script
+  // execution ever reaching the finally block below. Apps Script's own
+  // execution-timeout kill doesn't guarantee a finally runs, and this
+  // project already learned the cost of an unattended process leaving
+  // scratch resources behind the hard way (see CLAUDE.md's "About
+  // testing" - Drive load-test fixtures piling up to 30 files before
+  // anyone noticed). The finally block is still the primary cleanup path;
+  // expirationTime is a backstop, not a substitute for it.
+  function loadBigQueryStaged(rows, target, writeDisposition) {
+    var stagingTable = resolveStagingTableId(target.table);
+    BigQuery.Tables.insert(
+      {
+        tableReference: { projectId: target.projectId, datasetId: target.dataset, tableId: stagingTable },
+        expirationTime: String(Date.now() + 60 * 60 * 1000)
+      },
+      target.projectId,
+      target.dataset
+    );
+    try {
+      var blob = Utilities.newBlob(rowsToCsv(rows), 'text/csv');
+      var stagingLoadConfig = buildBigQueryLoadConfig(
+        { projectId: target.projectId, datasetId: target.dataset, tableId: stagingTable },
+        'WRITE_TRUNCATE',
+        target
+      );
+      var stagingJobId = runBigQueryJob({ configuration: { load: stagingLoadConfig } }, target.projectId, blob, 'load');
+
+      var testResults = runSqlTests(target.sqlTests, { projectId: target.projectId, dataset: target.dataset, table: stagingTable });
+
+      if (target.allowSchemaEvolution && writeDisposition === 'WRITE_APPEND') {
+        widenDestinationTableForPromotion(target, stagingTable);
+      }
+
+      var copyConfig = {
+        sourceTable: { projectId: target.projectId, datasetId: target.dataset, tableId: stagingTable },
+        destinationTable: { projectId: target.projectId, datasetId: target.dataset, tableId: target.table },
+        writeDisposition: writeDisposition
+      };
+      var promoteJobId = runBigQueryJob({ configuration: { copy: copyConfig } }, target.projectId, null, 'copy');
+
+      return {
+        projectId: target.projectId, dataset: target.dataset, table: target.table, jobId: promoteJobId,
+        staged: { table: stagingTable, jobId: stagingJobId },
+        sqlTestResults: testResults
+      };
+    } finally {
+      BigQuery.Tables.remove(target.projectId, target.dataset, stagingTable);
+    }
+  }
+
+  // Loads rows into a BigQuery table via a load job (data uploaded as CSV)
+  // rather than INSERT statements - the same approach BigQuery's own
+  // tooling uses for bulk loads. Defaults to "append" (WRITE_APPEND)
+  // rather than "overwrite" (WRITE_TRUNCATE): unlike loadSheets above,
+  // truncating a real table is destructive and hard to undo, so that mode
+  // must be opted into explicitly rather than risked by a missing "mode"
+  // key.
+  //
+  // target.allowSchemaEvolution (optional, default false) is BigQuery's
+  // own schemaUpdateOptions, opted into explicitly - same posture as
+  // "overwrite" mode above: destructive-adjacent behavior needs an
+  // explicit flag, not a default. Without it, a source that has grown a
+  // column the destination table doesn't have fails the load job outright
+  // (safe, but a hard stop until a human ALTERs the table by hand). With
+  // it, in "append" mode only, BigQuery is allowed to ALLOW_FIELD_ADDITION
+  // (a new column can appear) and ALLOW_FIELD_RELAXATION (an existing
+  // REQUIRED column can loosen to NULLABLE) as part of the load job -
+  // additive changes only. A real type change or a renamed/dropped column
+  // still fails the job either way; BigQuery itself has no
+  // schemaUpdateOptions for those, and silently coercing or dropping data
+  // would be worse than today's loud failure. See
+  // resolveBigQuerySchemaUpdateOptions above for why this is gated to
+  // "append" specifically, shared with loadBigQueryStaged's promotion
+  // copy job below.
+  //
+  // target.sqlTests (optional array of {name, query}) routes the whole
+  // load through loadBigQueryStaged above instead of the direct path
+  // below - stage, test, only then promote. Omit it (or leave it an empty
+  // array) and this function is byte-for-byte what it always was: a
+  // pipeline that doesn't ask for staging pays nothing extra for it.
+  function loadBigQuery(rows, target) {
+    if (!target.projectId || !target.dataset || !target.table) {
+      throw new Error('move(): bigquery target requires "projectId", "dataset", and "table".');
+    }
+    var mode = target.mode || 'append';
+    var writeDisposition = resolveBigQueryWriteDisposition(mode);
+    var result = { projectId: target.projectId, dataset: target.dataset, table: target.table, jobId: null };
+    if (rows.length === 0) {
+      return result;
+    }
+    if (target.sqlTests && target.sqlTests.length) {
+      return loadBigQueryStaged(rows, target, writeDisposition);
+    }
+    var blob = Utilities.newBlob(rowsToCsv(rows), 'text/csv');
+    var loadConfig = buildBigQueryLoadConfig(
+      { projectId: target.projectId, datasetId: target.dataset, tableId: target.table },
+      writeDisposition,
+      target
+    );
+    var loadSchemaUpdateOptions = resolveBigQuerySchemaUpdateOptions(target, writeDisposition);
+    if (loadSchemaUpdateOptions) {
+      loadConfig.schemaUpdateOptions = loadSchemaUpdateOptions;
+    }
+    var jobId = runBigQueryJob({ configuration: { load: loadConfig } }, target.projectId, blob, 'load');
     result.jobId = jobId;
-    var status = insertedJob.status;
-    var pollIntervalMs = 500;
-    while (status.state !== 'DONE') {
-      Utilities.sleep(pollIntervalMs);
-      pollIntervalMs = Math.min(pollIntervalMs * 2, 5000);
-      status = BigQuery.Jobs.get(target.projectId, jobId).status;
-    }
-    if (status.errorResult) {
-      throw new Error('move(): bigquery load job failed - ' + status.errorResult.message);
-    }
     return result;
   }
 
@@ -1364,6 +1761,131 @@ var NotSoBigData = (function () {
     return results;
   }
 
+  // Counts each status in a runNodes() result set and renders it as the
+  // "DONE" summary line cli() logs at the end of a run/list - see there.
+  // Only non-zero counts are rendered - a "list" run (every node
+  // "planned") would otherwise print "0 passed, 0 failed, 0 skipped, 5
+  // planned", which buries the one number that matters in noise nobody
+  // asked about. One function rather than a count/format split: this
+  // project's tests are black-box (a human runs cli() from the Apps
+  // Script editor - see CLAUDE.md's "About testing"), so there is no
+  // caller that would ever want the raw counts independent of this one
+  // string.
+  function formatStatusCounts(results) {
+    var counts = { success: 0, failed: 0, skipped: 0, planned: 0 };
+    results.forEach(function (result) { counts[result.status] += 1; });
+    var labels = { success: 'passed', failed: 'failed', skipped: 'skipped', planned: 'planned' };
+    var parts = ['success', 'failed', 'skipped', 'planned']
+      .filter(function (status) { return counts[status] > 0; })
+      .map(function (status) { return counts[status] + ' ' + labels[status]; });
+    return parts.length ? parts.join(', ') : 'nothing to do';
+  }
+
+  // Reads the optional notsobigdataManifest global the same guarded way
+  // discoverNodes() reads every other global - the read must never throw
+  // because of something this library doesn't own. Every field is
+  // optional; omitting the global entirely gives all three defaults.
+  function resolveManifestConfig() {
+    var raw;
+    try {
+      raw = globalThis.notsobigdataManifest;
+    } catch (error) {
+      raw = undefined;
+    }
+    var config = (raw && typeof raw === 'object') ? raw : {};
+    return {
+      enabled: config.enabled !== false,
+      folderId: typeof config.folderId === 'string' && config.folderId ? config.folderId : null,
+      fileName: typeof config.fileName === 'string' && config.fileName ? config.fileName : 'notsobigdata-manifest.json'
+    };
+  }
+
+  // Auto-detects "the folder the Apps Script project lives in" when no
+  // explicit folderId is configured - every Apps Script project has its own
+  // Drive file entry, even standalone ones, so its parent folder is the
+  // project's folder. Falls back to Drive's root when that file has no
+  // parent (e.g. it sits directly in "My Drive").
+  function resolveManifestFolderId(folderId) {
+    if (folderId) {
+      return folderId;
+    }
+    var scriptFile = DriveApp.getFileById(ScriptApp.getScriptId());
+    var parents = scriptFile.getParents();
+    return parents.hasNext() ? parents.next().getId() : DriveApp.getRootFolder().getId();
+  }
+
+  // Turns one runNodes() result into a manifest-safe summary. Kind-agnostic
+  // by construction: it never branches on node.kind, only on the *shape* of
+  // the result (an array of rows, or an object carrying loadResult/
+  // testResults) - the same shape every EXECUTORS entry already produces.
+  // The raw rows are never included, only their size - a manifest is an
+  // observability artifact, not a second copy of the data that already
+  // landed at its real destination.
+  function summarizeNodeResult(result) {
+    var summary = { name: result.name, kind: result.kind, status: result.status };
+    if (result.status === 'skipped') {
+      summary.blockedBy = result.blockedBy;
+    } else if (result.status === 'failed') {
+      summary.ms = result.ms;
+      summary.error = result.error;
+    } else if (result.status === 'success') {
+      summary.ms = result.ms;
+      if (Array.isArray(result.result)) {
+        summary.rowCount = result.result.length;
+        summary.columnCount = Array.isArray(result.result[0]) ? result.result[0].length : 0;
+      }
+      if (result.result && result.result.loadResult !== undefined) {
+        summary.loadResult = result.result.loadResult;
+      }
+      if (result.result && result.result.testResults !== undefined) {
+        summary.testResults = result.result.testResults;
+      }
+    }
+    return summary;
+  }
+
+  function buildManifest(commandText, ok, results, ignored) {
+    return {
+      notsobigdata: 'manifest',
+      version: 1,
+      generatedAt: new Date().toISOString(),
+      command: String(commandText).trim(),
+      ok: ok,
+      nodes: results.map(summarizeNodeResult),
+      ignored: ignored
+    };
+  }
+
+  // Writes the run manifest to Drive, overwriting the same file every time
+  // (found by name via upsertByName, never a fresh file per run - creating
+  // one per run is exactly the pattern that piled up duplicate fixture
+  // files in the test project before, see CLAUDE.md's "About testing").
+  // Best-effort: a Drive failure here must never throw or affect the
+  // node results actually being reported, so every path is caught and
+  // turned into one of three report.manifest shapes instead.
+  //
+  // Reuses resolveDriveWriteTarget/writeDriveText from move.js rather than
+  // re-implementing "resolve an existing file or create one" a second
+  // time - the first helper call to cross the move.js/cli.js boundary, and
+  // deliberately so: this is genuinely the same primitive loadDriveJson
+  // already uses, not new drive-writing logic.
+  function writeManifest(commandText, ok, results, ignored) {
+    var config = resolveManifestConfig();
+    if (!config.enabled) {
+      return { written: false, reason: 'disabled' };
+    }
+    try {
+      var folderId = resolveManifestFolderId(config.folderId);
+      var manifest = buildManifest(commandText, ok, results, ignored);
+      var target = { folderId: folderId, fileName: config.fileName, upsertByName: true };
+      var fileId = resolveDriveWriteTarget(target);
+      fileId = writeDriveText(fileId, target, JSON.stringify(manifest, null, 2), MimeType.PLAIN_TEXT);
+      return { written: true, fileId: fileId };
+    } catch (error) {
+      return { written: false, reason: 'error', error: error.message };
+    }
+  }
+
   // The smoke test. This is the first thing to run when anything looks
   // wrong, so it is the one command that never throws: it has to be able
   // to report "I found nothing" as a finding rather than as a failure,
@@ -1402,7 +1924,18 @@ var NotSoBigData = (function () {
   // The single public entrypoint. Takes one command string and returns
   // either a run report (for "run"/"list") or a message string (for
   // "hello"/"help").
+  //
+  // Logs "START"/"DONE" bookends around every call, padded to the same
+  // six characters as runNodes()'s own "OK"/"FAIL"/"SKIP"/"PLAN" labels so
+  // every line in the execution log lines up. "START" is the very first
+  // thing this function does, before parseCommand() - so a call that
+  // throws immediately (an unknown command, zero discovered nodes) still
+  // leaves a marker that cli() actually ran, not silence up to the error.
+  // "DONE" only fires for "run"/"list": hello()/help() already log their
+  // own single result line and have no per-node pass/fail/skip status to
+  // roll up. Both are pure Logger.log side effects - report is unchanged.
   function cli(input) {
+    Logger.log('START cli("' + input + '")');
     var parsed = parseCommand(input);
     if (parsed.command === 'help') {
       var helpText = usage();
@@ -1423,12 +1956,21 @@ var NotSoBigData = (function () {
     }
     var ordered = orderNodes(selected);
     var results = runNodes(ordered, parsed.command === 'list');
-    return {
-      ok: results.every(function (result) { return result.status !== 'failed' && result.status !== 'skipped'; }),
+    var ok = results.every(function (result) { return result.status !== 'failed' && result.status !== 'skipped'; });
+    Logger.log('DONE  cli("' + input + '") - ' + formatStatusCounts(results) + ' (' + results.length + ' total).');
+    var report = {
+      ok: ok,
       command: parsed.command,
       nodes: results,
       ignored: discovered.ignored
     };
+    // Only "run" writes a manifest - "list" is a dry run where nothing
+    // executed, and overwriting the last real run's record with a no-op
+    // would defeat the "reflects what actually happened" point of it.
+    if (parsed.command === 'run') {
+      report.manifest = writeManifest(input, ok, results, discovered.ignored);
+    }
+    return report;
   }
 
   return {

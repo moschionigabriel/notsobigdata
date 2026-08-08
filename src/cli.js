@@ -386,6 +386,131 @@ function runNodes(nodes, dryRun) {
   return results;
 }
 
+// Counts each status in a runNodes() result set and renders it as the
+// "DONE" summary line cli() logs at the end of a run/list - see there.
+// Only non-zero counts are rendered - a "list" run (every node
+// "planned") would otherwise print "0 passed, 0 failed, 0 skipped, 5
+// planned", which buries the one number that matters in noise nobody
+// asked about. One function rather than a count/format split: this
+// project's tests are black-box (a human runs cli() from the Apps
+// Script editor - see CLAUDE.md's "About testing"), so there is no
+// caller that would ever want the raw counts independent of this one
+// string.
+function formatStatusCounts(results) {
+  var counts = { success: 0, failed: 0, skipped: 0, planned: 0 };
+  results.forEach(function (result) { counts[result.status] += 1; });
+  var labels = { success: 'passed', failed: 'failed', skipped: 'skipped', planned: 'planned' };
+  var parts = ['success', 'failed', 'skipped', 'planned']
+    .filter(function (status) { return counts[status] > 0; })
+    .map(function (status) { return counts[status] + ' ' + labels[status]; });
+  return parts.length ? parts.join(', ') : 'nothing to do';
+}
+
+// Reads the optional notsobigdataManifest global the same guarded way
+// discoverNodes() reads every other global - the read must never throw
+// because of something this library doesn't own. Every field is
+// optional; omitting the global entirely gives all three defaults.
+function resolveManifestConfig() {
+  var raw;
+  try {
+    raw = globalThis.notsobigdataManifest;
+  } catch (error) {
+    raw = undefined;
+  }
+  var config = (raw && typeof raw === 'object') ? raw : {};
+  return {
+    enabled: config.enabled !== false,
+    folderId: typeof config.folderId === 'string' && config.folderId ? config.folderId : null,
+    fileName: typeof config.fileName === 'string' && config.fileName ? config.fileName : 'notsobigdata-manifest.json'
+  };
+}
+
+// Auto-detects "the folder the Apps Script project lives in" when no
+// explicit folderId is configured - every Apps Script project has its own
+// Drive file entry, even standalone ones, so its parent folder is the
+// project's folder. Falls back to Drive's root when that file has no
+// parent (e.g. it sits directly in "My Drive").
+function resolveManifestFolderId(folderId) {
+  if (folderId) {
+    return folderId;
+  }
+  var scriptFile = DriveApp.getFileById(ScriptApp.getScriptId());
+  var parents = scriptFile.getParents();
+  return parents.hasNext() ? parents.next().getId() : DriveApp.getRootFolder().getId();
+}
+
+// Turns one runNodes() result into a manifest-safe summary. Kind-agnostic
+// by construction: it never branches on node.kind, only on the *shape* of
+// the result (an array of rows, or an object carrying loadResult/
+// testResults) - the same shape every EXECUTORS entry already produces.
+// The raw rows are never included, only their size - a manifest is an
+// observability artifact, not a second copy of the data that already
+// landed at its real destination.
+function summarizeNodeResult(result) {
+  var summary = { name: result.name, kind: result.kind, status: result.status };
+  if (result.status === 'skipped') {
+    summary.blockedBy = result.blockedBy;
+  } else if (result.status === 'failed') {
+    summary.ms = result.ms;
+    summary.error = result.error;
+  } else if (result.status === 'success') {
+    summary.ms = result.ms;
+    if (Array.isArray(result.result)) {
+      summary.rowCount = result.result.length;
+      summary.columnCount = Array.isArray(result.result[0]) ? result.result[0].length : 0;
+    }
+    if (result.result && result.result.loadResult !== undefined) {
+      summary.loadResult = result.result.loadResult;
+    }
+    if (result.result && result.result.testResults !== undefined) {
+      summary.testResults = result.result.testResults;
+    }
+  }
+  return summary;
+}
+
+function buildManifest(commandText, ok, results, ignored) {
+  return {
+    notsobigdata: 'manifest',
+    version: 1,
+    generatedAt: new Date().toISOString(),
+    command: String(commandText).trim(),
+    ok: ok,
+    nodes: results.map(summarizeNodeResult),
+    ignored: ignored
+  };
+}
+
+// Writes the run manifest to Drive, overwriting the same file every time
+// (found by name via upsertByName, never a fresh file per run - creating
+// one per run is exactly the pattern that piled up duplicate fixture
+// files in the test project before, see CLAUDE.md's "About testing").
+// Best-effort: a Drive failure here must never throw or affect the
+// node results actually being reported, so every path is caught and
+// turned into one of three report.manifest shapes instead.
+//
+// Reuses resolveDriveWriteTarget/writeDriveText from move.js rather than
+// re-implementing "resolve an existing file or create one" a second
+// time - the first helper call to cross the move.js/cli.js boundary, and
+// deliberately so: this is genuinely the same primitive loadDriveJson
+// already uses, not new drive-writing logic.
+function writeManifest(commandText, ok, results, ignored) {
+  var config = resolveManifestConfig();
+  if (!config.enabled) {
+    return { written: false, reason: 'disabled' };
+  }
+  try {
+    var folderId = resolveManifestFolderId(config.folderId);
+    var manifest = buildManifest(commandText, ok, results, ignored);
+    var target = { folderId: folderId, fileName: config.fileName, upsertByName: true };
+    var fileId = resolveDriveWriteTarget(target);
+    fileId = writeDriveText(fileId, target, JSON.stringify(manifest, null, 2), MimeType.PLAIN_TEXT);
+    return { written: true, fileId: fileId };
+  } catch (error) {
+    return { written: false, reason: 'error', error: error.message };
+  }
+}
+
 // The smoke test. This is the first thing to run when anything looks
 // wrong, so it is the one command that never throws: it has to be able
 // to report "I found nothing" as a finding rather than as a failure,
@@ -424,7 +549,18 @@ function hello() {
 // The single public entrypoint. Takes one command string and returns
 // either a run report (for "run"/"list") or a message string (for
 // "hello"/"help").
+//
+// Logs "START"/"DONE" bookends around every call, padded to the same
+// six characters as runNodes()'s own "OK"/"FAIL"/"SKIP"/"PLAN" labels so
+// every line in the execution log lines up. "START" is the very first
+// thing this function does, before parseCommand() - so a call that
+// throws immediately (an unknown command, zero discovered nodes) still
+// leaves a marker that cli() actually ran, not silence up to the error.
+// "DONE" only fires for "run"/"list": hello()/help() already log their
+// own single result line and have no per-node pass/fail/skip status to
+// roll up. Both are pure Logger.log side effects - report is unchanged.
 function cli(input) {
+  Logger.log('START cli("' + input + '")');
   var parsed = parseCommand(input);
   if (parsed.command === 'help') {
     var helpText = usage();
@@ -445,10 +581,19 @@ function cli(input) {
   }
   var ordered = orderNodes(selected);
   var results = runNodes(ordered, parsed.command === 'list');
-  return {
-    ok: results.every(function (result) { return result.status !== 'failed' && result.status !== 'skipped'; }),
+  var ok = results.every(function (result) { return result.status !== 'failed' && result.status !== 'skipped'; });
+  Logger.log('DONE  cli("' + input + '") - ' + formatStatusCounts(results) + ' (' + results.length + ' total).');
+  var report = {
+    ok: ok,
     command: parsed.command,
     nodes: results,
     ignored: discovered.ignored
   };
+  // Only "run" writes a manifest - "list" is a dry run where nothing
+  // executed, and overwriting the last real run's record with a no-op
+  // would defeat the "reflects what actually happened" point of it.
+  if (parsed.command === 'run') {
+    report.manifest = writeManifest(input, ok, results, discovered.ignored);
+  }
+  return report;
 }
