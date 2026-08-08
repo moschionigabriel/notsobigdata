@@ -208,23 +208,30 @@ var NotSoBigData = (function () {
     return readDriveFileText(source.queryFileId);
   }
 
-  // Guards against a bigquery source running anything other than a single
-  // read statement. This is a footgun-preventing keyword/shape check, not a
-  // security boundary: it only strips comments, looks at the leading
-  // keyword, and rejects multiple ";"-separated statements, so it won't
-  // catch e.g. a SELECT that calls a mutating stored routine. move()'s job
-  // is extracting data - transforming/writing it belongs in model().
-  function assertReadOnlySelect(sql) {
+  // Guards against a piece of pipeline-author-supplied SQL doing anything
+  // other than a single read statement. This is a footgun-preventing
+  // keyword/shape check, not a security boundary: it only strips comments,
+  // looks at the leading keyword, and rejects multiple ";"-separated
+  // statements, so it won't catch e.g. a SELECT that calls a mutating
+  // stored routine. move()'s job is extracting/asserting on data -
+  // transforming/writing it belongs in model().
+  //
+  // "context" is only used to phrase the thrown message - shared by every
+  // call site that hands move() raw SQL to run under the script's live
+  // OAuth (a bigquery source's query/queryFileId, and a bigquery target's
+  // sqlTests[].query) rather than each one repeating this same check with
+  // its own wording.
+  function assertReadOnlySelect(sql, context) {
     var stripped = sql
       .replace(/--[^\n]*/g, '')
       .replace(/\/\*[\s\S]*?\*\//g, '')
       .trim()
       .replace(/;\s*$/, '');
     if (!/^(select|with)\b/i.test(stripped)) {
-      throw new Error('move(): bigquery source.query/queryFileId must be a read-only SELECT (optionally starting with WITH). move() only extracts data - transform or write logic belongs in model().');
+      throw new Error('move(): ' + context + ' must be a read-only SELECT (optionally starting with WITH). move() only extracts/asserts on data - transform or write logic belongs in model().');
     }
     if (stripped.indexOf(';') !== -1) {
-      throw new Error('move(): bigquery source.query/queryFileId must be a single statement - multi-statement scripts (separated by ";") are not allowed.');
+      throw new Error('move(): ' + context + ' must be a single statement - multi-statement scripts (separated by ";") are not allowed.');
     }
   }
 
@@ -239,7 +246,7 @@ var NotSoBigData = (function () {
   // silently truncated.
   function extractBigQuery(source) {
     var sql = resolveBigQuerySql(source);
-    assertReadOnlySelect(sql);
+    assertReadOnlySelect(sql, 'bigquery source.query/queryFileId');
     var queryRequest = {
       query: sql,
       useLegacySql: false
@@ -673,16 +680,48 @@ var NotSoBigData = (function () {
     }
   }
 
-  // Loads rows into a BigQuery table via a load job (data uploaded as CSV)
-  // rather than INSERT statements - the same approach BigQuery's own
-  // tooling uses for bulk loads. Defaults to "append" (WRITE_APPEND)
-  // rather than "overwrite" (WRITE_TRUNCATE): unlike loadSheets above,
-  // truncating a real table is destructive and hard to undo, so that mode
-  // must be opted into explicitly rather than risked by a missing "mode"
-  // key. Jobs.insert here doesn't long-poll the way getQueryResults does
-  // in extractBigQuery, so this polls job status itself, backing off the
-  // sleep between checks (500ms up to a 5s cap) so a longer-running load
-  // job doesn't cost dozens of Jobs.get round trips at a fixed interval.
+  // Inserts a BigQuery load or copy job, then polls its status - backing
+  // off the sleep between checks (500ms up to a 5s cap) so a longer-running
+  // job doesn't cost dozens of Jobs.get round trips at a fixed interval -
+  // until it reaches DONE, throwing if it finished with an error. Shared by
+  // every place this file runs a BigQuery write-side job: loadBigQuery's
+  // direct load, and loadBigQueryStaged's staging load and promotion copy
+  // below. blob is only meaningful for a load job (a copy job has no data
+  // to upload, just table references) - pass null/undefined for a copy.
+  // jobKind ("load"/"copy") only shapes the thrown error message.
+  function runBigQueryJob(jobConfiguration, projectId, blob, jobKind) {
+    var insertedJob = blob
+      ? BigQuery.Jobs.insert(jobConfiguration, projectId, blob)
+      : BigQuery.Jobs.insert(jobConfiguration, projectId);
+    var jobId = insertedJob.jobReference.jobId;
+    var status = insertedJob.status;
+    var pollIntervalMs = 500;
+    while (status.state !== 'DONE') {
+      Utilities.sleep(pollIntervalMs);
+      pollIntervalMs = Math.min(pollIntervalMs * 2, 5000);
+      status = BigQuery.Jobs.get(projectId, jobId).status;
+    }
+    if (status.errorResult) {
+      throw new Error('move(): bigquery ' + jobKind + ' job failed - ' + status.errorResult.message);
+    }
+    return jobId;
+  }
+
+  // Resolves a bigquery target's "mode" down to the writeDisposition it
+  // maps to. Shared by loadBigQuery's direct path and loadBigQueryStaged's
+  // promotion copy below - both need the exact same append/overwrite
+  // decision, just applied to a different kind of job.
+  function resolveBigQueryWriteDisposition(mode) {
+    var writeDisposition = mode === 'overwrite' ? 'WRITE_TRUNCATE' : mode === 'append' ? 'WRITE_APPEND' : null;
+    if (!writeDisposition) {
+      throw new Error('move(): unsupported bigquery target mode "' + mode + '". Expected "overwrite" or "append".');
+    }
+    return writeDisposition;
+  }
+
+  // Builds a load job's "configuration.load" body: the shared shape both
+  // loadBigQuery's direct load and loadBigQueryStaged's staging load use,
+  // differing only in destination table and writeDisposition.
   //
   // target.schema is an optional array of BigQuery field defs (e.g.
   // [{name: 'order_id', type: 'STRING'}]) to use instead of
@@ -690,6 +729,150 @@ var NotSoBigData = (function () {
   // which can guess wrong for things like a zero-padded id column
   // ("007") silently becoming an INTEGER - pass target.schema when that
   // matters; omit it and behavior is unchanged.
+  function buildBigQueryLoadConfig(destinationTable, writeDisposition, target) {
+    var loadConfig = {
+      destinationTable: destinationTable,
+      sourceFormat: 'CSV',
+      skipLeadingRows: 1,
+      writeDisposition: writeDisposition
+    };
+    if (target.schema) {
+      loadConfig.schema = { fields: target.schema };
+    } else {
+      loadConfig.autodetect = true;
+    }
+    return loadConfig;
+  }
+
+  // Builds a unique staging table id for loadBigQueryStaged below. BigQuery
+  // table ids only allow letters, digits, and underscores - unlike the
+  // Drive filenames this project already builds the same way
+  // (loadDriveXlsx's 'notsobigdata-xlsx-export-' + Utilities.getUuid(),
+  // where dashes are fine), so getUuid()'s dashes are stripped here.
+  function resolveStagingTableId(table) {
+    return '_notsobigdata_stage_' + table + '_' + Utilities.getUuid().replace(/-/g, '');
+  }
+
+  // Runs every target.sqlTests entry against the table loadBigQueryStaged
+  // just staged, substituting "{{ this }}" - deliberately reusing dbt's own
+  // name for "the table this test is about" - with the staged table's
+  // fully-qualified, backtick-quoted name. Each query is expected to
+  // return the rows that violate whatever it's checking (referential
+  // integrity, an aggregate/volume check, ...); zero rows back means the
+  // test passed, mirroring dbt's own generic-test contract. Gated through
+  // assertReadOnlySelect for the same reason a bigquery source's query is:
+  // this SQL runs under the script's live OAuth, and a sql test is
+  // pipeline-author-supplied text, not move()'s own.
+  //
+  // Only the first result page is read - getQueryResults already reports
+  // totalRows on page one, so answering "did any rows come back" (and
+  // showing a few examples) doesn't need extractBigQuery's full pageToken
+  // walk. Every declared test still runs even after one has already
+  // failed - collected, not thrown on first sight - so one call surfaces
+  // every failing test at once, the same posture runTests() takes for
+  // config.tests. There is no "discard_row" here (yet): a sql test finding
+  // bad rows can't cheaply un-stage just those rows the way runTests()
+  // filters an in-memory array, and no real user has needed it yet - the
+  // same "not built speculatively" call move.md already makes for
+  // referential checks in general.
+  function runSqlTests(sqlTests, stagedRef) {
+    var thisRef = '`' + stagedRef.projectId + '.' + stagedRef.dataset + '.' + stagedRef.table + '`';
+    var failures = [];
+    sqlTests.forEach(function (test) {
+      if (!test || typeof test.query !== 'string' || !test.query) {
+        throw new Error('move(): every entry in bigquery target.sqlTests needs a "query" (a non-empty string).');
+      }
+      var query = test.query.replace(/\{\{\s*this\s*\}\}/g, thisRef);
+      assertReadOnlySelect(query, 'bigquery target.sqlTests[].query');
+      var queryResults = BigQuery.Jobs.query({ query: query, useLegacySql: false }, stagedRef.projectId);
+      var jobId = queryResults.jobReference.jobId;
+      while (!queryResults.jobComplete) {
+        queryResults = BigQuery.Jobs.getQueryResults(stagedRef.projectId, jobId);
+      }
+      var totalRows = Number(queryResults.totalRows || 0);
+      if (totalRows > 0) {
+        var exampleRows = (queryResults.rows || []).slice(0, 5).map(function (row) {
+          return row.f.map(function (cell) { return cell.v; }).join(', ');
+        });
+        failures.push({ name: test.name || query, count: totalRows, exampleRows: exampleRows });
+      }
+    });
+    if (failures.length) {
+      var summary = failures.map(function (f) {
+        return '"' + f.name + '" returned ' + f.count + ' failing row(s) (e.g. ' + f.exampleRows.join(' | ') + ')';
+      }).join('; ');
+      throw new Error('move(): bigquery sql test(s) failed against the staged table - ' + summary + '.');
+    }
+    return { ran: sqlTests.length };
+  }
+
+  // Stages rows into a brand-new scratch table, runs target.sqlTests
+  // against it, and only if every test passes promotes - via a BigQuery
+  // copy job, not a second CSV upload - into the real target. A failing
+  // sql test throws out of runSqlTests before promotion ever runs, so the
+  // table a pipeline actually reads from is never touched by a batch that
+  // failed its checks. See README.md's bigquery target section for the
+  // config shape.
+  //
+  // The staging table is created explicitly (BigQuery.Tables.insert)
+  // rather than left to the load job's own auto-create, specifically so an
+  // expirationTime can be set before any data lands - a durable,
+  // BigQuery-side cleanup guarantee that doesn't depend on this script
+  // execution ever reaching the finally block below. Apps Script's own
+  // execution-timeout kill doesn't guarantee a finally runs, and this
+  // project already learned the cost of an unattended process leaving
+  // scratch resources behind the hard way (see CLAUDE.md's "About
+  // testing" - Drive load-test fixtures piling up to 30 files before
+  // anyone noticed). The finally block is still the primary cleanup path;
+  // expirationTime is a backstop, not a substitute for it.
+  function loadBigQueryStaged(rows, target, mode, writeDisposition) {
+    var stagingTable = resolveStagingTableId(target.table);
+    BigQuery.Tables.insert(
+      {
+        tableReference: { projectId: target.projectId, datasetId: target.dataset, tableId: stagingTable },
+        expirationTime: String(Date.now() + 60 * 60 * 1000)
+      },
+      target.projectId,
+      target.dataset
+    );
+    try {
+      var blob = Utilities.newBlob(rowsToCsv(rows), 'text/csv');
+      var stagingLoadConfig = buildBigQueryLoadConfig(
+        { projectId: target.projectId, datasetId: target.dataset, tableId: stagingTable },
+        'WRITE_TRUNCATE',
+        target
+      );
+      var stagingJobId = runBigQueryJob({ configuration: { load: stagingLoadConfig } }, target.projectId, blob, 'load');
+
+      var testResults = runSqlTests(target.sqlTests, { projectId: target.projectId, dataset: target.dataset, table: stagingTable });
+
+      var copyConfig = {
+        sourceTable: { projectId: target.projectId, datasetId: target.dataset, tableId: stagingTable },
+        destinationTable: { projectId: target.projectId, datasetId: target.dataset, tableId: target.table },
+        writeDisposition: writeDisposition
+      };
+      if (target.allowSchemaEvolution && mode === 'append') {
+        copyConfig.schemaUpdateOptions = ['ALLOW_FIELD_ADDITION', 'ALLOW_FIELD_RELAXATION'];
+      }
+      var promoteJobId = runBigQueryJob({ configuration: { copy: copyConfig } }, target.projectId, null, 'copy');
+
+      return {
+        projectId: target.projectId, dataset: target.dataset, table: target.table, jobId: promoteJobId,
+        staged: { table: stagingTable, jobId: stagingJobId },
+        sqlTestResults: testResults
+      };
+    } finally {
+      BigQuery.Tables.remove(target.projectId, target.dataset, stagingTable);
+    }
+  }
+
+  // Loads rows into a BigQuery table via a load job (data uploaded as CSV)
+  // rather than INSERT statements - the same approach BigQuery's own
+  // tooling uses for bulk loads. Defaults to "append" (WRITE_APPEND)
+  // rather than "overwrite" (WRITE_TRUNCATE): unlike loadSheets above,
+  // truncating a real table is destructive and hard to undo, so that mode
+  // must be opted into explicitly rather than risked by a missing "mode"
+  // key.
   //
   // target.allowSchemaEvolution (optional, default false) is BigQuery's
   // own schemaUpdateOptions, opted into explicitly - same posture as
@@ -708,51 +891,36 @@ var NotSoBigData = (function () {
   // the destination schema wholesale every run - schemaUpdateOptions
   // would be a no-op there, so it's simply not attached rather than
   // throwing on a harmless combination.
+  //
+  // target.sqlTests (optional array of {name, query}) routes the whole
+  // load through loadBigQueryStaged above instead of the direct path
+  // below - stage, test, only then promote. Omit it (or leave it an empty
+  // array) and this function is byte-for-byte what it always was: a
+  // pipeline that doesn't ask for staging pays nothing extra for it.
   function loadBigQuery(rows, target) {
     if (!target.projectId || !target.dataset || !target.table) {
       throw new Error('move(): bigquery target requires "projectId", "dataset", and "table".');
     }
     var mode = target.mode || 'append';
-    var writeDisposition = mode === 'overwrite' ? 'WRITE_TRUNCATE' : mode === 'append' ? 'WRITE_APPEND' : null;
-    if (!writeDisposition) {
-      throw new Error('move(): unsupported bigquery target mode "' + mode + '". Expected "overwrite" or "append".');
-    }
+    var writeDisposition = resolveBigQueryWriteDisposition(mode);
     var result = { projectId: target.projectId, dataset: target.dataset, table: target.table, jobId: null };
     if (rows.length === 0) {
       return result;
     }
-    var blob = Utilities.newBlob(rowsToCsv(rows), 'text/csv');
-    var loadConfig = {
-      destinationTable: {
-        projectId: target.projectId,
-        datasetId: target.dataset,
-        tableId: target.table
-      },
-      sourceFormat: 'CSV',
-      skipLeadingRows: 1,
-      writeDisposition: writeDisposition
-    };
-    if (target.schema) {
-      loadConfig.schema = { fields: target.schema };
-    } else {
-      loadConfig.autodetect = true;
+    if (target.sqlTests && target.sqlTests.length) {
+      return loadBigQueryStaged(rows, target, mode, writeDisposition);
     }
+    var blob = Utilities.newBlob(rowsToCsv(rows), 'text/csv');
+    var loadConfig = buildBigQueryLoadConfig(
+      { projectId: target.projectId, datasetId: target.dataset, tableId: target.table },
+      writeDisposition,
+      target
+    );
     if (target.allowSchemaEvolution && mode === 'append') {
       loadConfig.schemaUpdateOptions = ['ALLOW_FIELD_ADDITION', 'ALLOW_FIELD_RELAXATION'];
     }
-    var insertedJob = BigQuery.Jobs.insert({ configuration: { load: loadConfig } }, target.projectId, blob);
-    var jobId = insertedJob.jobReference.jobId;
+    var jobId = runBigQueryJob({ configuration: { load: loadConfig } }, target.projectId, blob, 'load');
     result.jobId = jobId;
-    var status = insertedJob.status;
-    var pollIntervalMs = 500;
-    while (status.state !== 'DONE') {
-      Utilities.sleep(pollIntervalMs);
-      pollIntervalMs = Math.min(pollIntervalMs * 2, 5000);
-      status = BigQuery.Jobs.get(target.projectId, jobId).status;
-    }
-    if (status.errorResult) {
-      throw new Error('move(): bigquery load job failed - ' + status.errorResult.message);
-    }
     return result;
   }
 
@@ -1063,6 +1231,9 @@ var NotSoBigData = (function () {
   function move(config) {
     if (!config || !config.source) {
       throw new Error('move(): config.source is required.');
+    }
+    if (config.target && config.target.sqlTests && config.target.type !== 'bigquery') {
+      throw new Error('move(): target.sqlTests is only supported on a "bigquery" target - got "' + config.target.type + '".');
     }
     var rows = extract(config.source);
     if (config.tests) {
