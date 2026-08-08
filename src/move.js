@@ -225,28 +225,43 @@ function assertReadOnlySelect(sql, context) {
   }
 }
 
+// Runs a BigQuery query job (Jobs.query) to completion and returns
+// whichever response - the initial Jobs.query call, or the last
+// getQueryResults poll - ended up job-complete. A caller that wants more
+// than that one page (extractBigQuery below) walks pageToken itself from
+// there. getQueryResults itself long-polls (waits) for job completion up
+// to its own timeout - unlike a load/copy job's plain status check,
+// which is why runBigQueryJob above has to back off polling itself - so
+// there's no need to sleep client-side between these calls too.
+// queryRequest.maxResults, if given, is carried over to every poll call,
+// not just the first: the point of setting it at all is a caller that
+// only wants a bounded first page (runSqlTests below), and a maxResults
+// that stopped applying the moment a job needed more than one poll to
+// finish would defeat that.
+function runBigQueryQueryJob(queryRequest, projectId) {
+  var queryResults = BigQuery.Jobs.query(queryRequest, projectId);
+  var jobId = queryResults.jobReference.jobId;
+  var pollParams = queryRequest.maxResults ? { maxResults: queryRequest.maxResults } : undefined;
+  while (!queryResults.jobComplete) {
+    queryResults = pollParams
+      ? BigQuery.Jobs.getQueryResults(projectId, jobId, pollParams)
+      : BigQuery.Jobs.getQueryResults(projectId, jobId);
+  }
+  return queryResults;
+}
+
 // Reads from BigQuery via the Advanced BigQuery Service - either a whole
 // table or the result of a read-only query. The table identifier is
 // backtick-quoted since it's interpolated into SQL text, even though
 // it's the pipeline author's own declared config, not runtime user
-// input. getQueryResults itself long-polls (waits) for job completion up
-// to its own timeout, so there's no need to sleep client-side between
-// polls. Once the job is done, results are read page by page via
+// input. Once the job is done, results are read page by page via
 // pageToken so a result set bigger than a single response page isn't
 // silently truncated.
 function extractBigQuery(source) {
   var sql = resolveBigQuerySql(source);
   assertReadOnlySelect(sql, 'bigquery source.query/queryFileId');
-  var queryRequest = {
-    query: sql,
-    useLegacySql: false
-  };
-  var queryResults = BigQuery.Jobs.query(queryRequest, source.projectId);
-
+  var queryResults = runBigQueryQueryJob({ query: sql, useLegacySql: false }, source.projectId);
   var jobId = queryResults.jobReference.jobId;
-  while (!queryResults.jobComplete) {
-    queryResults = BigQuery.Jobs.getQueryResults(source.projectId, jobId);
-  }
 
   var headers = queryResults.schema.fields.map(function (field) { return field.name; });
   var rows = [headers];
@@ -287,8 +302,11 @@ function appendQueryParam(url, param, value) {
 // Walks a cursor-paginated API: calls fetchPage(token) - undefined on the
 // first call, then whatever resolvePath(page, options.tokenPath) found on
 // the page before it - until that token comes back undefined (tokenPath
-// wasn't present on that page at all - the normal end-of-results signal)
-// or options.maxPages pages have been fetched, whichever comes first.
+// wasn't present on that page at all) or explicit null (tokenPath was
+// present but the API set it to null - the other common way a
+// cursor-paginated REST API signals "no more pages", alongside just
+// omitting the field) - or options.maxPages pages have been fetched,
+// whichever comes first.
 // Written knowing nothing about HTTP on purpose - fetchPage just has to
 // hand back one page's parsed body - even though extractApi below is
 // currently its only caller: cli.js's IIFE exposes only cli() (see
@@ -325,7 +343,7 @@ function extractPaginated(fetchPage, options) {
     allObjects = allObjects.concat(pageObjects);
     token = resolvePath(page, options.tokenPath);
     pageCount++;
-  } while (token !== undefined && pageCount < options.maxPages);
+  } while (token !== undefined && token !== null && pageCount < options.maxPages);
   return objectsToRows(allObjects);
 }
 
@@ -709,6 +727,24 @@ function resolveBigQueryWriteDisposition(mode) {
   return writeDisposition;
 }
 
+// Resolves target.allowSchemaEvolution + a job's writeDisposition down to
+// the schemaUpdateOptions array to attach (or undefined to attach
+// nothing) - shared by loadBigQuery's direct load job and
+// loadBigQueryStaged's promotion copy job below, the same "one decision,
+// two job kinds" shape resolveBigQueryWriteDisposition above already
+// covers for mode. Takes writeDisposition rather than mode directly:
+// "append" and "WRITE_APPEND" carry the same fact, and writeDisposition
+// is already what both call sites have in hand by the time they need
+// this. Gated to WRITE_APPEND specifically because WRITE_TRUNCATE
+// already replaces the destination schema wholesale every run - the
+// option would be a no-op there, so it's simply not attached rather than
+// thrown on as a harmless combination.
+function resolveBigQuerySchemaUpdateOptions(target, writeDisposition) {
+  return (target.allowSchemaEvolution && writeDisposition === 'WRITE_APPEND')
+    ? ['ALLOW_FIELD_ADDITION', 'ALLOW_FIELD_RELAXATION']
+    : undefined;
+}
+
 // Builds a load job's "configuration.load" body: the shared shape both
 // loadBigQuery's direct load and loadBigQueryStaged's staging load use,
 // differing only in destination table and writeDisposition.
@@ -754,10 +790,13 @@ function resolveStagingTableId(table) {
 // this SQL runs under the script's live OAuth, and a sql test is
 // pipeline-author-supplied text, not move()'s own.
 //
-// Only the first result page is read - getQueryResults already reports
-// totalRows on page one, so answering "did any rows come back" (and
-// showing a few examples) doesn't need extractBigQuery's full pageToken
-// walk. Every declared test still runs even after one has already
+// Only a bounded first page is read via runBigQueryQueryJob's
+// maxResults - getQueryResults already reports totalRows regardless of
+// page size, so answering "did any rows come back" (and showing a few
+// examples) doesn't need to pull a potentially huge offending-row set
+// over the wire just to keep 5 of them, the way an uncapped request
+// would for a referential check that legitimately finds thousands of
+// violations. Every declared test still runs even after one has already
 // failed - collected, not thrown on first sight - so one call surfaces
 // every failing test at once, the same posture runTests() takes for
 // config.tests. There is no "discard_row" here (yet): a sql test finding
@@ -774,11 +813,7 @@ function runSqlTests(sqlTests, stagedRef) {
     }
     var query = test.query.replace(/\{\{\s*this\s*\}\}/g, thisRef);
     assertReadOnlySelect(query, 'bigquery target.sqlTests[].query');
-    var queryResults = BigQuery.Jobs.query({ query: query, useLegacySql: false }, stagedRef.projectId);
-    var jobId = queryResults.jobReference.jobId;
-    while (!queryResults.jobComplete) {
-      queryResults = BigQuery.Jobs.getQueryResults(stagedRef.projectId, jobId);
-    }
+    var queryResults = runBigQueryQueryJob({ query: query, useLegacySql: false, maxResults: 5 }, stagedRef.projectId);
     var totalRows = Number(queryResults.totalRows || 0);
     if (totalRows > 0) {
       var exampleRows = (queryResults.rows || []).slice(0, 5).map(function (row) {
@@ -815,7 +850,7 @@ function runSqlTests(sqlTests, stagedRef) {
 // testing" - Drive load-test fixtures piling up to 30 files before
 // anyone noticed). The finally block is still the primary cleanup path;
 // expirationTime is a backstop, not a substitute for it.
-function loadBigQueryStaged(rows, target, mode, writeDisposition) {
+function loadBigQueryStaged(rows, target, writeDisposition) {
   var stagingTable = resolveStagingTableId(target.table);
   BigQuery.Tables.insert(
     {
@@ -841,8 +876,9 @@ function loadBigQueryStaged(rows, target, mode, writeDisposition) {
       destinationTable: { projectId: target.projectId, datasetId: target.dataset, tableId: target.table },
       writeDisposition: writeDisposition
     };
-    if (target.allowSchemaEvolution && mode === 'append') {
-      copyConfig.schemaUpdateOptions = ['ALLOW_FIELD_ADDITION', 'ALLOW_FIELD_RELAXATION'];
+    var copySchemaUpdateOptions = resolveBigQuerySchemaUpdateOptions(target, writeDisposition);
+    if (copySchemaUpdateOptions) {
+      copyConfig.schemaUpdateOptions = copySchemaUpdateOptions;
     }
     var promoteJobId = runBigQueryJob({ configuration: { copy: copyConfig } }, target.projectId, null, 'copy');
 
@@ -876,11 +912,10 @@ function loadBigQueryStaged(rows, target, mode, writeDisposition) {
 // additive changes only. A real type change or a renamed/dropped column
 // still fails the job either way; BigQuery itself has no
 // schemaUpdateOptions for those, and silently coercing or dropping data
-// would be worse than today's loud failure. Gated on "append"
-// specifically because "overwrite" (WRITE_TRUNCATE) already replaces
-// the destination schema wholesale every run - schemaUpdateOptions
-// would be a no-op there, so it's simply not attached rather than
-// throwing on a harmless combination.
+// would be worse than today's loud failure. See
+// resolveBigQuerySchemaUpdateOptions above for why this is gated to
+// "append" specifically, shared with loadBigQueryStaged's promotion
+// copy job below.
 //
 // target.sqlTests (optional array of {name, query}) routes the whole
 // load through loadBigQueryStaged above instead of the direct path
@@ -898,7 +933,7 @@ function loadBigQuery(rows, target) {
     return result;
   }
   if (target.sqlTests && target.sqlTests.length) {
-    return loadBigQueryStaged(rows, target, mode, writeDisposition);
+    return loadBigQueryStaged(rows, target, writeDisposition);
   }
   var blob = Utilities.newBlob(rowsToCsv(rows), 'text/csv');
   var loadConfig = buildBigQueryLoadConfig(
@@ -906,8 +941,9 @@ function loadBigQuery(rows, target) {
     writeDisposition,
     target
   );
-  if (target.allowSchemaEvolution && mode === 'append') {
-    loadConfig.schemaUpdateOptions = ['ALLOW_FIELD_ADDITION', 'ALLOW_FIELD_RELAXATION'];
+  var loadSchemaUpdateOptions = resolveBigQuerySchemaUpdateOptions(target, writeDisposition);
+  if (loadSchemaUpdateOptions) {
+    loadConfig.schemaUpdateOptions = loadSchemaUpdateOptions;
   }
   var jobId = runBigQueryJob({ configuration: { load: loadConfig } }, target.projectId, blob, 'load');
   result.jobId = jobId;
@@ -1221,9 +1257,6 @@ function runTests(rows, tests, defaultOnFailure) {
 function move(config) {
   if (!config || !config.source) {
     throw new Error('move(): config.source is required.');
-  }
-  if (config.target && config.target.sqlTests && config.target.type !== 'bigquery') {
-    throw new Error('move(): target.sqlTests is only supported on a "bigquery" target - got "' + config.target.type + '".');
   }
   var rows = extract(config.source);
   if (config.tests) {

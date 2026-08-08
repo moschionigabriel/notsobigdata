@@ -386,23 +386,19 @@ function runNodes(nodes, dryRun) {
   return results;
 }
 
-// Counts each status in a runNodes() result set, and renders it as the
+// Counts each status in a runNodes() result set and renders it as the
 // "DONE" summary line cli() logs at the end of a run/list - see there.
-// Kept as two small functions rather than one, the same split
-// summarizeNodeResult()/buildManifest() already use elsewhere in this
-// file, so the counting logic is testable independent of its one string
-// format.
-function summarizeStatusCounts(results) {
-  var counts = { success: 0, failed: 0, skipped: 0, planned: 0 };
-  results.forEach(function (result) { counts[result.status] += 1; });
-  return counts;
-}
-
 // Only non-zero counts are rendered - a "list" run (every node
 // "planned") would otherwise print "0 passed, 0 failed, 0 skipped, 5
 // planned", which buries the one number that matters in noise nobody
-// asked about.
-function formatStatusCounts(counts) {
+// asked about. One function rather than a count/format split: this
+// project's tests are black-box (a human runs cli() from the Apps
+// Script editor - see CLAUDE.md's "About testing"), so there is no
+// caller that would ever want the raw counts independent of this one
+// string.
+function formatStatusCounts(results) {
+  var counts = { success: 0, failed: 0, skipped: 0, planned: 0 };
+  results.forEach(function (result) { counts[result.status] += 1; });
   var labels = { success: 'passed', failed: 'failed', skipped: 'skipped', planned: 'planned' };
   var parts = ['success', 'failed', 'skipped', 'planned']
     .filter(function (status) { return counts[status] > 0; })
@@ -586,7 +582,7 @@ function cli(input) {
   var ordered = orderNodes(selected);
   var results = runNodes(ordered, parsed.command === 'list');
   var ok = results.every(function (result) { return result.status !== 'failed' && result.status !== 'skipped'; });
-  Logger.log('DONE  cli("' + input + '") - ' + formatStatusCounts(summarizeStatusCounts(results)) + ' (' + results.length + ' total).');
+  Logger.log('DONE  cli("' + input + '") - ' + formatStatusCounts(results) + ' (' + results.length + ' total).');
   var report = {
     ok: ok,
     command: parsed.command,
