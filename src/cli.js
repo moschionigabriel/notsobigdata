@@ -61,6 +61,14 @@ function nodeNames(nodes) {
   return nodes.map(function (node) { return node.name; });
 }
 
+// Same reasoning as nodeNames() above, for the single-node case: the
+// "<name> (<kind>)" label appears at every log line runNodes() writes
+// (START/SKIP/PLAN/OK/FAIL) plus hello()'s node listing - one helper keeps
+// all six rendering identically by construction.
+function nodeLabel(node) {
+  return node.name + ' (' + node.kind + ')';
+}
+
 var COMMANDS = ['run', 'list', 'hello', 'help'];
 
 function usage() {
@@ -355,7 +363,27 @@ function orderNodes(nodes) {
 // Logged output stays deliberately small - names, statuses, row counts -
 // never the extracted rows themselves, which can be huge and may hold
 // data the user would rather not have sitting in an execution log.
-function runNodes(nodes, dryRun) {
+//
+// START logs immediately before the one branch that can actually take
+// real time - the EXECUTORS[node.kind] call - not before the blocked-check
+// or the dry-run check above it, since neither of those waits on anything:
+// a skipped or planned node is decided instantly, so a START line there
+// would never carry the "is this still working" signal it exists for. That
+// signal matters for real execution (a BigQuery job can poll for tens of
+// seconds) - without it, a human watching the Apps Script log during a
+// long run can only see which nodes have already finished, never which one
+// is currently in flight.
+//
+// SKIP and FAIL always log - they're exactly what needs a human's
+// attention. OK only logs when verbose is true: nothing failed is already
+// implied by START's presence plus the absence of a FAIL/SKIP line, and
+// the row-count/timing detail OK would add is never lost from the
+// permanent record either way - it's always in the returned result and
+// (for "run") the Drive manifest, regardless of what hits the console.
+// verbose defaults false (see resolveLoggingConfig()) precisely so a
+// normal run's console output stays proportional to what needs attention,
+// not to how many nodes happened to succeed.
+function runNodes(nodes, dryRun, verbose) {
   var results = [];
   var blocked = emptyMap();
   nodes.forEach(function (node) {
@@ -363,24 +391,27 @@ function runNodes(nodes, dryRun) {
     if (blockers.length) {
       blocked[node.name] = true;
       results.push({ name: node.name, kind: node.kind, status: 'skipped', blockedBy: blockers });
-      Logger.log('SKIP  ' + node.name + ' (' + node.kind + ') - waiting on ' + blockers.join(', '));
+      Logger.log('SKIP  ' + nodeLabel(node) + ' - waiting on ' + blockers.join(', '));
       return;
     }
     if (dryRun) {
       results.push({ name: node.name, kind: node.kind, status: 'planned' });
-      Logger.log('PLAN  ' + node.name + ' (' + node.kind + ')');
+      Logger.log('PLAN  ' + nodeLabel(node));
       return;
     }
+    Logger.log('START ' + nodeLabel(node));
     var startedAt = new Date().getTime();
     try {
       var result = EXECUTORS[node.kind](node.config);
       var elapsed = new Date().getTime() - startedAt;
       results.push({ name: node.name, kind: node.kind, status: 'success', ms: elapsed, result: result });
-      Logger.log('OK    ' + node.name + ' (' + node.kind + ') - ' + (Array.isArray(result) ? result.length + ' rows, ' : '') + elapsed + 'ms');
+      if (verbose) {
+        Logger.log('OK    ' + nodeLabel(node) + ' - ' + (Array.isArray(result) ? result.length + ' rows, ' : '') + elapsed + 'ms');
+      }
     } catch (error) {
       blocked[node.name] = true;
       results.push({ name: node.name, kind: node.kind, status: 'failed', ms: new Date().getTime() - startedAt, error: error.message });
-      Logger.log('FAIL  ' + node.name + ' (' + node.kind + ') - ' + error.message);
+      Logger.log('FAIL  ' + nodeLabel(node) + ' - ' + error.message);
     }
   });
   return results;
@@ -423,6 +454,23 @@ function resolveManifestConfig() {
     folderId: typeof config.folderId === 'string' && config.folderId ? config.folderId : null,
     fileName: typeof config.fileName === 'string' && config.fileName ? config.fileName : 'notsobigdata-manifest.json'
   };
+}
+
+// Reads the optional notsobigdataLogging global, same guarded pattern as
+// resolveManifestConfig() above. verbose is the only field: false by
+// default, so a normal run's console output stays proportional to what
+// needs attention (see runNodes()'s own comment) rather than to how many
+// nodes happened to succeed. Set true to restore an OK line for every
+// successful node too.
+function resolveLoggingConfig() {
+  var raw;
+  try {
+    raw = globalThis.notsobigdataLogging;
+  } catch (error) {
+    raw = undefined;
+  }
+  var config = (raw && typeof raw === 'object') ? raw : {};
+  return { verbose: config.verbose === true };
 }
 
 // Auto-detects "the folder the Apps Script project lives in" when no
@@ -489,6 +537,14 @@ function buildManifest(commandText, ok, results, ignored) {
 // node results actually being reported, so every path is caught and
 // turned into one of three report.manifest shapes instead.
 //
+// Every outcome also gets a Logger.log line, same as every other outcome
+// in a run (the call-level START/DONE, each node's START/OK/FAIL/SKIP/PLAN).
+// Without it, a failed write was only visible in the returned
+// report.manifest - which the documented usage pattern (Logger.log(report.ok))
+// never inspects - so a human watching the Apps Script execution log, the
+// one place CLAUDE.md's testing section says they actually look, had no way
+// to tell a manifest failed to write from one that succeeded silently.
+//
 // Reuses resolveDriveWriteTarget/writeDriveText from move.js rather than
 // re-implementing "resolve an existing file or create one" a second
 // time - the first helper call to cross the move.js/cli.js boundary, and
@@ -497,6 +553,7 @@ function buildManifest(commandText, ok, results, ignored) {
 function writeManifest(commandText, ok, results, ignored) {
   var config = resolveManifestConfig();
   if (!config.enabled) {
+    Logger.log('MANIFEST skipped - notsobigdataManifest.enabled is false');
     return { written: false, reason: 'disabled' };
   }
   try {
@@ -505,8 +562,10 @@ function writeManifest(commandText, ok, results, ignored) {
     var target = { folderId: folderId, fileName: config.fileName, upsertByName: true };
     var fileId = resolveDriveWriteTarget(target);
     fileId = writeDriveText(fileId, target, JSON.stringify(manifest, null, 2), MimeType.PLAIN_TEXT);
+    Logger.log('MANIFEST written to ' + fileId);
     return { written: true, fileId: fileId };
   } catch (error) {
+    Logger.log('MANIFEST failed - ' + error.message);
     return { written: false, reason: 'error', error: error.message };
   }
 }
@@ -530,9 +589,7 @@ function hello() {
   // returned - two copies of that tail would drift the first time the
   // format changes.
   if (discovered && discovered.nodes.length) {
-    lines.push('Discovered ' + discovered.nodes.length + ' node(s): ' + discovered.nodes.map(function (node) {
-      return node.name + ' (' + node.kind + ')';
-    }).join(', ') + '.');
+    lines.push('Discovered ' + discovered.nodes.length + ' node(s): ' + discovered.nodes.map(nodeLabel).join(', ') + '.');
   } else if (discovered) {
     lines.push('Discovered 0 nodes. If you expected some, check they are declared as top-level "var"s - a config object declared inside a function is invisible to cli().');
   }
@@ -580,7 +637,7 @@ function cli(input) {
     throw new Error('cli(): the selection matched no nodes. Run cli("list") to see everything available.');
   }
   var ordered = orderNodes(selected);
-  var results = runNodes(ordered, parsed.command === 'list');
+  var results = runNodes(ordered, parsed.command === 'list', resolveLoggingConfig().verbose);
   var ok = results.every(function (result) { return result.status !== 'failed' && result.status !== 'skipped'; });
   Logger.log('DONE  cli("' + input + '") - ' + formatStatusCounts(results) + ' (' + results.length + ' total).');
   var report = {
