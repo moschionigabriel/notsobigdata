@@ -61,6 +61,14 @@ function nodeNames(nodes) {
   return nodes.map(function (node) { return node.name; });
 }
 
+// Same reasoning as nodeNames() above, for the single-node case: the
+// "<name> (<kind>)" label appears at every log line runNodes() writes
+// (START/SKIP/PLAN/OK/FAIL) plus hello()'s node listing - one helper keeps
+// all six rendering identically by construction.
+function nodeLabel(node) {
+  return node.name + ' (' + node.kind + ')';
+}
+
 var COMMANDS = ['run', 'list', 'hello', 'help'];
 
 function usage() {
@@ -368,17 +376,17 @@ function runNodes(nodes, dryRun) {
   var results = [];
   var blocked = emptyMap();
   nodes.forEach(function (node) {
-    Logger.log('START ' + node.name + ' (' + node.kind + ')');
+    Logger.log('START ' + nodeLabel(node));
     var blockers = node.dependsOn.filter(function (dependency) { return has(blocked, dependency); });
     if (blockers.length) {
       blocked[node.name] = true;
       results.push({ name: node.name, kind: node.kind, status: 'skipped', blockedBy: blockers });
-      Logger.log('SKIP  ' + node.name + ' (' + node.kind + ') - waiting on ' + blockers.join(', '));
+      Logger.log('SKIP  ' + nodeLabel(node) + ' - waiting on ' + blockers.join(', '));
       return;
     }
     if (dryRun) {
       results.push({ name: node.name, kind: node.kind, status: 'planned' });
-      Logger.log('PLAN  ' + node.name + ' (' + node.kind + ')');
+      Logger.log('PLAN  ' + nodeLabel(node));
       return;
     }
     var startedAt = new Date().getTime();
@@ -386,11 +394,11 @@ function runNodes(nodes, dryRun) {
       var result = EXECUTORS[node.kind](node.config);
       var elapsed = new Date().getTime() - startedAt;
       results.push({ name: node.name, kind: node.kind, status: 'success', ms: elapsed, result: result });
-      Logger.log('OK    ' + node.name + ' (' + node.kind + ') - ' + (Array.isArray(result) ? result.length + ' rows, ' : '') + elapsed + 'ms');
+      Logger.log('OK    ' + nodeLabel(node) + ' - ' + (Array.isArray(result) ? result.length + ' rows, ' : '') + elapsed + 'ms');
     } catch (error) {
       blocked[node.name] = true;
       results.push({ name: node.name, kind: node.kind, status: 'failed', ms: new Date().getTime() - startedAt, error: error.message });
-      Logger.log('FAIL  ' + node.name + ' (' + node.kind + ') - ' + error.message);
+      Logger.log('FAIL  ' + nodeLabel(node) + ' - ' + error.message);
     }
   });
   return results;
@@ -551,9 +559,7 @@ function hello() {
   // returned - two copies of that tail would drift the first time the
   // format changes.
   if (discovered && discovered.nodes.length) {
-    lines.push('Discovered ' + discovered.nodes.length + ' node(s): ' + discovered.nodes.map(function (node) {
-      return node.name + ' (' + node.kind + ')';
-    }).join(', ') + '.');
+    lines.push('Discovered ' + discovered.nodes.length + ' node(s): ' + discovered.nodes.map(nodeLabel).join(', ') + '.');
   } else if (discovered) {
     lines.push('Discovered 0 nodes. If you expected some, check they are declared as top-level "var"s - a config object declared inside a function is invisible to cli().');
   }
