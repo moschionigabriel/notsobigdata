@@ -191,6 +191,53 @@ is `planned` and nothing executes — and there's no `manifest` field, since
 { written: false, reason: 'error', error: '...' }      // Drive write failed - never throws, never affects ok
 ```
 
+## Logging
+
+`cli()` writes to the Apps Script execution log ([`Logger.log`](https://developers.google.com/apps-script/reference/base/logger)) so you can
+watch a run happen live in the editor, or read back what happened afterward.
+By default it's kept proportional to what needs your attention, not to how
+many nodes happened to succeed:
+
+```
+START cli("run")
+START rawOrders (move)
+START rawCustomers (move)
+FAIL  rawCustomers (move) - move(): ...
+SKIP  ordersReport (move) - waiting on rawCustomers
+DONE  cli("run") - 1 passed, 1 failed, 1 skipped (3 total).
+MANIFEST written to <id>
+```
+
+Every node that actually runs logs a `START` line right before it starts —
+so a node in the middle of a slow BigQuery job still shows up as "in
+progress," not silence — and `FAIL`/`SKIP` always log too, since those are
+exactly the lines you need to see. A node that *succeeds*, though, doesn't
+get its own confirmation line by default: `START` plus the absence of a
+`FAIL`/`SKIP` line already tells you nothing went wrong, and the detail an
+`OK` line would add (row count, elapsed time) is never actually lost —
+it's always in the returned `report.nodes[]` and, for `run`, the [Drive
+manifest](#the-run-manifest) below, whether or not it hits the console.
+`cli('list')`'s dry run only ever logs one `PLAN` line per node — nothing
+executes, so there's no "in progress" to signal.
+
+Want the full detail back, e.g. while actively debugging a run? Set
+`verbose: true`:
+
+```javascript
+var notsobigdataLogging = {
+  verbose: false   // set true to also log an OK line for every successful node
+};
+```
+
+```
+START cli("run")
+START rawOrders (move)
+OK    rawOrders (move) - 1200 rows, 340ms
+START rawCustomers (move)
+OK    rawCustomers (move) - 80 rows, 210ms
+DONE  cli("run") - 2 passed (2 total).
+```
+
 ## The run manifest
 
 Every `cli('run ...')` writes a small JSON file to Drive — a dbt-`manifest.json`-
