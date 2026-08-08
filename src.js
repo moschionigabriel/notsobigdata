@@ -1739,19 +1739,29 @@ var NotSoBigData = (function () {
   // never the extracted rows themselves, which can be huge and may hold
   // data the user would rather not have sitting in an execution log.
   //
-  // Every node gets its own START/outcome bookend pair - START right before
-  // it's handled, then OK/FAIL/SKIP/PLAN once its outcome is known - mirroring
-  // the START/DONE pair cli() itself logs around the whole call below. Without
-  // a per-node START, a human watching the Apps Script log during a long run
-  // can only see which nodes have already finished, never which one is
-  // currently in flight. START logs unconditionally, even for nodes that turn
-  // out skipped or merely planned, so every node in the ordered list produces
-  // a matching pair - not just the ones that reach EXECUTORS.
-  function runNodes(nodes, dryRun) {
+  // START logs immediately before the one branch that can actually take
+  // real time - the EXECUTORS[node.kind] call - not before the blocked-check
+  // or the dry-run check above it, since neither of those waits on anything:
+  // a skipped or planned node is decided instantly, so a START line there
+  // would never carry the "is this still working" signal it exists for. That
+  // signal matters for real execution (a BigQuery job can poll for tens of
+  // seconds) - without it, a human watching the Apps Script log during a
+  // long run can only see which nodes have already finished, never which one
+  // is currently in flight.
+  //
+  // SKIP and FAIL always log - they're exactly what needs a human's
+  // attention. OK only logs when verbose is true: nothing failed is already
+  // implied by START's presence plus the absence of a FAIL/SKIP line, and
+  // the row-count/timing detail OK would add is never lost from the
+  // permanent record either way - it's always in the returned result and
+  // (for "run") the Drive manifest, regardless of what hits the console.
+  // verbose defaults false (see resolveLoggingConfig()) precisely so a
+  // normal run's console output stays proportional to what needs attention,
+  // not to how many nodes happened to succeed.
+  function runNodes(nodes, dryRun, verbose) {
     var results = [];
     var blocked = emptyMap();
     nodes.forEach(function (node) {
-      Logger.log('START ' + nodeLabel(node));
       var blockers = node.dependsOn.filter(function (dependency) { return has(blocked, dependency); });
       if (blockers.length) {
         blocked[node.name] = true;
@@ -1764,12 +1774,15 @@ var NotSoBigData = (function () {
         Logger.log('PLAN  ' + nodeLabel(node));
         return;
       }
+      Logger.log('START ' + nodeLabel(node));
       var startedAt = new Date().getTime();
       try {
         var result = EXECUTORS[node.kind](node.config);
         var elapsed = new Date().getTime() - startedAt;
         results.push({ name: node.name, kind: node.kind, status: 'success', ms: elapsed, result: result });
-        Logger.log('OK    ' + nodeLabel(node) + ' - ' + (Array.isArray(result) ? result.length + ' rows, ' : '') + elapsed + 'ms');
+        if (verbose) {
+          Logger.log('OK    ' + nodeLabel(node) + ' - ' + (Array.isArray(result) ? result.length + ' rows, ' : '') + elapsed + 'ms');
+        }
       } catch (error) {
         blocked[node.name] = true;
         results.push({ name: node.name, kind: node.kind, status: 'failed', ms: new Date().getTime() - startedAt, error: error.message });
@@ -1816,6 +1829,23 @@ var NotSoBigData = (function () {
       folderId: typeof config.folderId === 'string' && config.folderId ? config.folderId : null,
       fileName: typeof config.fileName === 'string' && config.fileName ? config.fileName : 'notsobigdata-manifest.json'
     };
+  }
+
+  // Reads the optional notsobigdataLogging global, same guarded pattern as
+  // resolveManifestConfig() above. verbose is the only field: false by
+  // default, so a normal run's console output stays proportional to what
+  // needs attention (see runNodes()'s own comment) rather than to how many
+  // nodes happened to succeed. Set true to restore an OK line for every
+  // successful node too.
+  function resolveLoggingConfig() {
+    var raw;
+    try {
+      raw = globalThis.notsobigdataLogging;
+    } catch (error) {
+      raw = undefined;
+    }
+    var config = (raw && typeof raw === 'object') ? raw : {};
+    return { verbose: config.verbose === true };
   }
 
   // Auto-detects "the folder the Apps Script project lives in" when no
@@ -1982,7 +2012,7 @@ var NotSoBigData = (function () {
       throw new Error('cli(): the selection matched no nodes. Run cli("list") to see everything available.');
     }
     var ordered = orderNodes(selected);
-    var results = runNodes(ordered, parsed.command === 'list');
+    var results = runNodes(ordered, parsed.command === 'list', resolveLoggingConfig().verbose);
     var ok = results.every(function (result) { return result.status !== 'failed' && result.status !== 'skipped'; });
     Logger.log('DONE  cli("' + input + '") - ' + formatStatusCounts(results) + ' (' + results.length + ' total).');
     var report = {
