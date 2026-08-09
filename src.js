@@ -256,20 +256,21 @@ var NotSoBigData = (function () {
   // keyword/shape check, not a security boundary: it only strips comments,
   // looks at the leading keyword, and rejects multiple ";"-separated
   // statements, so it won't catch e.g. a SELECT that calls a mutating
-  // stored routine. move()'s job is extracting/asserting on data -
-  // transforming/writing it belongs in model().
+  // stored routine.
   //
-  // "context" is only used to phrase the thrown message - shared by every
-  // call site that hands move() raw SQL to run under the script's live
-  // OAuth (a bigquery source's query/queryFileId, and a bigquery target's
-  // sqlTests[].query) rather than each one repeating this same check with
-  // its own wording.
-  function assertReadOnlySelect(sql, context) {
+  // messagePrefix is the caller's own complete "move(): ..."/"model(): ..."
+  // lead-in - same convention assertSingleStatement below already uses -
+  // rather than a bare "context" this function prefixes itself, so the
+  // thrown message reads the same regardless of which module or which kind
+  // of SQL (a bigquery source's query, a bigquery target's sqlTests[].query,
+  // or a model's own tests[].query - runSqlTests below hands every one of
+  // those through here) raised it.
+  function assertReadOnlySelect(sql, messagePrefix) {
     var stripped = stripSqlComments(sql);
     if (!/^(select|with)\b/i.test(stripped)) {
-      throw new Error('move(): ' + context + ' must be a read-only SELECT (optionally starting with WITH). move() only extracts/asserts on data - transform or write logic belongs in model().');
+      throw new Error(messagePrefix + ' must be a read-only SELECT (optionally starting with WITH) - it can check data, not change it.');
     }
-    assertSingleStatementStripped(stripped, 'move(): ' + context);
+    assertSingleStatementStripped(stripped, messagePrefix);
   }
 
   // Runs a BigQuery query job (Jobs.query) to completion and returns
@@ -306,7 +307,7 @@ var NotSoBigData = (function () {
   // silently truncated.
   function extractBigQuery(source) {
     var sql = resolveBigQuerySql(source);
-    assertReadOnlySelect(sql, 'bigquery source.query/queryFileId');
+    assertReadOnlySelect(sql, 'move(): bigquery source.query/queryFileId');
     var queryResults = runBigQueryQueryJob({ query: sql, useLegacySql: false }, source.projectId);
     var jobId = queryResults.jobReference.jobId;
 
@@ -829,16 +830,27 @@ var NotSoBigData = (function () {
     return '_notsobigdata_stage_' + table + '_' + Utilities.getUuid().replace(/-/g, '');
   }
 
-  // Runs every target.sqlTests entry against the table loadBigQueryStaged
-  // just staged, substituting "{{ this }}" - deliberately reusing dbt's own
-  // name for "the table this test is about" - with the staged table's
-  // fully-qualified, backtick-quoted name. Each query is expected to
-  // return the rows that violate whatever it's checking (referential
-  // integrity, an aggregate/volume check, ...); zero rows back means the
-  // test passed, mirroring dbt's own generic-test contract. Gated through
-  // assertReadOnlySelect for the same reason a bigquery source's query is:
-  // this SQL runs under the script's live OAuth, and a sql test is
-  // pipeline-author-supplied text, not move()'s own.
+  // Runs a list of {name, query} SQL tests against one relation, substituting
+  // "{{ this }}" - deliberately reusing dbt's own name for "the table this
+  // test is about" - with relationRef's fully-qualified, backtick-quoted
+  // name. Each query is expected to return the rows that violate whatever
+  // it's checking (referential integrity, an aggregate/volume check, ...);
+  // zero rows back means the test passed, mirroring dbt's own generic-test
+  // contract. Gated through assertReadOnlySelect for the same reason a
+  // bigquery source's query is: this SQL runs under the script's live
+  // OAuth, and a sql test is pipeline-author-supplied text, not move()'s
+  // or model()'s own.
+  //
+  // Shared by move.js's own loadBigQueryStaged below (relationRef names a
+  // brand-new staging table) and model.js's model() (relationRef names the
+  // model's own just-materialized relation) - genuinely the same primitive
+  // either way: run these queries against that relation, fail loudly if any
+  // comes back non-empty. messagePrefix is the caller's own complete
+  // "move(): ..."/"model(): ..." lead-in, same convention
+  // assertSingleStatement/assertReadOnlySelect already use, so the thrown
+  // message and every per-entry error reads right regardless of which
+  // module or which kind of test (a bigquery target's sqlTests, or a
+  // model's tests) raised it.
   //
   // Only a bounded first page is read via runBigQueryQueryJob's
   // maxResults - getQueryResults already reports totalRows regardless of
@@ -850,20 +862,20 @@ var NotSoBigData = (function () {
   // failed - collected, not thrown on first sight - so one call surfaces
   // every failing test at once, the same posture runTests() takes for
   // config.tests. There is no "discard_row" here (yet): a sql test finding
-  // bad rows can't cheaply un-stage just those rows the way runTests()
-  // filters an in-memory array, and no real user has needed it yet - the
-  // same "not built speculatively" call move.md already makes for
-  // referential checks in general.
-  function runSqlTests(sqlTests, stagedRef) {
-    var thisRef = qualifiedTableRef(stagedRef.projectId, stagedRef.dataset, stagedRef.table);
+  // bad rows can't cheaply undo the write it's checking the way runTests()
+  // filters an in-memory array before anything is written, and no real user
+  // has needed it yet - the same "not built speculatively" call move.md
+  // already makes for referential checks in general.
+  function runSqlTests(sqlTests, relationRef, messagePrefix) {
+    var thisRef = qualifiedTableRef(relationRef.projectId, relationRef.dataset, relationRef.table);
     var failures = [];
     sqlTests.forEach(function (test) {
       if (!test || typeof test.query !== 'string' || !test.query) {
-        throw new Error('move(): every entry in bigquery target.sqlTests needs a "query" (a non-empty string).');
+        throw new Error(messagePrefix + ': every entry needs a "query" (a non-empty string).');
       }
       var query = test.query.replace(/\{\{\s*this\s*\}\}/g, thisRef);
-      assertReadOnlySelect(query, 'bigquery target.sqlTests[].query');
-      var queryResults = runBigQueryQueryJob({ query: query, useLegacySql: false, maxResults: 5 }, stagedRef.projectId);
+      assertReadOnlySelect(query, messagePrefix + '[].query');
+      var queryResults = runBigQueryQueryJob({ query: query, useLegacySql: false, maxResults: 5 }, relationRef.projectId);
       var totalRows = Number(queryResults.totalRows || 0);
       if (totalRows > 0) {
         var exampleRows = (queryResults.rows || []).slice(0, 5).map(function (row) {
@@ -876,7 +888,7 @@ var NotSoBigData = (function () {
       var summary = failures.map(function (f) {
         return '"' + f.name + '" returned ' + f.count + ' failing row(s) (e.g. ' + f.exampleRows.join(' | ') + ')';
       }).join('; ');
-      throw new Error('move(): bigquery sql test(s) failed against the staged table - ' + summary + '.');
+      throw new Error(messagePrefix + ' failed against ' + thisRef + ' - ' + summary + '.');
     }
     return { ran: sqlTests.length };
   }
@@ -962,7 +974,7 @@ var NotSoBigData = (function () {
       );
       var stagingJobId = runBigQueryJob({ configuration: { load: stagingLoadConfig } }, target.projectId, blob, 'load');
 
-      var testResults = runSqlTests(target.sqlTests, { projectId: target.projectId, dataset: target.dataset, table: stagingTable });
+      var testResults = runSqlTests(target.sqlTests, { projectId: target.projectId, dataset: target.dataset, table: stagingTable }, 'move(): bigquery target.sqlTests');
 
       if (target.allowSchemaEvolution && writeDisposition === 'WRITE_APPEND') {
         widenDestinationTableForPromotion(target, stagingTable);
@@ -1715,6 +1727,214 @@ var NotSoBigData = (function () {
     return materialized;
   }
 
+  // The check names a model's own tests[] entries may use for a "generic"
+  // (dbt-style) test - not_null, unique, accepted_values, relationships:
+  // dbt's own four built-in generic tests. Deliberately not move.js's
+  // extra tests[] vocabulary (min/max/regex) - those are row-level checks
+  // over an in-memory 2D array (see move.js's KNOWN_CHECKS) and don't apply
+  // to a materialized relation; a custom query test below already covers
+  // that same ground trivially (e.g. "WHERE amount < 0"). Checked by array
+  // membership rather than object-property lookup, same prototype-pollution
+  // reasoning as move.js's own KNOWN_CHECKS/isKnownCheck - check is a
+  // config-supplied string, and a plain {} object already "has" toString,
+  // constructor and friends.
+  var MODEL_TEST_KNOWN_CHECKS = ['not_null', 'unique', 'accepted_values', 'relationships'];
+
+  function isKnownModelTestCheck(check) {
+    return MODEL_TEST_KNOWN_CHECKS.indexOf(check) !== -1;
+  }
+
+  // Extra config key each generic check needs beyond "column" - same "fail
+  // loud at validation time, not two calls later" reasoning as move.js's
+  // TEST_CHECK_REQUIRES. Object.create(null) for the same reason: test.check
+  // is config-supplied, not a hardcoded key.
+  var MODEL_TEST_REQUIRES = Object.create(null);
+  MODEL_TEST_REQUIRES.accepted_values = 'values';
+  MODEL_TEST_REQUIRES.relationships = 'to';
+
+  // Backtick-quotes a column/field name for interpolation into generated
+  // test SQL - MODEL_TEST_COMPILERS below builds SQL text out of
+  // config-supplied identifiers (test.column, test.field), and an unquoted
+  // identifier that happens to be a reserved word (order, group, ...) would
+  // otherwise break. Throws rather than stripping a stray backtick or
+  // backslash, since a name that already contains either can't be safely
+  // quoted at all - a backtick-quoted identifier uses the same backslash
+  // escape sequences a string literal does (see quoteSqlLiteral below), so
+  // a trailing backslash could otherwise escape the closing backtick the
+  // same way it can escape a string literal's closing quote. Same "reject,
+  // don't guess" posture as every other config-shape check in this file -
+  // a real BigQuery column name has no legitimate use for either character.
+  function quoteIdentifier(name) {
+    if (name.indexOf('`') !== -1 || name.indexOf('\\') !== -1) {
+      throw new Error('model(): "' + name + '" is not a valid column/field name - it contains a backtick or backslash.');
+    }
+    return '`' + name + '`';
+  }
+
+  // Renders one accepted_values entry as a SQL literal - numbers/booleans
+  // unquoted, strings single-quoted with a backslash escaped first, then an
+  // embedded "'" (valid GoogleSQL string-literal escaping, matching the
+  // useLegacySql: false this whole file already runs under). Escaping "\"
+  // before "'" matters, not just for style: a value ending in an odd number
+  // of backslashes would otherwise turn the escaped-quote sequence this
+  // function emits for the *next* value into an escaped quote inside the
+  // *current* one, closing the literal in the wrong place and letting
+  // whatever text follows (the rest of a comma-joined values list) be
+  // parsed as SQL instead of string content. Scoped narrowly to what
+  // accepted_values needs (test.values is config-supplied text landing in
+  // generated SQL, same trust model as everything else in this file), not a
+  // general-purpose SQL serializer - nothing else needs one yet.
+  function quoteSqlLiteral(value) {
+    if (typeof value === 'number' || typeof value === 'boolean') {
+      return String(value);
+    }
+    if (typeof value === 'string') {
+      return '\'' + value.replace(/\\/g, '\\\\').replace(/'/g, '\\\'') + '\'';
+    }
+    throw new Error('model(): accepted_values "values" entries must be a string, number, or boolean - got ' + typeof value + '.');
+  }
+
+  // Confirms one tests[] entry is well-formed before it's ever compiled to
+  // SQL or resolved against the registry - exactly one of check/query set,
+  // a known check, its required extra key, an accepted_values "values" that
+  // is a non-empty array of safely quotable literals, no backtick smuggled
+  // into an identifier. All of this is checked up front, inside
+  // expandModelNodes()'s own try/catch, so a bad test becomes that model's
+  // own discoveryError - caught by cli('list'), not just a real run - same
+  // "validated even before there's data to check" posture move.js's own
+  // validateTest takes for config.tests.
+  function validateModelTest(test, messagePrefix) {
+    if (!test || typeof test !== 'object') {
+      throw new Error(messagePrefix + ' every "tests" entry must be an object.');
+    }
+    var hasCheck = test.check !== undefined;
+    var hasQuery = test.query !== undefined;
+    if (hasCheck === hasQuery) {
+      throw new Error(messagePrefix + ' every "tests" entry needs exactly one of "check" (a generic test) or "query" (a custom test).');
+    }
+    if (hasQuery) {
+      if (typeof test.query !== 'string' || !test.query) {
+        throw new Error(messagePrefix + ' a custom test\'s "query" must be a non-empty string.');
+      }
+      return;
+    }
+    if (typeof test.check !== 'string' || !isKnownModelTestCheck(test.check)) {
+      throw new Error(messagePrefix + ' test has an unsupported "check" ("' + test.check + '"). Expected one of: ' + MODEL_TEST_KNOWN_CHECKS.join(', ') + '.');
+    }
+    if (typeof test.column !== 'string' || !test.column) {
+      throw new Error(messagePrefix + ' test (check "' + test.check + '") needs a "column" (a non-empty string).');
+    }
+    quoteIdentifier(test.column);
+    var requiredKey = MODEL_TEST_REQUIRES[test.check];
+    if (requiredKey && test[requiredKey] === undefined) {
+      throw new Error(messagePrefix + ' test on column "' + test.column + '" (check "' + test.check + '") requires "' + requiredKey + '".');
+    }
+    if (test.check === 'accepted_values') {
+      if (!Array.isArray(test.values) || !test.values.length) {
+        throw new Error(messagePrefix + ' test on column "' + test.column + '" (check "accepted_values") requires "values" to be a non-empty array.');
+      }
+      test.values.forEach(quoteSqlLiteral);
+    }
+    if (test.check === 'relationships') {
+      if (typeof test.to !== 'string' || !test.to) {
+        throw new Error(messagePrefix + ' test on column "' + test.column + '" (check "relationships") requires "to" (another model\'s name).');
+      }
+      if (test.field !== undefined) {
+        if (typeof test.field !== 'string' || !test.field) {
+          throw new Error(messagePrefix + ' test on column "' + test.column + '" (check "relationships") has an invalid "field" - must be a non-empty string.');
+        }
+        quoteIdentifier(test.field);
+      }
+    }
+  }
+
+  function validateModelTests(tests, messagePrefix) {
+    if (tests === undefined) {
+      return;
+    }
+    if (!Array.isArray(tests)) {
+      throw new Error(messagePrefix + ' "tests" must be an array of test objects.');
+    }
+    tests.forEach(function (test) { validateModelTest(test, messagePrefix); });
+  }
+
+  // The name a compiled test reports itself as in a failure message, when
+  // the model author didn't set test.name - e.g. not_null_customer_id,
+  // relationships_customer_id_to_stg_customers - mirroring dbt's own
+  // generated test names closely enough to be recognizable.
+  function defaultModelTestName(test) {
+    if (test.check === 'relationships') {
+      return 'relationships_' + test.column + '_to_' + test.to;
+    }
+    return test.check + '_' + test.column;
+  }
+
+  // One query-builder per generic check, each producing a query string that
+  // still contains the literal "{{ this }}" placeholder - substitution
+  // happens once, inside move.js's runSqlTests, not duplicated here. Every
+  // query follows the same dbt generic-test contract runSqlTests already
+  // expects: return the offending rows, zero rows back means the check
+  // passed. Object.create(null) and MODEL_TEST_KNOWN_CHECKS-based dispatch
+  // (never CELL_CHECKS-style truthiness) for the same prototype-pollution
+  // reason move.js's own CELL_CHECKS/TEST_CHECK_REQUIRES already are -
+  // test.check is a config-supplied string.
+  var MODEL_TEST_COMPILERS = Object.create(null);
+  MODEL_TEST_COMPILERS.not_null = function (test) {
+    var column = quoteIdentifier(test.column);
+    return 'SELECT * FROM {{ this }} WHERE ' + column + ' IS NULL';
+  };
+  MODEL_TEST_COMPILERS.unique = function (test) {
+    var column = quoteIdentifier(test.column);
+    return 'SELECT ' + column + ' FROM {{ this }} GROUP BY ' + column + ' HAVING COUNT(*) > 1';
+  };
+  MODEL_TEST_COMPILERS.accepted_values = function (test) {
+    var column = quoteIdentifier(test.column);
+    var values = test.values.map(quoteSqlLiteral).join(', ');
+    return 'SELECT * FROM {{ this }} WHERE ' + column + ' NOT IN (' + values + ')';
+  };
+  // relationships needs the registry to resolve "to" into a real relation -
+  // the same resolveModelConfig()+qualifiedRelation() pair compileModelSql's
+  // own ref() substitution already uses above, reused here rather than a
+  // second way to look up a model's relation. The child column's own
+  // "IS NOT NULL" guard is deliberate: a NULL foreign key isn't a
+  // referential-integrity violation (pair with a not_null test if that
+  // matters), matching dbt's own relationships test.
+  MODEL_TEST_COMPILERS.relationships = function (test, registry) {
+    var column = quoteIdentifier(test.column);
+    var field = quoteIdentifier(test.field || test.column);
+    var toRelation = qualifiedRelation(resolveModelConfig(test.to, registry));
+    return 'SELECT ' + column + ' FROM {{ this }} WHERE ' + column + ' IS NOT NULL AND '
+      + column + ' NOT IN (SELECT ' + field + ' FROM ' + toRelation + ')';
+  };
+
+  // Turns every tests[] entry into the {name, query} shape move.js's
+  // runSqlTests expects - a custom entry (test.query) passes through as-is;
+  // a generic entry (test.check) compiles via MODEL_TEST_COMPILERS. registry
+  // is only actually used by "relationships"' to-resolution, but passed to
+  // every compiler uniformly rather than special-casing one check's own
+  // signature.
+  function compileModelTests(tests, registry) {
+    return tests.map(function (test) {
+      if (test.query) {
+        return { name: test.name, query: test.query };
+      }
+      return { name: test.name || defaultModelTestName(test), query: MODEL_TEST_COMPILERS[test.check](test, registry) };
+    });
+  }
+
+  // The dependency-derivation hook for "relationships" tests, mirroring
+  // extractRefDependencies above for {{ ref() }}: a relationships test's
+  // "to" is a real edge to another model - this model can't meaningfully be
+  // tested against a model that hasn't run yet - so it has to be
+  // discoverable the same cheap, SQL-free way {{ ref() }}'s names are,
+  // without resolving anything against the registry yet (that happens once,
+  // at compile time, in MODEL_TEST_COMPILERS.relationships above).
+  function extractTestRefDependencies(tests) {
+    return (tests || [])
+      .filter(function (test) { return test && test.check === 'relationships'; })
+      .map(function (test) { return test.to; });
+  }
+
   // cli.js's discoverNodes() calls this once, after its own var-scan, and
   // folds the result into the same node list - see the module comment above
   // for why models need this instead of being found by that scan directly.
@@ -1785,6 +2005,7 @@ var NotSoBigData = (function () {
           throw new Error(cached.error);
         }
         config.sql = extractModelSql(cached.content, config.sqlFile, name);
+        validateModelTests(config.tests, 'model(): "' + name + '"');
         // Computed from config.dependsOn (whichever hand-written value won
         // MODEL_DEFAULT_KEYS's override), then deleted off config - node.config
         // must not keep its own, pre-merge "dependsOn" once node.dependsOn
@@ -1794,7 +2015,14 @@ var NotSoBigData = (function () {
         var handWritten = parseDependsOnList('model(): "' + name + '"', config.dependsOn);
         delete config.dependsOn;
         node.config = config;
-        node.dependsOn = mergeDependsOn(extractRefDependencies(config.sql), handWritten);
+        // A relationships test's "to" is unioned in alongside {{ ref() }}'s
+        // own edges - see extractTestRefDependencies above - so a model
+        // never runs (or is tested) against a relation that hasn't been
+        // built yet, the same guarantee {{ ref() }} already gives.
+        node.dependsOn = mergeDependsOn(
+          extractRefDependencies(config.sql).concat(extractTestRefDependencies(config.tests)),
+          handWritten
+        );
       } catch (error) {
         node.discoveryError = error.message;
       }
@@ -1803,19 +2031,36 @@ var NotSoBigData = (function () {
   }
 
   // The EXECUTORS.model entry: compiles the model's SQL (substituting every
-  // ref()) and materializes it as a view or table. Deliberately does not
-  // call move.js's assertReadOnlySelect - that guard exists to keep move()
-  // read-only, and a model's whole job is writing. It does reuse
-  // assertSingleStatement, move.js's other SQL-shape guard: a model can
-  // write, but a stray ";" splitting its SQL into more than one statement
-  // is a mistake either way, not a second statement this library intends
-  // to run.
+  // ref()), materializes it as a view or table, then - if the model
+  // declares tests - runs them against the relation it just materialized.
+  // Deliberately does not call move.js's assertReadOnlySelect on the
+  // model's own SQL - that guard exists to keep move() read-only, and a
+  // model's whole job is writing. It does reuse assertSingleStatement,
+  // move.js's other SQL-shape guard: a model can write, but a stray ";"
+  // splitting its SQL into more than one statement is a mistake either way,
+  // not a second statement this library intends to run.
+  //
+  // Tests run *after* CREATE OR REPLACE, not staged-then-promoted the way a
+  // bigquery move target's sqlTests are (see loadBigQueryStaged in
+  // move.js). That's deliberate, not a missed guarantee: CREATE OR REPLACE
+  // is already atomic, and re-running a model's own SELECT a second time
+  // into a scratch table just to test-before-promote would double BigQuery
+  // compute on every single run - for a guarantee real dbt itself doesn't
+  // give either (dbt builds a model, then runs its tests afterward, as a
+  // separate step; a failing test never un-writes the model). A failing
+  // test here throws (via the reused runSqlTests), which fails this node
+  // and skips its dependents through cli()'s ordinary failure propagation -
+  // same outcome shape as any other model() failure, just discovered one
+  // step later. There is no "discard_row" equivalent for a model test:
+  // unlike move()'s in-memory tests, there's no row array left to filter -
+  // the relation is already fully written by the time a test can run.
   //
   // config.sql is always already set by expandModelNodes() above by the
   // time this runs. A node whose own discovery failed instead carries a
   // node-level discoveryError, which cli.js's runNodes() checks and reports
   // as "failed" before ever calling an EXECUTORS entry - so there is no path
-  // into this function for a node that didn't get a real config.sql.
+  // into this function for a node that didn't get a real config.sql, and
+  // config.tests (if present) has already passed validateModelTests above.
   function model(config) {
     var sql = config.sql;
     assertSingleStatement(sql, 'model(): "' + config.name + '"');
@@ -1827,7 +2072,16 @@ var NotSoBigData = (function () {
     var materialized = resolveMaterialized(config);
     var statement = 'CREATE OR REPLACE ' + materialized.toUpperCase() + ' ' + relation + ' AS\n' + compiled;
     runBigQueryQueryJob({ query: statement, useLegacySql: false }, config.projectId);
-    return { relation: relation, materialized: materialized };
+    var result = { relation: relation, materialized: materialized };
+    if (config.tests && config.tests.length) {
+      var compiledTests = compileModelTests(config.tests, registry);
+      result.testResults = runSqlTests(
+        compiledTests,
+        { projectId: config.projectId, dataset: config.dataset, table: config.name },
+        'model(): "' + config.name + '" tests'
+      );
+    }
+    return result;
   }
 
   // ==================================================================

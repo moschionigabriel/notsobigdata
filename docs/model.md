@@ -110,6 +110,73 @@ model in `dependsOn` isn't rejected, but it's not the documented way to do
 it and skips the guarantee `ref()` gives that the dependency and the SQL
 can't drift apart.
 
+## Tests
+
+A model can declare `tests`, an optional array run against the relation
+it just materialized — dbt's own four built-in generic tests, plus your
+own SQL for anything more specific:
+
+```javascript
+var notsobigdataModels = {
+  projectId: 'my-project', dataset: 'analytics',
+  models: {
+    stg_customers: { /* ... */ },
+    orders_summary: {
+      // SQL: select ... from {{ ref('stg_customers') }} ...
+      tests: [
+        { column: 'customer_id', check: 'not_null' },
+        { column: 'order_id', check: 'unique' },
+        { column: 'status', check: 'accepted_values', values: ['open', 'closed', 'cancelled'] },
+        { column: 'customer_id', check: 'relationships', to: 'stg_customers' },
+        { name: 'no_negative_totals', query: 'SELECT * FROM {{ this }} WHERE order_total < 0' }
+      ]
+    }
+  }
+};
+```
+
+Each entry sets exactly one of `check` (a generic test) or `query` (a
+custom test) — never both, never neither.
+
+- `not_null` and `unique` need `column` only.
+- `accepted_values` also needs `values` (a non-empty array of strings,
+  numbers, or booleans).
+- `relationships` also needs `to` (another declared model's name) and
+  accepts an optional `field` (the column on `to`, defaulting to the same
+  name as `column`) — this is model's answer to the referential check
+  `move`'s own row-level `tests` can't express (see
+  [docs/move.md](move.md)'s "Tests" section): does every value in this
+  model's column exist somewhere in another model's column?
+- `query` (a custom test) works exactly like a `bigquery` move target's
+  `target.sqlTests` — a `SELECT` with `{{ this }}` standing in for this
+  model's own fully-qualified relation, expected to return the *offending
+  rows*. Zero rows back means the test passed.
+
+A `relationships` test's `to` is a real dependency, the same way
+`{{ ref() }}` is — `orders_summary` above waits on `stg_customers` even
+though nothing in its SQL selects from it, so the test never runs against
+a relation that doesn't exist yet.
+
+Every declared test runs, whether it's the built-in generic kind or your
+own SQL, and a bad shape (an unknown `check`, a missing required key, an
+empty `values`) is caught the moment `cli()` discovers the model —
+`cli('list')` catches it, not just a real run, same as every other model
+misconfiguration.
+
+Tests run **after** the model materializes, not before — unlike a
+`bigquery` move target's `sqlTests`, which stage data and test it before
+ever touching the real table. A model's `CREATE OR REPLACE` is already
+atomic, and re-running the model's own `SELECT` a second time into a
+scratch table just to test-before-promote would double the BigQuery cost
+of every run for a guarantee real dbt itself doesn't give either — dbt
+builds a model, then runs its tests afterward, as a separate step. A
+failing test here throws, same as any other `model()` error: this node
+fails and anything depending on it is skipped, but the (bad) data is
+already sitting in the real relation by the time you find out. There's no
+`discard_row` option the way `move`'s own `tests` has — a model's tests
+run against a relation that's already fully written, not an in-memory row
+array you can still filter.
+
 `{{ ref() }}` is the only template call implemented so far — no macros, no
 `for`/`if`. Referencing a name that isn't a declared model is an error, not
 something silently passed through as literal text into SQL that runs with

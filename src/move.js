@@ -246,20 +246,21 @@ function assertSingleStatement(sql, messagePrefix) {
 // keyword/shape check, not a security boundary: it only strips comments,
 // looks at the leading keyword, and rejects multiple ";"-separated
 // statements, so it won't catch e.g. a SELECT that calls a mutating
-// stored routine. move()'s job is extracting/asserting on data -
-// transforming/writing it belongs in model().
+// stored routine.
 //
-// "context" is only used to phrase the thrown message - shared by every
-// call site that hands move() raw SQL to run under the script's live
-// OAuth (a bigquery source's query/queryFileId, and a bigquery target's
-// sqlTests[].query) rather than each one repeating this same check with
-// its own wording.
-function assertReadOnlySelect(sql, context) {
+// messagePrefix is the caller's own complete "move(): ..."/"model(): ..."
+// lead-in - same convention assertSingleStatement below already uses -
+// rather than a bare "context" this function prefixes itself, so the
+// thrown message reads the same regardless of which module or which kind
+// of SQL (a bigquery source's query, a bigquery target's sqlTests[].query,
+// or a model's own tests[].query - runSqlTests below hands every one of
+// those through here) raised it.
+function assertReadOnlySelect(sql, messagePrefix) {
   var stripped = stripSqlComments(sql);
   if (!/^(select|with)\b/i.test(stripped)) {
-    throw new Error('move(): ' + context + ' must be a read-only SELECT (optionally starting with WITH). move() only extracts/asserts on data - transform or write logic belongs in model().');
+    throw new Error(messagePrefix + ' must be a read-only SELECT (optionally starting with WITH) - it can check data, not change it.');
   }
-  assertSingleStatementStripped(stripped, 'move(): ' + context);
+  assertSingleStatementStripped(stripped, messagePrefix);
 }
 
 // Runs a BigQuery query job (Jobs.query) to completion and returns
@@ -296,7 +297,7 @@ function runBigQueryQueryJob(queryRequest, projectId) {
 // silently truncated.
 function extractBigQuery(source) {
   var sql = resolveBigQuerySql(source);
-  assertReadOnlySelect(sql, 'bigquery source.query/queryFileId');
+  assertReadOnlySelect(sql, 'move(): bigquery source.query/queryFileId');
   var queryResults = runBigQueryQueryJob({ query: sql, useLegacySql: false }, source.projectId);
   var jobId = queryResults.jobReference.jobId;
 
@@ -819,16 +820,27 @@ function resolveStagingTableId(table) {
   return '_notsobigdata_stage_' + table + '_' + Utilities.getUuid().replace(/-/g, '');
 }
 
-// Runs every target.sqlTests entry against the table loadBigQueryStaged
-// just staged, substituting "{{ this }}" - deliberately reusing dbt's own
-// name for "the table this test is about" - with the staged table's
-// fully-qualified, backtick-quoted name. Each query is expected to
-// return the rows that violate whatever it's checking (referential
-// integrity, an aggregate/volume check, ...); zero rows back means the
-// test passed, mirroring dbt's own generic-test contract. Gated through
-// assertReadOnlySelect for the same reason a bigquery source's query is:
-// this SQL runs under the script's live OAuth, and a sql test is
-// pipeline-author-supplied text, not move()'s own.
+// Runs a list of {name, query} SQL tests against one relation, substituting
+// "{{ this }}" - deliberately reusing dbt's own name for "the table this
+// test is about" - with relationRef's fully-qualified, backtick-quoted
+// name. Each query is expected to return the rows that violate whatever
+// it's checking (referential integrity, an aggregate/volume check, ...);
+// zero rows back means the test passed, mirroring dbt's own generic-test
+// contract. Gated through assertReadOnlySelect for the same reason a
+// bigquery source's query is: this SQL runs under the script's live
+// OAuth, and a sql test is pipeline-author-supplied text, not move()'s
+// or model()'s own.
+//
+// Shared by move.js's own loadBigQueryStaged below (relationRef names a
+// brand-new staging table) and model.js's model() (relationRef names the
+// model's own just-materialized relation) - genuinely the same primitive
+// either way: run these queries against that relation, fail loudly if any
+// comes back non-empty. messagePrefix is the caller's own complete
+// "move(): ..."/"model(): ..." lead-in, same convention
+// assertSingleStatement/assertReadOnlySelect already use, so the thrown
+// message and every per-entry error reads right regardless of which
+// module or which kind of test (a bigquery target's sqlTests, or a
+// model's tests) raised it.
 //
 // Only a bounded first page is read via runBigQueryQueryJob's
 // maxResults - getQueryResults already reports totalRows regardless of
@@ -840,20 +852,20 @@ function resolveStagingTableId(table) {
 // failed - collected, not thrown on first sight - so one call surfaces
 // every failing test at once, the same posture runTests() takes for
 // config.tests. There is no "discard_row" here (yet): a sql test finding
-// bad rows can't cheaply un-stage just those rows the way runTests()
-// filters an in-memory array, and no real user has needed it yet - the
-// same "not built speculatively" call move.md already makes for
-// referential checks in general.
-function runSqlTests(sqlTests, stagedRef) {
-  var thisRef = qualifiedTableRef(stagedRef.projectId, stagedRef.dataset, stagedRef.table);
+// bad rows can't cheaply undo the write it's checking the way runTests()
+// filters an in-memory array before anything is written, and no real user
+// has needed it yet - the same "not built speculatively" call move.md
+// already makes for referential checks in general.
+function runSqlTests(sqlTests, relationRef, messagePrefix) {
+  var thisRef = qualifiedTableRef(relationRef.projectId, relationRef.dataset, relationRef.table);
   var failures = [];
   sqlTests.forEach(function (test) {
     if (!test || typeof test.query !== 'string' || !test.query) {
-      throw new Error('move(): every entry in bigquery target.sqlTests needs a "query" (a non-empty string).');
+      throw new Error(messagePrefix + ': every entry needs a "query" (a non-empty string).');
     }
     var query = test.query.replace(/\{\{\s*this\s*\}\}/g, thisRef);
-    assertReadOnlySelect(query, 'bigquery target.sqlTests[].query');
-    var queryResults = runBigQueryQueryJob({ query: query, useLegacySql: false, maxResults: 5 }, stagedRef.projectId);
+    assertReadOnlySelect(query, messagePrefix + '[].query');
+    var queryResults = runBigQueryQueryJob({ query: query, useLegacySql: false, maxResults: 5 }, relationRef.projectId);
     var totalRows = Number(queryResults.totalRows || 0);
     if (totalRows > 0) {
       var exampleRows = (queryResults.rows || []).slice(0, 5).map(function (row) {
@@ -866,7 +878,7 @@ function runSqlTests(sqlTests, stagedRef) {
     var summary = failures.map(function (f) {
       return '"' + f.name + '" returned ' + f.count + ' failing row(s) (e.g. ' + f.exampleRows.join(' | ') + ')';
     }).join('; ');
-    throw new Error('move(): bigquery sql test(s) failed against the staged table - ' + summary + '.');
+    throw new Error(messagePrefix + ' failed against ' + thisRef + ' - ' + summary + '.');
   }
   return { ran: sqlTests.length };
 }
@@ -952,7 +964,7 @@ function loadBigQueryStaged(rows, target, writeDisposition) {
     );
     var stagingJobId = runBigQueryJob({ configuration: { load: stagingLoadConfig } }, target.projectId, blob, 'load');
 
-    var testResults = runSqlTests(target.sqlTests, { projectId: target.projectId, dataset: target.dataset, table: stagingTable });
+    var testResults = runSqlTests(target.sqlTests, { projectId: target.projectId, dataset: target.dataset, table: stagingTable }, 'move(): bigquery target.sqlTests');
 
     if (target.allowSchemaEvolution && writeDisposition === 'WRITE_APPEND') {
       widenDestinationTableForPromotion(target, stagingTable);
