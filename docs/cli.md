@@ -193,7 +193,7 @@ Any top-level `var` holding an object with a `kind` key is a node.
 | --- | --- | --- |
 | `kind` | yes | Which kind of step this is, as a hand-written key on the `var`. Only `'move'` is declared this way — a `model` node is registered differently, as an entry in the `notsobigdataModels` registry rather than its own top-level `var`; see [docs/model.md](model.md). Both kinds still show up as ordinary nodes to `cli()` once discovered. |
 | `name` | no | The node's name, used by `dependsOn` and `--select`. Defaults to the variable name you declared it as. |
-| `dependsOn` | no | Array of node names this one must run after. |
+| `dependsOn` | no | Array of node names this one must run after. (A `model` node isn't declared this way — see [docs/model.md](model.md)'s "Depending on a `move` node" for how a model hand-declares a `dependsOn` of its own, alongside its `{{ ref() }}`-derived edges.) |
 
 Everything else on the object is that kind's own config — for `move`, the
 `source` and `target` described in [docs/move.md](move.md).

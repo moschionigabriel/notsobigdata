@@ -91,11 +91,19 @@ function parseSingleStringArgument(call, args) {
 }
 
 // The keys a model entry or the registry's top level may set as a
-// materialization default. Kept as an explicit list rather than copying
-// every key on notsobigdataModels, so an unrelated key a user attaches to
-// the registry (notes, a comment, anything) never leaks into a model's
-// resolved config.
-var MODEL_DEFAULT_KEYS = ['projectId', 'dataset', 'materialized'];
+// default. Kept as an explicit list rather than copying every key on
+// notsobigdataModels, so an unrelated key a user attaches to the registry
+// (notes, a comment, anything) never leaks into a model's resolved
+// config. dependsOn joins this list for the same reason a project-wide
+// materialized default is useful - a registry-wide "every model waits on
+// this" is a real shape (e.g. a shared staging load) - and it gets the
+// override behavior below (an entry's own dependsOn replaces the
+// registry's, not merges with it) for free, the same way materialized
+// already does. That override is deliberately about *this* value only:
+// expandModelNodes() below still always unions whichever dependsOn wins
+// here with the model's own {{ ref() }}-derived edges - dependsOn can
+// never suppress a real ref().
+var MODEL_DEFAULT_KEYS = ['projectId', 'dataset', 'materialized', 'dependsOn'];
 
 // Guarded read of the single notsobigdataModels global, reusing cli.js's
 // readOptionalGlobal() - same "never throw because of a global this
@@ -246,8 +254,11 @@ function extractModelSql(html, sqlFile, modelName) {
   return matches[0].sql.trim();
 }
 
-// The dependency-derivation hook: a model's ref() calls *are* its edges,
-// so dependsOn is read out of the SQL instead of being hand-written. Scans
+// The dependency-derivation hook: a model's ref() calls *are* its edges to
+// other models, so a model-to-model dependency is read out of the SQL
+// instead of being hand-written - see mergeDependsOn() below for the one
+// other source of edges a model can have (a hand-written dependsOn,
+// naming a non-model node the SQL has no way to ref()). Scans
 // stripSqlComments()'s output (move.js's own comment-stripping, reused
 // rather than re-implemented) rather than the raw SQL, so a ref() a user
 // has commented out (e.g. "-- from {{ ref('old_model') }}") doesn't become
@@ -256,6 +267,29 @@ function extractRefDependencies(sql) {
   return scanTemplateExpressions(stripSqlComments(sql))
     .filter(function (expression) { return expression.call === 'ref'; })
     .map(function (expression) { return parseSingleStringArgument('ref', expression.args); });
+}
+
+// Unions a model's {{ ref() }}-derived edges with its hand-written
+// dependsOn (see MODEL_DEFAULT_KEYS above for where that value comes
+// from - a model entry's own dependsOn, or the registry's project-wide
+// default), preserving first-seen order and dropping duplicates. The
+// union is deliberate, not a merge choice made lightly: dependsOn is for
+// naming a node ref() cannot reach (a move node, by convention - see
+// docs/model.md), and must never be able to suppress an edge the SQL
+// itself already declares via a real ref(). Reuses cli.js's
+// emptyMap()/has() rather than Array#indexOf, same prototype-pollution
+// reasoning as every other name-keyed lookup in this library.
+function mergeDependsOn(refDeps, handWrittenDeps) {
+  var seen = emptyMap();
+  var merged = [];
+  refDeps.concat(handWrittenDeps).forEach(function (name) {
+    if (has(seen, name)) {
+      return;
+    }
+    seen[name] = true;
+    merged.push(name);
+  });
+  return merged;
 }
 
 // Substitutes every {{ ref('x') }} with x's resolved, backtick-quoted
@@ -384,7 +418,8 @@ function expandModelNodes() {
       }
       config.sql = extractModelSql(cached.content, config.sqlFile, name);
       node.config = config;
-      node.dependsOn = extractRefDependencies(config.sql);
+      var handWritten = parseDependsOnList('model(): "' + name + '"', config.dependsOn);
+      node.dependsOn = mergeDependsOn(extractRefDependencies(config.sql), handWritten);
     } catch (error) {
       node.discoveryError = error.message;
     }
