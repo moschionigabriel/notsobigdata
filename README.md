@@ -135,7 +135,9 @@ declared → **[docs/cli.md](docs/cli.md)**.
   connector config → **[docs/move.md](docs/move.md)**.
 - **`model`** — SQL models against BigQuery, the "T" of "ELT": dbt-style
   `{{ ref() }}` dependencies, `view`/`table` materialization, SQL stored in
-  `.html` files. Full config → **[docs/model.md](docs/model.md)**.
+  `.html` files, with optional dbt-style tests (`not_null`, `unique`,
+  `accepted_values`, `relationships`) or your own SQL. Full config →
+  **[docs/model.md](docs/model.md)**.
 
 ## Scheduling
 

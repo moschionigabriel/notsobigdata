@@ -389,4 +389,7 @@ scope for `tests` — they'd need to query another table, which a check
 running against an in-memory 2D array can't do. For a `bigquery` target
 specifically, `target.sqlTests` (above) covers that case instead, by
 running SQL against the data after it's staged in BigQuery rather than
-against the extracted rows in Apps Script memory.
+against the extracted rows in Apps Script memory. Checking one *model*
+against another (rather than incoming `move` rows against an existing
+table) has its own, more direct `relationships` check — see
+[docs/model.md](model.md)'s "Tests" section.
