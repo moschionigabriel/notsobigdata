@@ -4,12 +4,16 @@
 // time with HtmlService because .html is the only plain-text file Apps
 // Script lets a project hold. Models reference each other dbt-style, with
 // {{ ref('other_model') }} placeholders inside the SQL. Those refs *are*
-// the model-to-model dependency declaration - a model never hand-writes
-// dependsOn for another *model*, and refs get substituted with the real
-// table identifier just before the SQL runs. A model can still have its
-// own hand-written dependsOn for a non-model (move) dependency ref()
-// can't reach - see MODEL_DEFAULT_KEYS and mergeDependsOn() below, and
-// docs/model.md's "Depending on a move node" for the user-facing version.
+// the dependency declaration - a model never hand-writes dependsOn for
+// something its SQL already ref()s, and refs get substituted with the
+// real table identifier just before the SQL runs. ref() resolves against
+// two things: another declared model, or a move node whose target is
+// bigquery (see the moveBigQueryTargets index in expandModelNodes()
+// below) - a move node loading anything else (Sheets, Drive, an API) has
+// no queryable relation for ref() to substitute, so a model that merely
+// needs to wait on one of those still uses a hand-written dependsOn - see
+// MODEL_DEFAULT_KEYS and mergeDependsOn() below, and docs/model.md's
+// "Depending on a move node" for the user-facing version.
 //
 // A model's .html file can hold its SQL three ways, chosen by how many
 // <script type="text/sql"> tags it contains - see extractModelSql() below:
@@ -406,15 +410,18 @@ function extractModelSql(html, sqlFile, modelName) {
   return matches[0].sql.trim();
 }
 
-// The dependency-derivation hook: a model's ref() calls *are* its edges to
-// other models, so a model-to-model dependency is read out of the SQL
-// instead of being hand-written - see mergeDependsOn() below for the one
-// other source of edges a model can have (a hand-written dependsOn,
-// naming a non-model node the SQL has no way to ref()). Scans
-// stripSqlComments()'s output (move.js's own comment-stripping, reused
-// rather than re-implemented) rather than the raw SQL, so a ref() a user
-// has commented out (e.g. "-- from {{ ref('old_model') }}") doesn't become
-// a real dependency edge on a model that may not even exist any more.
+// The dependency-derivation hook: a model's ref() calls *are* its edges,
+// so a dependency is read out of the SQL instead of being hand-written -
+// see mergeDependsOn() below for the one other source of edges a model can
+// have (a hand-written dependsOn, naming a node ref() has no way to reach -
+// a move node with a non-bigquery target). Just extracts names here, with
+// no opinion on whether a name is a model or a move node - expandModelNodes()
+// below is what classifies each one and turns an unknown name into a
+// discoveryError. Scans stripSqlComments()'s output (move.js's own
+// comment-stripping, reused rather than re-implemented) rather than the raw
+// SQL, so a ref() a user has commented out (e.g. "-- from {{ ref('old_model')
+// }}") doesn't become a real dependency edge on a node that may not even
+// exist any more.
 function extractRefDependencies(sql) {
   return scanTemplateExpressions(stripSqlComments(sql))
     .filter(function (expression) { return expression.call === 'ref'; })
@@ -1197,6 +1204,34 @@ function extractTestRefDependencies(tests) {
     .map(function (test) { return test.to; });
 }
 
+// The other half of what {{ ref() }} can resolve, alongside a model name:
+// a move node whose target is bigquery. Built once per expandModelNodes()
+// call (not once per model - move nodes are project-wide state, the same
+// reasoning readMacroDefinitions() is hoisted above the per-model loop
+// below), from the node list cli.js's discoverNodes() already scanned
+// before calling here. Keyed by node name -> its qualifiedTableRef(), the
+// exact string a ref() substitutes in, computed once here rather than at
+// every model's compile time (compileModelSql() in model() below just
+// looks this up).
+//
+// Missing projectId/dataset/table on a bigquery target is deliberately not
+// an error here - that is move()'s own config to validate (loadBigQuery
+// already throws for it), not something this index has any business
+// re-checking; such a node simply doesn't make it into the index, so a
+// ref() naming it fails the same "does not match a declared model or a
+// bigquery-target move node" way a typo would.
+function indexMoveBigQueryTargets(otherNodes) {
+  var index = emptyMap();
+  (otherNodes || []).forEach(function (node) {
+    var target = node.kind === 'move' && node.config ? node.config.target : null;
+    if (!target || target.type !== 'bigquery' || !target.projectId || !target.dataset || !target.table) {
+      return;
+    }
+    index[node.name] = qualifiedTableRef(target.projectId, target.dataset, target.table);
+  });
+  return index;
+}
+
 // cli.js's discoverNodes() calls this once, after its own var-scan, and
 // folds the result into the same node list - see the module comment above
 // for why models need this instead of being found by that scan directly.
@@ -1239,8 +1274,9 @@ function extractTestRefDependencies(tests) {
 // already fully known at discovery time (no BigQuery call needed to see
 // it), so deferring it to a real run would make "list" strictly less
 // useful for exactly the errors that are cheapest to catch early.
-function expandModelNodes() {
+function expandModelNodes(otherNodes) {
   var registry = readModelsRegistry();
+  var moveBigQueryTargets = indexMoveBigQueryTargets(otherNodes);
   // Read once, hoisted above the per-model loop below - macro files are
   // project-wide state, the same status registry itself already has, not
   // per-model state the way a model's own sqlFile is. Deliberately NOT
@@ -1296,6 +1332,34 @@ function expandModelNodes() {
       validateModelTests(config.tests, 'model(): "' + name + '"');
       validateSetUsage(config.sql, 'model(): "' + name + '"');
       validateVarUsage(config.sql, registry, 'model(): "' + name + '"');
+      // Every {{ ref(...) }} name must resolve to something - a declared
+      // model (unchanged, handled by model()'s own resolveRef at compile
+      // time) or a bigquery-target move node (resolved right here, once,
+      // rather than re-scanning the global for it on every compile - see
+      // moveBigQueryTargets above). Anything else is a discoveryError, same
+      // "fail loud at validation time, not two calls later" posture as
+      // every other check in this loop - without this, a typo'd or
+      // non-bigquery move node name would only surface once model() itself
+      // ran and its resolveRef fallback found nothing.
+      var refNames = extractRefDependencies(config.sql);
+      // emptyMap(), not {} - same reason every other name-keyed map in
+      // this library uses it (see cli.js's own emptyMap() comment): a move
+      // node literally named "__proto__" is a real, if wacky, possible key
+      // here, and a plain {} would silently swallow that assignment (sets
+      // the prototype, not an own property) instead of storing it.
+      var moveRefTargets = emptyMap();
+      refNames.forEach(function (refName) {
+        if (has(registry.models, refName)) {
+          return;
+        }
+        if (has(moveBigQueryTargets, refName)) {
+          moveRefTargets[refName] = moveBigQueryTargets[refName];
+          return;
+        }
+        throw new Error('model(): "' + name + '" has {{ ref(\'' + refName + '\') }}, which does not match a declared model or a move node with a bigquery target. Known models: '
+          + Object.keys(registry.models).join(', ') + '. Known bigquery-target move nodes: ' + Object.keys(moveBigQueryTargets).join(', ') + '.');
+      });
+      config.moveRefTargets = moveRefTargets;
       // Computed from config.dependsOn (whichever hand-written value won
       // MODEL_DEFAULT_KEYS's override), then deleted off config - node.config
       // must not keep its own, pre-merge "dependsOn" once node.dependsOn
@@ -1310,7 +1374,7 @@ function expandModelNodes() {
       // never runs (or is tested) against a relation that hasn't been
       // built yet, the same guarantee {{ ref() }} already gives.
       node.dependsOn = mergeDependsOn(
-        extractRefDependencies(config.sql).concat(extractTestRefDependencies(config.tests)),
+        refNames.concat(extractTestRefDependencies(config.tests)),
         handWritten
       );
     } catch (error) {
@@ -1358,7 +1422,22 @@ function model(config) {
   assertSingleStatement(sql, 'model(): "' + config.name + '"');
   var registry = readModelsRegistry();
   var compiled = compileModelSql(sql, function (refName) {
-    return qualifiedRelation(resolveModelConfig(refName, registry));
+    if (has(registry.models, refName)) {
+      return qualifiedRelation(resolveModelConfig(refName, registry));
+    }
+    // Not a model - must be a bigquery-target move node, already resolved
+    // and validated once by expandModelNodes() at discovery time (see its
+    // own comment), so this is a cheap lookup, not a fresh resolution -
+    // same "redundant re-validation, cheap defense in depth" posture the
+    // model branch above already has via resolveModelConfig's own throw.
+    // Unreachable in practice (discovery already rejects anything that
+    // wouldn't resolve here), but a node's own config could in principle be
+    // mutated between discovery and run, so this still throws rather than
+    // substituting undefined into a live BigQuery statement.
+    if (has(config.moveRefTargets, refName)) {
+      return config.moveRefTargets[refName];
+    }
+    throw new Error('model(): "' + config.name + '" has {{ ref(\'' + refName + '\') }}, which does not match a declared model or a move node with a bigquery target.');
   }, registry);
   var relation = qualifiedRelation(config);
   var materialized = resolveMaterialized(config);
