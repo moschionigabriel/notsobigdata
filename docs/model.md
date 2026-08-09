@@ -150,6 +150,49 @@ same way they are in real dbt/Jinja. `{% set %}` is a value scoped to one
 model's own SQL; `{{ var(...) }}` is a value scoped to the whole project,
 declared once on the registry. Neither can read the other's values.
 
+### Repeating SQL: `{% for %}`
+
+A model can repeat a block of SQL once per item in a literal list with
+`{% for x in ['a', 'b'] %}...{% endfor %}`, substituting a bare `{{ x }}`
+reference to the loop variable within that block — real Jinja block syntax,
+the same way dbt itself uses `{% for %}` to generate a pivot's repeated
+columns without hand-writing each one:
+
+```html
+<!-- orders_summary.html -->
+<script type="text/sql">
+  select
+    customer_id,
+    {% for status in ['open', 'closed', 'cancelled'] %}
+    sum(case when status = '{{ status }}' then amount else 0 end) as {{ status }}_total,
+    {% endfor %}
+    count(*) as order_count
+  from {{ ref('stg_orders') }}
+  group by 1
+</script>
+```
+
+The list is a literal, comma-separated array of quoted strings only — not a
+`var()` or `ref()` call — the same string-literal-only posture `config()`'s
+kwargs and `{% set %}`'s right-hand side already take. `{% for %}` expands
+before anything else looks at the SQL, so a `{{ ref(...) }}`, `{{
+config(...) }}`, or `{% set %}` written *inside* a loop body works exactly
+like it would outside one, repeated once per item along with the rest of
+the block.
+
+Because `{% for %}` is plain text repetition, not a real Jinja evaluator,
+it has the same limit `{% set %}` already documents for itself: only the
+bare `{{ x }}` shape is substituted. Using the loop variable as an argument
+to another call — `{{ ref(x) }}`, `{{ var(x) }}` — is not supported; write
+the block so the loop variable stands on its own, the way `status` does
+above.
+
+Nesting one `{% for %}` inside another is not supported and is a
+discovery-time error, same as an unterminated `{% for %}` with no matching
+`{% endfor %}`, an empty list, or an item that isn't a quoted string —
+`cli('list')` catches all of these before any real run, same as every
+other model misconfiguration.
+
 Every model is then just another node: `cli('run')` picks up every entry in
 `notsobigdataModels.models` alongside your `move` nodes and orders the
 whole graph together, `cli('run --select model')` runs only models,
@@ -278,9 +321,8 @@ run against a relation that's already fully written, not an in-memory row
 array you can still filter.
 
 `{{ ref() }}`, `{{ config() }}` and `{{ var() }}` are the only `{{ }}`
-calls implemented so far, alongside the `{% set %}` statement (see above)
-— no `for`/`if` (those are block constructs, a materially bigger
-undertaking than a single-line statement). Referencing a name that isn't a
+calls implemented so far, alongside the `{% set %}` and `{% for %}`
+block constructs (see above) — no `if` yet. Referencing a name that isn't a
 declared model, an undefined `{% set %}`/`var()`, or an unsupported
 template call, is an error, not something silently passed through as
 literal text into SQL that runs with your live
