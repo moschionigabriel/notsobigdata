@@ -15,15 +15,18 @@
 // pick up a new kind from this map alone.
 //
 // One honest caveat, so nobody discovers it mid-change: discovery is
-// kind-agnostic only for kinds whose edges are hand-written. discoverNodes()
-// below reads dependencies straight off config.dependsOn, and the planned
-// model kind derives its edges by parsing {{ ref() }} out of its SQL
-// instead. So adding model() means an entry here *plus* a per-kind hook for
-// deriving dependsOn. That hook doesn't exist yet - it isn't written
-// speculatively, because the kind that needs it isn't written either, and
-// guessing its shape now is how you get the wrong abstraction.
+// kind-agnostic only for kinds whose *edges* are hand-written. move's
+// dependsOn is read straight off its config below; model's isn't - a
+// model derives its edges by parsing {{ ref() }} out of its own SQL, and
+// its nodes don't even come from a top-level var each (see
+// discoverNodes() below) - they're expanded from the single
+// notsobigdataModels registry by model.js's expandModelNodes(). Both of
+// those are model-specific hooks, kept as narrow as the kind that needed
+// them; a third kind needing something similar gets its own hook, not a
+// generalized version of this one.
 var EXECUTORS = {
-  move: move
+  move: move,
+  model: model
 };
 
 function knownKinds() {
@@ -40,6 +43,16 @@ function has(map, key) {
   return Object.prototype.hasOwnProperty.call(map, key);
 }
 
+// True for a plain, non-array object - the shape check every "is this
+// really a config object" guard in this library repeats: discoverNodes()'s
+// var-scan below, and model.js's readModelsRegistry (twice, once for the
+// registry itself and once for its .models field). One predicate means
+// whether "typeof x === 'object'" needs the Array.isArray() exclusion too
+// never has to be decided more than once.
+function isPlainObject(value) {
+  return !!value && typeof value === 'object' && !Array.isArray(value);
+}
+
 // Every lookup map below is built with this rather than {}, because has()
 // only fixes half the problem. It guards the *read* side; this guards the
 // *write* side, and the write side has a worse failure. Assigning
@@ -52,6 +65,32 @@ function has(map, key) {
 // stores like any other.
 function emptyMap() {
   return Object.create(null);
+}
+
+// Claims a node name against the shared map every discovery path
+// populates - the plain var-scan below and model.js's expandModelNodes()
+// fold-in both need "is this name already taken, and by what" to agree,
+// so the check and its error message live in one place instead of being
+// copy-pasted per discovery path.
+function claimName(claimedNames, name, variable) {
+  if (has(claimedNames, name)) {
+    throw new Error('cli(): two nodes are both named "' + name + '" (declared as "' + claimedNames[name] + '" and "' + variable + '"). Node names must be unique - set an explicit "name" on one of them.');
+  }
+  claimedNames[name] = variable;
+}
+
+// Guarded read of a single optional global - shared by every "config
+// object declared as a top-level var, or omitted entirely" reader in this
+// library (resolveManifestConfig/resolveLoggingConfig below, and
+// model.js's readModelsRegistry). Never throws because of a global this
+// library doesn't own, same reasoning discoverNodes()'s own scan already
+// applies to every global it walks past.
+function readOptionalGlobal(name) {
+  try {
+    return globalThis[name];
+  } catch (error) {
+    return undefined;
+  }
 }
 
 // Node lists appear in three different error messages and in hello()'s
@@ -179,7 +218,7 @@ function discoverNodes() {
     // move on - so there's no reason to distinguish the two cases.
     try {
       value = scope[key];
-      if (!value || typeof value !== 'object' || Array.isArray(value)) {
+      if (!isPlainObject(value)) {
         return;
       }
       kind = value.kind;
@@ -200,10 +239,19 @@ function discoverNodes() {
       ignored.push({ name: name, kind: kind, variable: key });
       return;
     }
-    if (has(claimedNames, name)) {
-      throw new Error('cli(): two nodes are both named "' + name + '" (declared as "' + claimedNames[name] + '" and "' + key + '"). Node names must be unique - set an explicit "name" on one of them.');
+    // model is a known kind but not one this scan can ever build a
+    // correct node for: its dependsOn comes from parsing {{ ref() }} out
+    // of its SQL (see expandModelNodes() below), which this loop has no
+    // way to do for a bare top-level var. Without this check, a var
+    // written this way - the shape an earlier version of this README
+    // documented - wouldn't be ignored (model is a real EXECUTORS entry
+    // now) and wouldn't fail loudly either: it would silently become a
+    // node with no derived edges at all, ordering wrong relative to
+    // whatever it actually ref()s.
+    if (kind === 'model') {
+      throw new Error('cli(): "' + key + '" is declared as a top-level var with kind "model" - models are declared as entries in notsobigdataModels.models instead, not their own var. See README.md\'s "The model kind" section.');
     }
-    claimedNames[name] = key;
+    claimName(claimedNames, name, key);
     if (dependsOn !== undefined && !Array.isArray(dependsOn)) {
       throw new Error('cli(): node "' + name + '" has a "dependsOn" that is not an array - got ' + typeof dependsOn + '.');
     }
@@ -223,6 +271,18 @@ function discoverNodes() {
       config: value,
       dependsOn: edges
     });
+  });
+  // model nodes don't come from the scan above at all - see the EXECUTORS
+  // comment. expandModelNodes() (model.js) turns the single
+  // notsobigdataModels registry into one fully-formed node per entry,
+  // already carrying config and dependsOn; folding them in here, right
+  // where the var-scan finishes, means every downstream step
+  // (assertDependenciesExist, selection, ordering, running) sees one flat
+  // node list and never has to know two different discovery mechanisms
+  // produced it.
+  expandModelNodes().forEach(function (node) {
+    claimName(claimedNames, node.name, node.variable);
+    nodes.push(node);
   });
   return { nodes: nodes, ignored: ignored };
 }
@@ -387,6 +447,23 @@ function runNodes(nodes, dryRun, verbose) {
   var results = [];
   var blocked = emptyMap();
   nodes.forEach(function (node) {
+    // A node can arrive already known to be broken - model.js's
+    // expandModelNodes() sets this when a model's own sqlFile/tag
+    // configuration is bad, discovered while building the graph, well
+    // before any node's turn to actually run. Checked here, kind-
+    // agnostically (a plain node-level field, not something only model
+    // nodes could have), and ahead of the dryRun branch below: the whole
+    // point of a "list" dry run is surfacing a config mistake before
+    // anything executes for real, and this error is already fully known
+    // with nothing to execute to see it - reporting it only on a real
+    // "run" would make "list" strictly less useful for exactly the
+    // errors that are cheapest to catch early.
+    if (node.discoveryError) {
+      blocked[node.name] = true;
+      results.push({ name: node.name, kind: node.kind, status: 'failed', error: node.discoveryError });
+      Logger.log('FAIL  ' + nodeLabel(node) + ' - ' + node.discoveryError);
+      return;
+    }
     var blockers = node.dependsOn.filter(function (dependency) { return has(blocked, dependency); });
     if (blockers.length) {
       blocked[node.name] = true;
@@ -442,12 +519,7 @@ function formatStatusCounts(results) {
 // because of something this library doesn't own. Every field is
 // optional; omitting the global entirely gives all three defaults.
 function resolveManifestConfig() {
-  var raw;
-  try {
-    raw = globalThis.notsobigdataManifest;
-  } catch (error) {
-    raw = undefined;
-  }
+  var raw = readOptionalGlobal('notsobigdataManifest');
   var config = (raw && typeof raw === 'object') ? raw : {};
   return {
     enabled: config.enabled !== false,
@@ -463,12 +535,7 @@ function resolveManifestConfig() {
 // nodes happened to succeed. Set true to restore an OK line for every
 // successful node too.
 function resolveLoggingConfig() {
-  var raw;
-  try {
-    raw = globalThis.notsobigdataLogging;
-  } catch (error) {
-    raw = undefined;
-  }
+  var raw = readOptionalGlobal('notsobigdataLogging');
   var config = (raw && typeof raw === 'object') ? raw : {};
   return { verbose: config.verbose === true };
 }
@@ -489,11 +556,11 @@ function resolveManifestFolderId(folderId) {
 
 // Turns one runNodes() result into a manifest-safe summary. Kind-agnostic
 // by construction: it never branches on node.kind, only on the *shape* of
-// the result (an array of rows, or an object carrying loadResult/
-// testResults) - the same shape every EXECUTORS entry already produces.
-// The raw rows are never included, only their size - a manifest is an
-// observability artifact, not a second copy of the data that already
-// landed at its real destination.
+// the result (an array of rows, an object carrying loadResult/testResults,
+// or model()'s relation/materialized) - the same shapes every EXECUTORS
+// entry already produces. The raw rows are never included, only their
+// size - a manifest is an observability artifact, not a second copy of
+// the data that already landed at its real destination.
 function summarizeNodeResult(result) {
   var summary = { name: result.name, kind: result.kind, status: result.status };
   if (result.status === 'skipped') {
@@ -512,6 +579,10 @@ function summarizeNodeResult(result) {
     }
     if (result.result && result.result.testResults !== undefined) {
       summary.testResults = result.result.testResults;
+    }
+    if (result.result && result.result.relation !== undefined) {
+      summary.relation = result.result.relation;
+      summary.materialized = result.result.materialized;
     }
   }
   return summary;
