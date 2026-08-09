@@ -43,6 +43,16 @@ function has(map, key) {
   return Object.prototype.hasOwnProperty.call(map, key);
 }
 
+// True for a plain, non-array object - the shape check every "is this
+// really a config object" guard in this library repeats: discoverNodes()'s
+// var-scan below, and model.js's readModelsRegistry (twice, once for the
+// registry itself and once for its .models field). One predicate means
+// whether "typeof x === 'object'" needs the Array.isArray() exclusion too
+// never has to be decided more than once.
+function isPlainObject(value) {
+  return !!value && typeof value === 'object' && !Array.isArray(value);
+}
+
 // Every lookup map below is built with this rather than {}, because has()
 // only fixes half the problem. It guards the *read* side; this guards the
 // *write* side, and the write side has a worse failure. Assigning
@@ -208,7 +218,7 @@ function discoverNodes() {
     // move on - so there's no reason to distinguish the two cases.
     try {
       value = scope[key];
-      if (!value || typeof value !== 'object' || Array.isArray(value)) {
+      if (!isPlainObject(value)) {
         return;
       }
       kind = value.kind;
@@ -529,11 +539,11 @@ function resolveManifestFolderId(folderId) {
 
 // Turns one runNodes() result into a manifest-safe summary. Kind-agnostic
 // by construction: it never branches on node.kind, only on the *shape* of
-// the result (an array of rows, or an object carrying loadResult/
-// testResults) - the same shape every EXECUTORS entry already produces.
-// The raw rows are never included, only their size - a manifest is an
-// observability artifact, not a second copy of the data that already
-// landed at its real destination.
+// the result (an array of rows, an object carrying loadResult/testResults,
+// or model()'s relation/materialized) - the same shapes every EXECUTORS
+// entry already produces. The raw rows are never included, only their
+// size - a manifest is an observability artifact, not a second copy of
+// the data that already landed at its real destination.
 function summarizeNodeResult(result) {
   var summary = { name: result.name, kind: result.kind, status: result.status };
   if (result.status === 'skipped') {
@@ -552,6 +562,10 @@ function summarizeNodeResult(result) {
     }
     if (result.result && result.result.testResults !== undefined) {
       summary.testResults = result.result.testResults;
+    }
+    if (result.result && result.result.relation !== undefined) {
+      summary.relation = result.result.relation;
+      summary.materialized = result.result.materialized;
     }
   }
   return summary;

@@ -200,12 +200,22 @@ var NotSoBigData = (function () {
       if (!source.dataset) {
         throw new Error('move(): bigquery source with "table" also requires "dataset".');
       }
-      return 'SELECT * FROM `' + source.projectId + '.' + source.dataset + '.' + source.table + '`';
+      return 'SELECT * FROM ' + qualifiedTableRef(source.projectId, source.dataset, source.table);
     }
     if (source.query) {
       return source.query;
     }
     return readDriveFileText(source.queryFileId);
+  }
+
+  // Backtick-quotes a project.dataset.table identifier for interpolation
+  // into SQL - the one shared form for a BigQuery relation, reused
+  // everywhere this library builds one: a bigquery source's own table
+  // above, {{ this }} in runSqlTests below, and model.js's model/ref
+  // relations. One function means all three agree on the same quoting by
+  // construction rather than three copies staying in sync by hand.
+  function qualifiedTableRef(projectId, dataset, table) {
+    return '`' + projectId + '.' + dataset + '.' + table + '`';
   }
 
   // Strips SQL comments and a trailing ";" - shared by assertReadOnlySelect
@@ -220,6 +230,16 @@ var NotSoBigData = (function () {
       .replace(/;\s*$/, '');
   }
 
+  // The actual check, taking sql already stripped by stripSqlComments -
+  // split out from assertSingleStatement below so assertReadOnlySelect can
+  // reuse the stripped string it already computed for its own SELECT/WITH
+  // check instead of stripping the same SQL a second time.
+  function assertSingleStatementStripped(stripped, messagePrefix) {
+    if (stripped.indexOf(';') !== -1) {
+      throw new Error(messagePrefix + ' must be a single statement - multi-statement scripts (separated by ";") are not allowed.');
+    }
+  }
+
   // Rejects multiple ";"-separated statements. Split out of
   // assertReadOnlySelect below so model() can reuse just this half - a
   // model is meant to write, so it has no read-only requirement to check,
@@ -228,9 +248,7 @@ var NotSoBigData = (function () {
   // lead-in, so the thrown message reads the same regardless of which
   // module raised it.
   function assertSingleStatement(sql, messagePrefix) {
-    if (stripSqlComments(sql).indexOf(';') !== -1) {
-      throw new Error(messagePrefix + ' must be a single statement - multi-statement scripts (separated by ";") are not allowed.');
-    }
+    assertSingleStatementStripped(stripSqlComments(sql), messagePrefix);
   }
 
   // Guards against a piece of pipeline-author-supplied SQL doing anything
@@ -251,7 +269,7 @@ var NotSoBigData = (function () {
     if (!/^(select|with)\b/i.test(stripped)) {
       throw new Error('move(): ' + context + ' must be a read-only SELECT (optionally starting with WITH). move() only extracts/asserts on data - transform or write logic belongs in model().');
     }
-    assertSingleStatement(sql, 'move(): ' + context);
+    assertSingleStatementStripped(stripped, 'move(): ' + context);
   }
 
   // Runs a BigQuery query job (Jobs.query) to completion and returns
@@ -837,7 +855,7 @@ var NotSoBigData = (function () {
   // same "not built speculatively" call move.md already makes for
   // referential checks in general.
   function runSqlTests(sqlTests, stagedRef) {
-    var thisRef = '`' + stagedRef.projectId + '.' + stagedRef.dataset + '.' + stagedRef.table + '`';
+    var thisRef = qualifiedTableRef(stagedRef.projectId, stagedRef.dataset, stagedRef.table);
     var failures = [];
     sqlTests.forEach(function (test) {
       if (!test || typeof test.query !== 'string' || !test.query) {
@@ -1461,7 +1479,7 @@ var NotSoBigData = (function () {
     if (raw === undefined) {
       return { defaults: {}, models: {} };
     }
-    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+    if (!isPlainObject(raw)) {
       throw new Error('model(): notsobigdataModels must be an object - got ' + (Array.isArray(raw) ? 'an array' : typeof raw) + '.');
     }
     var defaults = {};
@@ -1472,7 +1490,7 @@ var NotSoBigData = (function () {
     });
     var models = {};
     if (raw.models !== undefined) {
-      if (!raw.models || typeof raw.models !== 'object' || Array.isArray(raw.models)) {
+      if (!isPlainObject(raw.models)) {
         throw new Error('model(): notsobigdataModels.models must be an object - got ' + (Array.isArray(raw.models) ? 'an array' : typeof raw.models) + '.');
       }
       models = raw.models;
@@ -1489,12 +1507,20 @@ var NotSoBigData = (function () {
   // (never substitute a name that didn't resolve to a real entry - see the
   // model() executor below).
   //
+  // registry is optional - a caller that hasn't already read the registry
+  // (there is no other one right now, but a future caller might) can omit
+  // it and get a fresh read. Both current callers already have one in hand
+  // (expandModelNodes() reads it once for every model it expands; model()
+  // reads it once for however many ref()s its own SQL contains) and pass it
+  // through, so resolving N models' configs never re-reads and re-validates
+  // the same global N times over.
+  //
   // has() is cli.js's guard against a model named e.g. "toString" or
   // "__proto__" testing as present in a plain {} it was never added to -
   // the same risk cli.js's own node/kind lookups already guard against, so
   // reused rather than re-implemented here.
-  function resolveModelConfig(name) {
-    var registry = readModelsRegistry();
+  function resolveModelConfig(name, registry) {
+    registry = registry || readModelsRegistry();
     if (!has(registry.models, name)) {
       throw new Error('model(): "' + name + '" is not declared in notsobigdataModels.models. Known models: ' + Object.keys(registry.models).join(', ') + '.');
     }
@@ -1610,14 +1636,19 @@ var NotSoBigData = (function () {
     });
   }
 
+  // Builds config.name's fully-qualified relation, reusing move.js's own
+  // qualifiedTableRef() for the actual backtick-quoting so a model's
+  // relation and a bigquery source/test's table reference are spelled the
+  // same way by construction. ['projectId', 'dataset'] loops rather than two
+  // near-identical if/throw blocks, since both checks are the same shape
+  // and only differ in which key and word they name.
   function qualifiedRelation(config) {
-    if (!config.projectId) {
-      throw new Error('model(): "' + config.name + '" is missing "projectId" - set it on notsobigdataModels or on this model entry.');
-    }
-    if (!config.dataset) {
-      throw new Error('model(): "' + config.name + '" is missing "dataset" - set it on notsobigdataModels or on this model entry.');
-    }
-    return '`' + config.projectId + '.' + config.dataset + '.' + config.name + '`';
+    ['projectId', 'dataset'].forEach(function (key) {
+      if (!config[key]) {
+        throw new Error('model(): "' + config.name + '" is missing "' + key + '" - set it on notsobigdataModels or on this model entry.');
+      }
+    });
+    return qualifiedTableRef(config.projectId, config.dataset, config.name);
   }
 
   // view/table only - incremental (dbt's third materialization) is v2, same
@@ -1651,7 +1682,7 @@ var NotSoBigData = (function () {
     var registry = readModelsRegistry();
     var htmlCache = emptyMap();
     return Object.keys(registry.models).map(function (name) {
-      var config = resolveModelConfig(name);
+      var config = resolveModelConfig(name, registry);
       if (!has(htmlCache, config.sqlFile)) {
         htmlCache[config.sqlFile] = readModelHtml(config.sqlFile);
       }
@@ -1682,8 +1713,9 @@ var NotSoBigData = (function () {
   function model(config) {
     var sql = config.sql;
     assertSingleStatement(sql, 'model(): "' + config.name + '"');
+    var registry = readModelsRegistry();
     var compiled = compileModelSql(sql, function (refName) {
-      return qualifiedRelation(resolveModelConfig(refName));
+      return qualifiedRelation(resolveModelConfig(refName, registry));
     });
     var relation = qualifiedRelation(config);
     var materialized = resolveMaterialized(config);
@@ -1738,6 +1770,16 @@ var NotSoBigData = (function () {
   // failing inside the sort with a TypeError instead of a clear message.
   function has(map, key) {
     return Object.prototype.hasOwnProperty.call(map, key);
+  }
+
+  // True for a plain, non-array object - the shape check every "is this
+  // really a config object" guard in this library repeats: discoverNodes()'s
+  // var-scan below, and model.js's readModelsRegistry (twice, once for the
+  // registry itself and once for its .models field). One predicate means
+  // whether "typeof x === 'object'" needs the Array.isArray() exclusion too
+  // never has to be decided more than once.
+  function isPlainObject(value) {
+    return !!value && typeof value === 'object' && !Array.isArray(value);
   }
 
   // Every lookup map below is built with this rather than {}, because has()
@@ -1905,7 +1947,7 @@ var NotSoBigData = (function () {
       // move on - so there's no reason to distinguish the two cases.
       try {
         value = scope[key];
-        if (!value || typeof value !== 'object' || Array.isArray(value)) {
+        if (!isPlainObject(value)) {
           return;
         }
         kind = value.kind;
@@ -2226,11 +2268,11 @@ var NotSoBigData = (function () {
 
   // Turns one runNodes() result into a manifest-safe summary. Kind-agnostic
   // by construction: it never branches on node.kind, only on the *shape* of
-  // the result (an array of rows, or an object carrying loadResult/
-  // testResults) - the same shape every EXECUTORS entry already produces.
-  // The raw rows are never included, only their size - a manifest is an
-  // observability artifact, not a second copy of the data that already
-  // landed at its real destination.
+  // the result (an array of rows, an object carrying loadResult/testResults,
+  // or model()'s relation/materialized) - the same shapes every EXECUTORS
+  // entry already produces. The raw rows are never included, only their
+  // size - a manifest is an observability artifact, not a second copy of
+  // the data that already landed at its real destination.
   function summarizeNodeResult(result) {
     var summary = { name: result.name, kind: result.kind, status: result.status };
     if (result.status === 'skipped') {
@@ -2249,6 +2291,10 @@ var NotSoBigData = (function () {
       }
       if (result.result && result.result.testResults !== undefined) {
         summary.testResults = result.result.testResults;
+      }
+      if (result.result && result.result.relation !== undefined) {
+        summary.relation = result.result.relation;
+        summary.materialized = result.result.materialized;
       }
     }
     return summary;

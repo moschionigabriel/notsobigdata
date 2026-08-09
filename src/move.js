@@ -190,12 +190,22 @@ function resolveBigQuerySql(source) {
     if (!source.dataset) {
       throw new Error('move(): bigquery source with "table" also requires "dataset".');
     }
-    return 'SELECT * FROM `' + source.projectId + '.' + source.dataset + '.' + source.table + '`';
+    return 'SELECT * FROM ' + qualifiedTableRef(source.projectId, source.dataset, source.table);
   }
   if (source.query) {
     return source.query;
   }
   return readDriveFileText(source.queryFileId);
+}
+
+// Backtick-quotes a project.dataset.table identifier for interpolation
+// into SQL - the one shared form for a BigQuery relation, reused
+// everywhere this library builds one: a bigquery source's own table
+// above, {{ this }} in runSqlTests below, and model.js's model/ref
+// relations. One function means all three agree on the same quoting by
+// construction rather than three copies staying in sync by hand.
+function qualifiedTableRef(projectId, dataset, table) {
+  return '`' + projectId + '.' + dataset + '.' + table + '`';
 }
 
 // Strips SQL comments and a trailing ";" - shared by assertReadOnlySelect
@@ -210,6 +220,16 @@ function stripSqlComments(sql) {
     .replace(/;\s*$/, '');
 }
 
+// The actual check, taking sql already stripped by stripSqlComments -
+// split out from assertSingleStatement below so assertReadOnlySelect can
+// reuse the stripped string it already computed for its own SELECT/WITH
+// check instead of stripping the same SQL a second time.
+function assertSingleStatementStripped(stripped, messagePrefix) {
+  if (stripped.indexOf(';') !== -1) {
+    throw new Error(messagePrefix + ' must be a single statement - multi-statement scripts (separated by ";") are not allowed.');
+  }
+}
+
 // Rejects multiple ";"-separated statements. Split out of
 // assertReadOnlySelect below so model() can reuse just this half - a
 // model is meant to write, so it has no read-only requirement to check,
@@ -218,9 +238,7 @@ function stripSqlComments(sql) {
 // lead-in, so the thrown message reads the same regardless of which
 // module raised it.
 function assertSingleStatement(sql, messagePrefix) {
-  if (stripSqlComments(sql).indexOf(';') !== -1) {
-    throw new Error(messagePrefix + ' must be a single statement - multi-statement scripts (separated by ";") are not allowed.');
-  }
+  assertSingleStatementStripped(stripSqlComments(sql), messagePrefix);
 }
 
 // Guards against a piece of pipeline-author-supplied SQL doing anything
@@ -241,7 +259,7 @@ function assertReadOnlySelect(sql, context) {
   if (!/^(select|with)\b/i.test(stripped)) {
     throw new Error('move(): ' + context + ' must be a read-only SELECT (optionally starting with WITH). move() only extracts/asserts on data - transform or write logic belongs in model().');
   }
-  assertSingleStatement(sql, 'move(): ' + context);
+  assertSingleStatementStripped(stripped, 'move(): ' + context);
 }
 
 // Runs a BigQuery query job (Jobs.query) to completion and returns
@@ -827,7 +845,7 @@ function resolveStagingTableId(table) {
 // same "not built speculatively" call move.md already makes for
 // referential checks in general.
 function runSqlTests(sqlTests, stagedRef) {
-  var thisRef = '`' + stagedRef.projectId + '.' + stagedRef.dataset + '.' + stagedRef.table + '`';
+  var thisRef = qualifiedTableRef(stagedRef.projectId, stagedRef.dataset, stagedRef.table);
   var failures = [];
   sqlTests.forEach(function (test) {
     if (!test || typeof test.query !== 'string' || !test.query) {

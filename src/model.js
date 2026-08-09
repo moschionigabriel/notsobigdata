@@ -113,7 +113,7 @@ function readModelsRegistry() {
   if (raw === undefined) {
     return { defaults: {}, models: {} };
   }
-  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+  if (!isPlainObject(raw)) {
     throw new Error('model(): notsobigdataModels must be an object - got ' + (Array.isArray(raw) ? 'an array' : typeof raw) + '.');
   }
   var defaults = {};
@@ -124,7 +124,7 @@ function readModelsRegistry() {
   });
   var models = {};
   if (raw.models !== undefined) {
-    if (!raw.models || typeof raw.models !== 'object' || Array.isArray(raw.models)) {
+    if (!isPlainObject(raw.models)) {
       throw new Error('model(): notsobigdataModels.models must be an object - got ' + (Array.isArray(raw.models) ? 'an array' : typeof raw.models) + '.');
     }
     models = raw.models;
@@ -141,12 +141,20 @@ function readModelsRegistry() {
 // (never substitute a name that didn't resolve to a real entry - see the
 // model() executor below).
 //
+// registry is optional - a caller that hasn't already read the registry
+// (there is no other one right now, but a future caller might) can omit
+// it and get a fresh read. Both current callers already have one in hand
+// (expandModelNodes() reads it once for every model it expands; model()
+// reads it once for however many ref()s its own SQL contains) and pass it
+// through, so resolving N models' configs never re-reads and re-validates
+// the same global N times over.
+//
 // has() is cli.js's guard against a model named e.g. "toString" or
 // "__proto__" testing as present in a plain {} it was never added to -
 // the same risk cli.js's own node/kind lookups already guard against, so
 // reused rather than re-implemented here.
-function resolveModelConfig(name) {
-  var registry = readModelsRegistry();
+function resolveModelConfig(name, registry) {
+  registry = registry || readModelsRegistry();
   if (!has(registry.models, name)) {
     throw new Error('model(): "' + name + '" is not declared in notsobigdataModels.models. Known models: ' + Object.keys(registry.models).join(', ') + '.');
   }
@@ -262,14 +270,19 @@ function compileModelSql(sql, resolveRef) {
   });
 }
 
+// Builds config.name's fully-qualified relation, reusing move.js's own
+// qualifiedTableRef() for the actual backtick-quoting so a model's
+// relation and a bigquery source/test's table reference are spelled the
+// same way by construction. ['projectId', 'dataset'] loops rather than two
+// near-identical if/throw blocks, since both checks are the same shape
+// and only differ in which key and word they name.
 function qualifiedRelation(config) {
-  if (!config.projectId) {
-    throw new Error('model(): "' + config.name + '" is missing "projectId" - set it on notsobigdataModels or on this model entry.');
-  }
-  if (!config.dataset) {
-    throw new Error('model(): "' + config.name + '" is missing "dataset" - set it on notsobigdataModels or on this model entry.');
-  }
-  return '`' + config.projectId + '.' + config.dataset + '.' + config.name + '`';
+  ['projectId', 'dataset'].forEach(function (key) {
+    if (!config[key]) {
+      throw new Error('model(): "' + config.name + '" is missing "' + key + '" - set it on notsobigdataModels or on this model entry.');
+    }
+  });
+  return qualifiedTableRef(config.projectId, config.dataset, config.name);
 }
 
 // view/table only - incremental (dbt's third materialization) is v2, same
@@ -303,7 +316,7 @@ function expandModelNodes() {
   var registry = readModelsRegistry();
   var htmlCache = emptyMap();
   return Object.keys(registry.models).map(function (name) {
-    var config = resolveModelConfig(name);
+    var config = resolveModelConfig(name, registry);
     if (!has(htmlCache, config.sqlFile)) {
       htmlCache[config.sqlFile] = readModelHtml(config.sqlFile);
     }
@@ -334,8 +347,9 @@ function expandModelNodes() {
 function model(config) {
   var sql = config.sql;
   assertSingleStatement(sql, 'model(): "' + config.name + '"');
+  var registry = readModelsRegistry();
   var compiled = compileModelSql(sql, function (refName) {
-    return qualifiedRelation(resolveModelConfig(refName));
+    return qualifiedRelation(resolveModelConfig(refName, registry));
   });
   var relation = qualifiedRelation(config);
   var materialized = resolveMaterialized(config);

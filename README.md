@@ -266,8 +266,10 @@ inspect `report.manifest` in code just to find out:
 
 It never contains the actual rows a node moved — only their shape
 (`rowCount`/`columnCount`) plus each target's own small `loadResult`/
-`testResults`, if present. This keeps the file's size independent of how
-much data your pipeline actually moves.
+`testResults`, if present, or — for a `model` node — the `relation` it
+materialized and as which (`materialized: 'view'` or `'table'`). This
+keeps the file's size independent of how much data your pipeline
+actually moves.
 
 On by default. Configure it with an optional top-level `var`, same
 declaration style as a node:
