@@ -193,6 +193,107 @@ discovery-time error, same as an unterminated `{% for %}` with no matching
 `cli('list')` catches all of these before any real run, same as every
 other model misconfiguration.
 
+### Reusable SQL across models: `{% macro %}`
+
+Where `{% set %}` is scoped to one model's own SQL, a `{% macro %}` is a
+named, parameterized block of SQL any model can call — the same idea as a
+dbt macro, or a spreadsheet's named formula you write once and reuse. It's
+declared in its own `.html` file, not inside a model's file, using real
+Jinja block syntax:
+
+```html
+<!-- macros.html -->
+{% macro cents_to_dollars(column) %}
+  ROUND({{ column }} / 100, 2)
+{% endmacro %}
+```
+
+List which files hold macros on `notsobigdataModels.macros` — a plain array
+of file names, so you can name them however you like and split them across
+as many files as you want:
+
+```javascript
+var notsobigdataModels = {
+  projectId: 'my-project', dataset: 'analytics',
+  macros: ['macros.html'],
+  models: {
+    orders_summary: { /* ... */ }
+  }
+};
+```
+
+Call it from any model's SQL like any other `{{ }}` call, with quoted
+string arguments matching the macro's declared parameters:
+
+```html
+<!-- orders_summary.html -->
+<script type="text/sql">
+  select
+    order_id,
+    {{ cents_to_dollars('amount_cents') }} as amount_usd
+  from {{ ref('stg_orders') }}
+</script>
+```
+
+Unlike a model's raw SQL — which has no way to name itself, which is why a
+multi-model `.html` file needs `<script id="...">` matching (see "A
+model's `.html` file can hold its SQL three ways" below) — a `{% macro %}`
+block already names itself in its own opening statement. So one `.html`
+file can hold several macros with no wrapping tag and no `id` needed at
+all:
+
+```html
+<!-- macros.html -->
+{% macro cents_to_dollars(column) %}
+  ROUND({{ column }} / 100, 2)
+{% endmacro %}
+
+{% macro to_eur(column, rate) %}
+  ROUND({{ column }} * {{ rate }}, 2)
+{% endmacro %}
+```
+
+A macro's own parameters are bare names, not quoted — `{% macro
+name(a, b) %}`, not `{% macro name('a', 'b') %}` — since a parameter is a
+name the macro's body refers to via `{{ a }}`, the same bare-reference
+shape `{% set %}` already uses. A call site's arguments, on the other
+hand, are quoted strings, same posture every other call in this library
+takes (`ref()`, `config()`, `var()`, `{% for %}`'s own list) — no numbers,
+no expressions, no nested calls.
+
+A macro's own body is expanded *before* anything else looks at a model's
+SQL — before `ref()`/`config()`/`var()`/`{% set %}` are scanned, and after
+`{% for %}` (so a macro called from inside a loop body expands once per
+iteration). That means a `{{ ref(...) }}` inside a macro's body becomes a
+real dependency edge for whichever model calls it, exactly as if the
+`ref()` had been written directly in that model's own SQL:
+
+```html
+<!-- macros.html -->
+{% macro enrich_with_region(column) %}
+  (select region from {{ ref('stg_customers') }} where customer_id = {{ column }})
+{% endmacro %}
+```
+
+A model calling `{{ enrich_with_region('customer_id') }}` now depends on
+`stg_customers` too, with nothing extra to declare.
+
+A macro cannot call another macro — that's a discovery-time error,
+`cli('list')` catches it before any real run, same as every other model
+misconfiguration. This is a deliberate scope limit, not a missing feature:
+supporting real macro composition would need cycle detection (a macro
+calling a macro calling itself) this library doesn't otherwise need. If
+one macro's logic depends on another's, inline it, or ask whether the two
+should really be one macro.
+
+A macro name declared in more than one file listed in
+`notsobigdataModels.macros`, an unterminated `{% macro %}` with no matching
+`{% endmacro %}`, a call with the wrong number of arguments, or a
+parameter list with a duplicate or non-identifier name are all
+discovery-time errors too. Declaring zero macro files (or omitting
+`macros` from `notsobigdataModels` entirely) is not an error — it just
+means no model can call one.
+
 Every model is then just another node: `cli('run')` picks up every entry in
 `notsobigdataModels.models` alongside your `move` nodes and orders the
 whole graph together, `cli('run --select model')` runs only models,
@@ -320,13 +421,13 @@ already sitting in the real relation by the time you find out. There's no
 run against a relation that's already fully written, not an in-memory row
 array you can still filter.
 
-`{{ ref() }}`, `{{ config() }}` and `{{ var() }}` are the only `{{ }}`
-calls implemented so far, alongside the `{% set %}` and `{% for %}`
-block constructs (see above) — no `if` yet. Referencing a name that isn't a
-declared model, an undefined `{% set %}`/`var()`, or an unsupported
-template call, is an error, not something silently passed through as
-literal text into SQL that runs with your live
-BigQuery credentials.
+`{{ ref() }}`, `{{ config() }}` and `{{ var() }}` are the only built-in
+`{{ }}` calls implemented so far, alongside the `{% set %}` and `{% for %}`
+block constructs and your own `{% macro %}`s (see above) — no `if` yet.
+Referencing a name that isn't a declared model, an undefined `{% set %}`/
+`var()`, or a `{{ }}` call that's neither a built-in nor a declared macro,
+is an error, not something silently passed through as literal text into
+SQL that runs with your live BigQuery credentials.
 
 A model's SQL must be a single statement — no `;`-separated scripts, same
 restriction `move`'s BigQuery connector places on its own SQL (models can
