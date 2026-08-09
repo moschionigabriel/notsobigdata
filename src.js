@@ -1348,13 +1348,24 @@ var NotSoBigData = (function () {
   // ==================================================================
   // model - the "T" of ELT.
   //
-  // A model is SQL, stored in an Apps Script .html file - one <script
-  // type="text/sql"> tag, read back at run time with HtmlService, because
-  // .html is the only plain-text file Apps Script lets a project hold.
-  // Models reference each other dbt-style, with {{ ref('other_model') }}
-  // placeholders inside the SQL. Those refs *are* the dependency
-  // declaration: a model never writes its own dependsOn, and they get
-  // substituted with the real table identifier just before the SQL runs.
+  // A model is SQL, stored in an Apps Script .html file, read back at run
+  // time with HtmlService because .html is the only plain-text file Apps
+  // Script lets a project hold. Models reference each other dbt-style, with
+  // {{ ref('other_model') }} placeholders inside the SQL. Those refs *are*
+  // the dependency declaration: a model never writes its own dependsOn, and
+  // they get substituted with the real table identifier just before the
+  // SQL runs.
+  //
+  // A model's .html file can hold its SQL three ways, chosen by how many
+  // <script type="text/sql"> tags it contains - see extractModelSql() below:
+  //
+  //   - zero tags: the whole file is the SQL (nothing else in it to be).
+  //   - one tag: that tag's content is the SQL, whether or not it carries
+  //     an "id".
+  //   - more than one tag: every model sharing that file gets its own
+  //     tagged block, and each tag needs an "id" matching a model name -
+  //     this is what makes "several small models in one .html file" work,
+  //     the way a single dbt project holds many .sql files.
   //
   // Every model is declared once, as an entry in a single shared registry -
   // not as its own top-level "var" the way a move node is:
@@ -1501,10 +1512,12 @@ var NotSoBigData = (function () {
     return config;
   }
 
-  // Reads one model's SQL out of its .html file. HtmlService reads a file
-  // that lives in the Apps Script project itself, unlike move.js's
+  // Reads one .html file's raw content. HtmlService reads a file that
+  // lives in the Apps Script project itself, unlike move.js's
   // readDriveFileText (a Drive file, found by id) - models are project
-  // source, not a data source.
+  // source, not a data source. Separate from extractModelSql() below so
+  // expandModelNodes() can read a shared file once and reuse it for every
+  // model whose sqlFile points at it, rather than re-fetching per model.
   //
   // createHtmlOutputFromFile() takes the file's name as registered in the
   // project, which Google's own examples always give without the ".html"
@@ -1514,24 +1527,61 @@ var NotSoBigData = (function () {
   // and matches every fixture/example in this repo, but it's stripped here
   // before the actual API call so this matches the documented contract
   // rather than depending on any leniency the runtime may or may not have.
-  function readModelSql(sqlFile) {
+  function readModelHtml(sqlFile) {
     var scriptFileName = sqlFile.replace(/\.html$/i, '');
-    var html;
     try {
-      html = HtmlService.createHtmlOutputFromFile(scriptFileName).getContent();
+      return HtmlService.createHtmlOutputFromFile(scriptFileName).getContent();
     } catch (error) {
-      throw new Error('model(): could not read "' + sqlFile + '" - ' + error.message + '. Every model needs a matching .html file with a <script type="text/sql"> tag - see README.md\'s "The model kind" section.');
+      throw new Error('model(): could not read "' + sqlFile + '" - ' + error.message + '. Every model needs a matching .html file - see README.md\'s "The model kind" section.');
     }
-    var pattern = /<script[^>]*type=["']text\/sql["'][^>]*>([\s\S]*?)<\/script>/gi;
-    var matches = [];
+  }
+
+  // Finds every <script type="text/sql"> tag in a file's content, in
+  // whatever order its attributes appear (id before or after type). Each
+  // tag's "id" is null when the attribute is absent - only extractModelSql()
+  // below decides whether that's allowed, since that depends on how many
+  // tags the file has.
+  function extractSqlTags(html) {
+    var tagPattern = /<script([^>]*)type=["']text\/sql["']([^>]*)>([\s\S]*?)<\/script>/gi;
+    var idPattern = /\bid=["']([^"']*)["']/i;
+    var tags = [];
     var match;
-    while ((match = pattern.exec(html))) {
-      matches.push(match[1]);
+    while ((match = tagPattern.exec(html))) {
+      var idMatch = idPattern.exec(match[1] + match[2]);
+      tags.push({ id: idMatch ? idMatch[1] : null, sql: match[3] });
     }
-    if (matches.length !== 1) {
-      throw new Error('model(): "' + sqlFile + '" must have exactly one <script type="text/sql"> tag - found ' + matches.length + '.');
+    return tags;
+  }
+
+  // Picks the right SQL out of an already-read .html file for one named
+  // model - see the module comment above for the three tag-count cases.
+  // Takes the file's content rather than reading it itself, so a caller
+  // (expandModelNodes() below) can read a shared file once and call this
+  // once per model that points at it.
+  function extractModelSql(html, sqlFile, modelName) {
+    var tags = extractSqlTags(html);
+    if (tags.length === 0) {
+      return html.trim();
     }
-    return matches[0].trim();
+    if (tags.length === 1) {
+      var tag = tags[0];
+      if (tag.id && tag.id !== modelName) {
+        throw new Error('model(): "' + sqlFile + '" has one <script type="text/sql"> tag with id "' + tag.id + '", which does not match model "' + modelName + '".');
+      }
+      return tag.sql.trim();
+    }
+    var missingId = tags.some(function (candidate) { return !candidate.id; });
+    if (missingId) {
+      throw new Error('model(): "' + sqlFile + '" has more than one <script type="text/sql"> tag, so each one needs an "id" attribute matching a model name - found one without an id.');
+    }
+    var matches = tags.filter(function (candidate) { return candidate.id === modelName; });
+    if (!matches.length) {
+      throw new Error('model(): "' + sqlFile + '" has no <script type="text/sql" id="' + modelName + '"> tag. Ids found: ' + tags.map(function (candidate) { return candidate.id; }).join(', ') + '.');
+    }
+    if (matches.length > 1) {
+      throw new Error('model(): "' + sqlFile + '" has more than one <script type="text/sql" id="' + modelName + '"> tag - ids must be unique within a file.');
+    }
+    return matches[0].sql.trim();
   }
 
   // The dependency-derivation hook: a model's ref() calls *are* its edges,
@@ -1590,11 +1640,22 @@ var NotSoBigData = (function () {
   // node's config, so model() below - which runs later, once this node's
   // turn comes up in cli()'s run loop - reuses it instead of asking
   // HtmlService for the same file a second time.
+  //
+  // htmlCache is scoped to this one call, keyed by sqlFile: several models
+  // can now share one file (see the module comment above), so without this
+  // a shared file would be re-read from HtmlService once per model instead
+  // of once total. Reuses cli.js's has()/emptyMap() prototype-pollution
+  // guards for the same reason readModelsRegistry() does - sqlFile is a
+  // caller-chosen string, same risk class as a node or model name.
   function expandModelNodes() {
     var registry = readModelsRegistry();
+    var htmlCache = emptyMap();
     return Object.keys(registry.models).map(function (name) {
       var config = resolveModelConfig(name);
-      config.sql = readModelSql(config.sqlFile);
+      if (!has(htmlCache, config.sqlFile)) {
+        htmlCache[config.sqlFile] = readModelHtml(config.sqlFile);
+      }
+      config.sql = extractModelSql(htmlCache[config.sqlFile], config.sqlFile, name);
       return {
         name: name,
         kind: 'model',

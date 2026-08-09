@@ -751,14 +751,48 @@ whole graph together, `cli('run --select model')` runs only models,
 something silently passed through as literal text into SQL that runs with
 your live BigQuery credentials.
 
-A model's `.html` file needs exactly one `<script type="text/sql">` tag,
-and its SQL must be a single statement — no `;`-separated scripts, same
+A model's SQL must be a single statement — no `;`-separated scripts, same
 restriction `move`'s BigQuery connector places on its own SQL (models can
 still write, unlike `move`; this is about one statement, not read-only).
 Models are declared as entries in `notsobigdataModels.models`, never as
 their own `var { kind: 'model', ... }` — that shape is a `move` node's
 pattern, not a model's, and is rejected with a clear error rather than
 silently misbehaving.
+
+A model's `.html` file can hold its SQL three ways, chosen by how many
+`<script type="text/sql">` tags it contains:
+
+- **No tag at all** — the whole file is the SQL. Simplest option for a
+  model with its own dedicated file.
+- **One tag** — its content is the SQL, with or without an `id`.
+- **More than one tag** — several models can share one `.html` file, each
+  in its own tagged block, as long as every tag's `id` matches a model
+  name:
+
+  ```html
+  <!-- pipeline.sql.html -->
+  <script type="text/sql" id="stg_orders">
+    select 1 as order_id, 'alice' as customer
+  </script>
+  <script type="text/sql" id="orders_summary">
+    select customer, count(*) as order_count
+    from {{ ref('stg_orders') }}
+    group by 1
+  </script>
+  ```
+  ```javascript
+  var notsobigdataModels = {
+    projectId: 'my-project', dataset: 'analytics',
+    models: {
+      stg_orders: { sqlFile: 'pipeline.sql.html' },
+      orders_summary: { sqlFile: 'pipeline.sql.html', materialized: 'table' }
+    }
+  };
+  ```
+  A shared file is only ever read once per `cli()` run, however many
+  models point at it. A missing `id`, no tag matching a given model's
+  name, or two tags sharing the same `id` are all clear errors — never a
+  guess about which block belongs to which model.
 
 ## Scheduling
 
