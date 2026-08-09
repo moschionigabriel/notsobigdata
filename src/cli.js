@@ -447,6 +447,23 @@ function runNodes(nodes, dryRun, verbose) {
   var results = [];
   var blocked = emptyMap();
   nodes.forEach(function (node) {
+    // A node can arrive already known to be broken - model.js's
+    // expandModelNodes() sets this when a model's own sqlFile/tag
+    // configuration is bad, discovered while building the graph, well
+    // before any node's turn to actually run. Checked here, kind-
+    // agnostically (a plain node-level field, not something only model
+    // nodes could have), and ahead of the dryRun branch below: the whole
+    // point of a "list" dry run is surfacing a config mistake before
+    // anything executes for real, and this error is already fully known
+    // with nothing to execute to see it - reporting it only on a real
+    // "run" would make "list" strictly less useful for exactly the
+    // errors that are cheapest to catch early.
+    if (node.discoveryError) {
+      blocked[node.name] = true;
+      results.push({ name: node.name, kind: node.kind, status: 'failed', error: node.discoveryError });
+      Logger.log('FAIL  ' + nodeLabel(node) + ' - ' + node.discoveryError);
+      return;
+    }
     var blockers = node.dependsOn.filter(function (dependency) { return has(blocked, dependency); });
     if (blockers.length) {
       blocked[node.name] = true;

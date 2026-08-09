@@ -339,15 +339,22 @@ function resolveMaterialized(config) {
 // for every other node in the project - move nodes included, since this
 // is folded into the same discoverNodes() scan they come from. Each
 // model's own try/catch below is what makes that true: a bad sqlFile,
-// mismatched tag id, or duplicate id becomes that one node's
-// config.expandError (thrown by model() below, once this node's turn
-// comes up in the run loop) instead of an exception that unwinds
-// discoverNodes() itself and hides every node, of any kind, from
-// cli("hello")/cli("list")/cli("run --select ...") alike. A malformed
-// notsobigdataModels/registry.models shape is deliberately not covered
-// here - readModelsRegistry() above still throws for that, since it's a
-// mistake in the one shared config every model reads, not one model's own
-// problem.
+// mismatched tag id, or duplicate id becomes that one node's own
+// discoveryError (a plain node-level field, not nested in config - cli.js's
+// runNodes() checks it kind-agnostically, the same way it already checks
+// dependsOn) instead of an exception that unwinds discoverNodes() itself
+// and hides every node, of any kind, from cli("hello")/cli("list")/
+// cli("run --select ...") alike. A malformed notsobigdataModels/
+// registry.models shape is deliberately not covered here -
+// readModelsRegistry() above still throws for that, since it's a mistake
+// in the one shared config every model reads, not one model's own problem.
+//
+// discoveryError is deliberately still reported by a dry "list" run, not
+// only a real "run" - cli("list")'s whole point is surfacing a config
+// mistake before anything executes for real, and this kind of error is
+// already fully known at discovery time (no BigQuery call needed to see
+// it), so deferring it to a real run would make "list" strictly less
+// useful for exactly the errors that are cheapest to catch early.
 function expandModelNodes() {
   var registry = readModelsRegistry();
   var htmlCache = emptyMap();
@@ -379,7 +386,7 @@ function expandModelNodes() {
       node.config = config;
       node.dependsOn = extractRefDependencies(config.sql);
     } catch (error) {
-      node.config = { name: name, expandError: error.message };
+      node.discoveryError = error.message;
     }
     return node;
   });
@@ -394,17 +401,12 @@ function expandModelNodes() {
 // is a mistake either way, not a second statement this library intends
 // to run.
 //
-// config.sql is set by expandModelNodes() above whenever that node's own
-// discovery succeeded - every model node comes from there (discoverNodes()
-// rejects a hand-declared kind: 'model' var, see cli.js). When it didn't
-// succeed, expandModelNodes() stashes the reason as config.expandError
-// instead, so this node reports "failed" (and blocks its own dependents,
-// same as any other failure - see cli.js's runNodes()) rather than
-// crashing config.sql's read below with a confusing "undefined" error.
+// config.sql is always already set by expandModelNodes() above by the
+// time this runs. A node whose own discovery failed instead carries a
+// node-level discoveryError, which cli.js's runNodes() checks and reports
+// as "failed" before ever calling an EXECUTORS entry - so there is no path
+// into this function for a node that didn't get a real config.sql.
 function model(config) {
-  if (config.expandError) {
-    throw new Error(config.expandError);
-  }
   var sql = config.sql;
   assertSingleStatement(sql, 'model(): "' + config.name + '"');
   var registry = readModelsRegistry();
