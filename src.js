@@ -2700,28 +2700,30 @@ var NotSoBigData = (function () {
 
   // The EXECUTORS.model entry: compiles the model's SQL (substituting every
   // ref()), materializes it as a view or table, then - if the model
-  // declares tests - runs them against the relation it just materialized.
-  // Deliberately does not call move.js's assertReadOnlySelect on the
-  // model's own SQL - that guard exists to keep move() read-only, and a
-  // model's whole job is writing. It does reuse assertSingleStatement,
-  // move.js's other SQL-shape guard: a model can write, but a stray ";"
-  // splitting its SQL into more than one statement is a mistake either way,
-  // not a second statement this library intends to run.
+  // declares tests - runs them. Deliberately does not call move.js's
+  // assertReadOnlySelect on the model's own SQL - that guard exists to keep
+  // move() read-only, and a model's whole job is writing. It does reuse
+  // assertSingleStatement, move.js's other SQL-shape guard: a model can
+  // write, but a stray ";" splitting its SQL into more than one statement
+  // is a mistake either way, not a second statement this library intends
+  // to run.
   //
-  // Tests run *after* CREATE OR REPLACE, not staged-then-promoted the way a
-  // bigquery move target's sqlTests are (see loadBigQueryStaged in
-  // move.js). That's deliberate, not a missed guarantee: CREATE OR REPLACE
-  // is already atomic, and re-running a model's own SELECT a second time
-  // into a scratch table just to test-before-promote would double BigQuery
-  // compute on every single run - for a guarantee real dbt itself doesn't
-  // give either (dbt builds a model, then runs its tests afterward, as a
-  // separate step; a failing test never un-writes the model). A failing
-  // test here throws (via the reused runSqlTests), which fails this node
-  // and skips its dependents through cli()'s ordinary failure propagation -
-  // same outcome shape as any other model() failure, just discovered one
-  // step later. There is no "discard_row" equivalent for a model test:
-  // unlike move()'s in-memory tests, there's no row array left to filter -
-  // the relation is already fully written by the time a test can run.
+  // A view with tests still tests the relation it just materialized, same
+  // as ever: a view is just stored SQL text, not landed data, so there is
+  // nothing to stage - CREATE OR REPLACE VIEW already only ever changes
+  // what a *future* query sees, never something already sitting in a
+  // table. A table with no tests also just materializes directly - nothing
+  // to check, nothing to gain from staging.
+  //
+  // A table *with* tests goes through modelTableStaged() below instead:
+  // build into a scratch table, test the scratch table, and only promote
+  // into the real relation - via a copy job, not a second SELECT - once
+  // every test has passed. That's the guarantee CREATE OR REPLACE alone
+  // can't give a table model: without staging, a failing test is
+  // discovered only after the bad rows are already sitting in the real
+  // relation (this was itself the shape of the bug an external review
+  // caught - see modelTableStaged()'s own comment for the fix and why the
+  // previous "would double BigQuery compute" reasoning here didn't hold).
   //
   // config.sql is always already set by expandModelNodes() above by the
   // time this runs. A node whose own discovery failed instead carries a
@@ -2738,10 +2740,16 @@ var NotSoBigData = (function () {
     }, registry);
     var relation = qualifiedRelation(config);
     var materialized = resolveMaterialized(config);
+    var hasTests = !!(config.tests && config.tests.length);
+
+    if (materialized === 'table' && hasTests) {
+      return modelTableStaged(config, compiled, relation, registry);
+    }
+
     var statement = 'CREATE OR REPLACE ' + materialized.toUpperCase() + ' ' + relation + ' AS\n' + compiled;
     runBigQueryQueryJob({ query: statement, useLegacySql: false }, config.projectId);
     var result = { relation: relation, materialized: materialized };
-    if (config.tests && config.tests.length) {
+    if (hasTests) {
       var compiledTests = compileModelTests(config.tests, registry);
       result.testResults = runSqlTests(
         compiledTests,
@@ -2750,6 +2758,72 @@ var NotSoBigData = (function () {
       );
     }
     return result;
+  }
+
+  // Stages a table-materialized model's compiled SELECT into a scratch
+  // table, tests the scratch table, and only promotes into the real
+  // relation once every test passes - mirroring move.js's own
+  // loadBigQueryStaged (see its comment for the general shape and the
+  // GAS-execution-timeout reasoning behind the staging table's
+  // belt-and-suspenders expiration_timestamp). Reuses move.js's
+  // resolveStagingTableId rather than growing a second staging-id helper -
+  // it was already generic, just previously only called from move.js.
+  //
+  // Promotion is a BigQuery *copy* job (configuration.copy,
+  // WRITE_TRUNCATE - a full replace, matching what CREATE OR REPLACE TABLE
+  // already does every run since incremental materialization isn't
+  // implemented yet), not a second "CREATE OR REPLACE TABLE ... AS
+  // SELECT". That distinction is the whole point: an earlier version of
+  // this function's comment argued staging would double BigQuery compute,
+  // reasoning that promotion would mean re-running the model's own SELECT
+  // a second time. A copy job doesn't do that - it's a metadata-level
+  // operation, not a re-executed query - so the SELECT still runs exactly
+  // once per run, staging buys the "never test data that's already sitting
+  // in the real relation" guarantee for free, and the real relation is
+  // simply never touched by a run whose tests failed.
+  //
+  // The staging table's OPTIONS(expiration_timestamp=...) is set directly
+  // in the CREATE OR REPLACE TABLE DDL rather than via a separate
+  // BigQuery.Tables.insert call the way loadBigQueryStaged does - model()
+  // only ever talks to BigQuery through query jobs already (no CSV blob to
+  // load), so setting the expiration inline keeps this a single query job
+  // instead of adding a second API shape just for this one path.
+  function modelTableStaged(config, compiled, relation, registry) {
+    var stagingTable = resolveStagingTableId(config.name);
+    var stagingRelation = qualifiedTableRef(config.projectId, config.dataset, stagingTable);
+    var expirationMillis = Date.now() + 60 * 60 * 1000;
+    var stagingStatement = 'CREATE OR REPLACE TABLE ' + stagingRelation +
+      ' OPTIONS(expiration_timestamp = TIMESTAMP_MILLIS(' + expirationMillis + ')) AS\n' + compiled;
+    // Tracks whether the staging query itself succeeded, so the finally
+    // block below only tries to remove a table that actually exists - if
+    // the staging query throws, there is nothing to clean up yet, and
+    // calling BigQuery.Tables.remove anyway would mask the real error with
+    // a spurious "not found" from cleanup.
+    var stagingCreated = false;
+    try {
+      runBigQueryQueryJob({ query: stagingStatement, useLegacySql: false }, config.projectId);
+      stagingCreated = true;
+
+      var compiledTests = compileModelTests(config.tests, registry);
+      var testResults = runSqlTests(
+        compiledTests,
+        { projectId: config.projectId, dataset: config.dataset, table: stagingTable },
+        'model(): "' + config.name + '" tests'
+      );
+
+      var copyConfig = {
+        sourceTable: { projectId: config.projectId, datasetId: config.dataset, tableId: stagingTable },
+        destinationTable: { projectId: config.projectId, datasetId: config.dataset, tableId: config.name },
+        writeDisposition: 'WRITE_TRUNCATE'
+      };
+      runBigQueryJob({ configuration: { copy: copyConfig } }, config.projectId, null, 'copy');
+
+      return { relation: relation, materialized: 'table', staged: { table: stagingTable }, testResults: testResults };
+    } finally {
+      if (stagingCreated) {
+        BigQuery.Tables.remove(config.projectId, config.dataset, stagingTable);
+      }
+    }
   }
 
   // ==================================================================

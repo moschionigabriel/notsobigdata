@@ -407,19 +407,27 @@ empty `values`) is caught the moment `cli()` discovers the model —
 `cli('list')` catches it, not just a real run, same as every other model
 misconfiguration.
 
-Tests run **after** the model materializes, not before — unlike a
-`bigquery` move target's `sqlTests`, which stage data and test it before
-ever touching the real table. A model's `CREATE OR REPLACE` is already
-atomic, and re-running the model's own `SELECT` a second time into a
-scratch table just to test-before-promote would double the BigQuery cost
-of every run for a guarantee real dbt itself doesn't give either — dbt
-builds a model, then runs its tests afterward, as a separate step. A
-failing test here throws, same as any other `model()` error: this node
-fails and anything depending on it is skipped, but the (bad) data is
-already sitting in the real relation by the time you find out. There's no
-`discard_row` option the way `move`'s own `tests` has — a model's tests
-run against a relation that's already fully written, not an in-memory row
-array you can still filter.
+A `view` with tests still runs them **after** `CREATE OR REPLACE VIEW`,
+against the view itself: a view is just stored SQL text, not landed data,
+so there's nothing to stage — the view only ever changes what a *future*
+query sees, never something already sitting in a table.
+
+A `table` with tests works differently: it's staged first, the same way a
+`bigquery` move target's `sqlTests` are (see
+[docs/move.md](move.md)'s "Tests" section). The compiled `SELECT` builds
+into a scratch table, tests run against *that*, and only if every test
+passes does the real relation get replaced — via a BigQuery copy job, not
+a second `SELECT`, so this costs one extra (cheap) copy job per run, not
+a second run of the model's query. A failing test throws before that copy
+job ever runs, so the real relation is simply never touched by a batch
+that failed its checks — unlike a `view`, where the (only ever
+query-time) SQL has already changed by the time a test can catch it. As
+with a `view`'s tests, there's no `discard_row` option the way `move`'s
+own `tests` has — a model's tests check a whole relation, not an
+in-memory row array you can filter.
+
+A `table` with *no* tests declared materializes directly, same as
+always — nothing to check, nothing to gain from staging.
 
 `{{ ref() }}`, `{{ config() }}` and `{{ var() }}` are the only built-in
 `{{ }}` calls implemented so far, alongside the `{% set %}` and `{% for %}`
