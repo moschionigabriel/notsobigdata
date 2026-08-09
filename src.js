@@ -1429,22 +1429,23 @@ var NotSoBigData = (function () {
   // output straight into the same list the var-scan produces. Selection,
   // ordering and the run loop never learn the difference.
 
-  // Every {{ ... }} placeholder this library understands is a call with one
-  // string argument - {{ ref('other_model') }} today. Written as a generic
-  // scan-and-dispatch rather than a ref()-only regex, because more
-  // Jinja-like calls (starting with config(), most likely) are expected
-  // later: growing the dispatch in compileModelSql() below should be an
-  // added case, not a rewrite of the scanner.
+  // Every {{ ... }} placeholder this library understands is a call - either
+  // ref()'s one positional string argument, or config()'s kwarg-style
+  // key='value' arguments (see parseKwargsArgument below). Written as a
+  // generic scan-and-dispatch rather than a ref()-only regex, since more
+  // calls beyond these two are expected eventually: growing the dispatch in
+  // compileModelSql() below should stay an added case, not a rewrite of the
+  // scanner.
   //
   // Matches the call *shape* only - name plus whatever sits between its
-  // parens - deliberately not the "exactly one quoted string" shape ref()
-  // itself requires. Matching that narrowly here would let a call this
-  // library doesn't recognize (a no-arg {{ macro() }}, a kwarg-style
-  // {{ config(materialized='table') }}) fail to match at all and pass
-  // through as literal, unsubstituted text instead of being rejected by the
-  // "unsupported template call" check in compileModelSql() below - which
-  // defeats the point of that check. parseSingleStringArgument() below
-  // enforces ref()'s own stricter shape once a call is known to be ref().
+  // parens - deliberately not either call's own stricter argument shape.
+  // Matching narrowly here would let a call this library doesn't recognize
+  // (a no-arg {{ macro() }}, some other kwarg-style call) fail to match at
+  // all and pass through as literal, unsubstituted text instead of being
+  // rejected by the "unsupported template call" check in compileModelSql()
+  // below - which defeats the point of that check. parseSingleStringArgument()
+  // and parseKwargsArgument() below enforce each call's own stricter shape
+  // once a call is already known by name.
   function templateExpressionPattern() {
     return /\{\{\s*([a-zA-Z_][a-zA-Z0-9_]*)\(([^)]*)\)\s*\}\}/g;
   }
@@ -1471,6 +1472,42 @@ var NotSoBigData = (function () {
     return match[2];
   }
 
+  // config()'s argument shape: one or more comma-separated key='value' pairs,
+  // each value a quoted string - e.g. config(materialized='table'). Splits on
+  // top-level commas first, then matches each segment against a single
+  // key='value' pattern, so a bad segment (missing quotes, no "=", an empty
+  // key) names exactly which one is wrong rather than failing on the whole
+  // argument list at once. Deliberately string-only, same posture
+  // parseSingleStringArgument takes for ref() - config()'s only key so far
+  // (materialized) is itself a closed enum ('view'/'table'), so there is no
+  // present need for numbers/booleans/nested values, and adding them later is
+  // an easy extension of this same function rather than a redesign.
+  //
+  // Comma-splitting is naive - a value containing a literal "," would be cut
+  // in half - which is fine today (no config() value needs one) but would
+  // need a real scanner if a future key's value legitimately contains a
+  // comma.
+  function parseKwargsArgument(call, args) {
+    var trimmed = args.trim();
+    if (!trimmed) {
+      throw new Error('model(): "' + call + '()" needs at least one key=\'value\' argument.');
+    }
+    var kwargPattern = /^([a-zA-Z_][a-zA-Z0-9_]*)\s*=\s*(['"])([^'"]*)\2$/;
+    var result = {};
+    trimmed.split(',').forEach(function (segment) {
+      var match = kwargPattern.exec(segment.trim());
+      if (!match) {
+        throw new Error('model(): "' + call + '(' + args + ')" is not a valid call - every argument must be key=\'value\', e.g. ' + call + '(materialized=\'table\').');
+      }
+      var key = match[1];
+      if (has(result, key)) {
+        throw new Error('model(): "' + call + '(' + args + ')" sets "' + key + '" more than once.');
+      }
+      result[key] = match[3];
+    });
+    return result;
+  }
+
   // The keys a model entry or the registry's top level may set as a
   // default. Kept as an explicit list rather than copying every key on
   // notsobigdataModels, so an unrelated key a user attaches to the registry
@@ -1484,6 +1521,16 @@ var NotSoBigData = (function () {
   // suppress a real ref() - are enforced separately in mergeDependsOn()
   // below, not by this override.)
   var MODEL_DEFAULT_KEYS = ['projectId', 'dataset', 'materialized', 'dependsOn'];
+
+  // The keys a {{ config(...) }} call inside a model's own SQL may set - see
+  // extractConfigOverrides below. Kept separate from MODEL_DEFAULT_KEYS (even
+  // though "materialized" is the only member of both lists today) since the
+  // two lists answer different questions and may diverge: MODEL_DEFAULT_KEYS
+  // is "what the registry may set as a default", this is "what the SQL file
+  // itself may override inline" - projectId/dataset/dependsOn are registry
+  // routing concerns a model's own SQL has no business changing, even once a
+  // second config()-settable key beyond materialized eventually shows up.
+  var MODEL_CONFIG_KEYS = ['materialized'];
 
   // Guarded read of the single notsobigdataModels global, reusing cli.js's
   // readOptionalGlobal() - same "never throw because of a global this
@@ -1649,6 +1696,42 @@ var NotSoBigData = (function () {
       .map(function (expression) { return parseSingleStringArgument('ref', expression.args); });
   }
 
+  // The config()-override-derivation hook, mirroring extractRefDependencies
+  // above: a model's own {{ config(...) }} call (if any) sets values that win
+  // over both the registry's project-wide defaults and the model's own
+  // registry entry - the same "closest to the model wins" relationship dbt's
+  // own inline config() has with dbt_project.yml. Scans stripSqlComments()'s
+  // output for the same reason ref()'s scan does - a commented-out config()
+  // call must not take effect.
+  //
+  // At most one config() call is allowed per model - unlike ref(), which is
+  // expected to appear once per dependency, a second config() call setting
+  // (or re-setting) the same or different keys has no obvious precedence
+  // rule, so it's rejected outright rather than guessed at (last-wins,
+  // first-wins, or a per-key merge would each be a silent, surprising choice
+  // for whichever one wasn't picked).
+  //
+  // Every key returned is already validated against MODEL_CONFIG_KEYS here,
+  // at discovery time, so expandModelNodes() below can merge the result
+  // straight into a model's resolved config without a second whitelist check.
+  function extractConfigOverrides(sql) {
+    var calls = scanTemplateExpressions(stripSqlComments(sql))
+      .filter(function (expression) { return expression.call === 'config'; });
+    if (!calls.length) {
+      return {};
+    }
+    if (calls.length > 1) {
+      throw new Error('model(): SQL has ' + calls.length + ' {{ config(...) }} calls - at most one is allowed per model.');
+    }
+    var overrides = parseKwargsArgument('config', calls[0].args);
+    Object.keys(overrides).forEach(function (key) {
+      if (MODEL_CONFIG_KEYS.indexOf(key) === -1) {
+        throw new Error('model(): config() set "' + key + '", which is not a supported key. Supported: ' + MODEL_CONFIG_KEYS.join(', ') + '.');
+      }
+    });
+    return overrides;
+  }
+
   // Unions a model's {{ ref() }}-derived edges with its hand-written
   // dependsOn (see MODEL_DEFAULT_KEYS above for where that value comes
   // from - a model entry's own dependsOn, or the registry's project-wide
@@ -1679,12 +1762,31 @@ var NotSoBigData = (function () {
   // deliberately does not catch: ref substitution is string interpolation
   // into SQL that runs with the script owner's live BigQuery credentials,
   // so an unresolved name must stop the run, never fall through as literal
-  // text. Any *other* template call is rejected the same way, for the same
-  // reason - see the module comment above about growing this later.
+  // text.
+  //
+  // {{ config(...) }} is stripped to '' - its values were already folded into
+  // node.config back in expandModelNodes(), so by the time this runs the call
+  // has nothing left to do except disappear from the compiled statement.
+  // parseKwargsArgument is still called here (its result discarded) rather
+  // than just matching the call name, so a config() call this SQL string
+  // carries that somehow differs from the one discovery already validated
+  // (there is no legitimate way for that to happen today, since config.sql is
+  // set once and never mutated - but ref() gets this same redundant
+  // re-validation on every compile, and diverging from that precedent for
+  // config() only would be its own small surprise) still throws instead of
+  // silently vanishing.
+  //
+  // Any *other* template call is rejected the same way ref()'s unknown name
+  // is, for the same reason - see the module comment above about growing
+  // this dispatch.
   function compileModelSql(sql, resolveRef) {
     var compiled = sql.replace(templateExpressionPattern(), function (raw, call, args) {
+      if (call === 'config') {
+        parseKwargsArgument('config', args);
+        return '';
+      }
       if (call !== 'ref') {
-        throw new Error('model(): unsupported template call "' + call + '(...)" in SQL - only ref() is implemented so far.');
+        throw new Error('model(): unsupported template call "' + call + '(...)" in SQL - only ref() and config() are implemented so far.');
       }
       return resolveRef(parseSingleStringArgument('ref', args));
     });
@@ -2005,6 +2107,12 @@ var NotSoBigData = (function () {
           throw new Error(cached.error);
         }
         config.sql = extractModelSql(cached.content, config.sqlFile, name);
+        // {{ config(...) }} overrides applied after resolveModelConfig()'s own
+        // defaults+entry merge, so a model's own SQL wins over both the
+        // registry's project-wide default and its own registry entry - see
+        // extractConfigOverrides above.
+        var configOverrides = extractConfigOverrides(config.sql);
+        Object.keys(configOverrides).forEach(function (key) { config[key] = configOverrides[key]; });
         validateModelTests(config.tests, 'model(): "' + name + '"');
         // Computed from config.dependsOn (whichever hand-written value won
         // MODEL_DEFAULT_KEYS's override), then deleted off config - node.config
