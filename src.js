@@ -1453,6 +1453,15 @@ var NotSoBigData = (function () {
   // body is handled by the existing pipeline for free once the loop itself
   // has been resolved into plain text.
   //
+  // {{ name(args) }} calling a user-authored macro (declared with the
+  // {% macro %}/{% endmacro %} block construct, in a file notsobigdataModels.macros
+  // lists) is, like {% for %}, a text-expansion pass rather than a
+  // compileModelSql() dispatch case - see expandMacroCalls() below. It runs
+  // after {% for %} and before this scanner or compileModelSql() ever see the
+  // SQL, so ref()/config()/set()/var() living inside a macro's own body are
+  // handled by the existing pipeline for free, the same way a call inside a
+  // loop body already is.
+  //
   // Matches the call *shape* only - name plus whatever sits between its
   // parens - deliberately not either call's own stricter argument shape.
   // Matching narrowly here would let a call this library doesn't recognize
@@ -1618,7 +1627,7 @@ var NotSoBigData = (function () {
   function readModelsRegistry() {
     var raw = readOptionalGlobal('notsobigdataModels');
     if (raw === undefined) {
-      return { defaults: {}, models: {}, vars: {} };
+      return { defaults: {}, models: {}, vars: {}, macroFiles: [] };
     }
     if (!isPlainObject(raw)) {
       throw new Error('model(): notsobigdataModels must be an object - got ' + (Array.isArray(raw) ? 'an array' : typeof raw) + '.');
@@ -1648,7 +1657,19 @@ var NotSoBigData = (function () {
       });
       vars = raw.vars;
     }
-    return { defaults: defaults, models: models, vars: vars };
+    var macroFiles = [];
+    if (raw.macros !== undefined) {
+      if (!Array.isArray(raw.macros)) {
+        throw new Error('model(): notsobigdataModels.macros must be an array of file names - got ' + (isPlainObject(raw.macros) ? 'an object' : typeof raw.macros) + '.');
+      }
+      raw.macros.forEach(function (file, index) {
+        if (typeof file !== 'string' || !file) {
+          throw new Error('model(): notsobigdataModels.macros[' + index + '] must be a non-empty string - got ' + typeof file + '.');
+        }
+      });
+      macroFiles = raw.macros;
+    }
+    return { defaults: defaults, models: models, vars: vars, macroFiles: macroFiles };
   }
 
   // Merges the registry's defaults with one model's own entry (the entry
@@ -1947,6 +1968,203 @@ var NotSoBigData = (function () {
     return result;
   }
 
+  // {% macro name(a, b) %}...{% endmacro %}: a block construct declaring a
+  // reusable, named span of SQL text with positional parameters - the same
+  // "{% %}, not {{ }}" bracket shape {% set %}/{% for %} already use for a
+  // real Jinja statement/block, rather than a {{ }} call standing in for a
+  // value. Unlike a model's raw SQL, which has no way to self-identify (hence
+  // extractSqlTags()/extractModelSql()'s <script id="..."> matching), a macro
+  // block already names itself in its own opening statement - so several
+  // macros can share one file with no wrapping tag or id attribute at all;
+  // macroOpenPattern()'s own capture group is where the name comes from.
+  function macroOpenPattern() {
+    return /\{%\s*macro\s+([a-zA-Z_][a-zA-Z0-9_]*)\(([^)]*)\)\s*%\}/;
+  }
+
+  function macroEndPattern() {
+    return /\{%\s*endmacro\s*%\}/;
+  }
+
+  // A {% macro name(...) %} opening statement's own parameter list: zero or
+  // more comma-separated bare identifiers, no defaults, no types - e.g.
+  // macro(column) or macro(column, rate). Bare, not quoted: a parameter is a
+  // *name* the macro's own body refers to via {{ column }}, not a value the
+  // way {% for %}'s iterable items or config()'s kwarg values are (both of
+  // which parseForIterable/parseKwargsArgument parse as quoted strings) - so
+  // this parses identifiers instead, the same shape
+  // templateExpressionPattern()'s own call-name capture already uses. An
+  // empty list is valid (a zero-parameter macro).
+  function parseMacroParams(name, raw) {
+    var trimmed = raw.trim();
+    if (!trimmed) {
+      return [];
+    }
+    var itemPattern = /^[a-zA-Z_][a-zA-Z0-9_]*$/;
+    var seen = emptyMap();
+    return trimmed.split(',').map(function (segment) {
+      var param = segment.trim();
+      if (!itemPattern.test(param)) {
+        throw new Error('model(): "{% macro ' + name + '(' + raw + ') %}" is not a valid parameter list - every parameter must be a bare name, e.g. macro(column, rate).');
+      }
+      if (has(seen, param)) {
+        throw new Error('model(): "{% macro ' + name + '(' + raw + ') %}" declares parameter "' + param + '" more than once.');
+      }
+      seen[param] = true;
+      return param;
+    });
+  }
+
+  // Finds every {% macro name(params) %}...{% endmacro %} block in one
+  // file's content, keyed by its own declared name - reusing
+  // expandForLoops()'s left-to-right splice-and-resume scanning (re-slice the
+  // remaining text after each block found, call .exec() fresh each time)
+  // rather than a global regex's own lastIndex bookkeeping, for the same
+  // "simpler to reason about once a match is used to cut the string, not
+  // just collected" reason. A macro name declared twice *within this one
+  // file* is rejected here; readMacroDefinitions() below rejects the same
+  // name declared across *different* files, a distinct check since this
+  // function only ever sees one file at a time. (A {% macro %} block nested
+  // inside another isn't specifically detected - the inner block's own
+  // {% endmacro %} would close the outer block early, leaving the outer's
+  // real {% endmacro %} unmatched, which the stray-{% endmacro %} check below
+  // still catches as a clear error rather than silently producing a
+  // truncated macro body.)
+  function extractMacroBlocks(html) {
+    var openPattern = macroOpenPattern();
+    var endPattern = macroEndPattern();
+    var blocks = {};
+    var remaining = html;
+    var openMatch;
+    while ((openMatch = openPattern.exec(remaining))) {
+      var name = openMatch[1];
+      var afterOpen = remaining.slice(openMatch.index + openMatch[0].length);
+      var endMatch = endPattern.exec(afterOpen);
+      if (!endMatch) {
+        throw new Error('model(): "{% macro ' + name + '(...) %}" has no matching "{% endmacro %}".');
+      }
+      if (has(blocks, name)) {
+        throw new Error('model(): macro "' + name + '" is declared more than once in the same file.');
+      }
+      blocks[name] = { params: parseMacroParams(name, openMatch[2]), body: afterOpen.slice(0, endMatch.index) };
+      remaining = afterOpen.slice(endMatch.index + endMatch[0].length);
+    }
+    if (endPattern.test(remaining)) {
+      throw new Error('model(): file has a "{% endmacro %}" with no matching "{% macro %}".');
+    }
+    return blocks;
+  }
+
+  // Reads every file notsobigdataModels.macros lists (reusing readModelHtml()
+  // as-is - it doesn't care whether a file holds SQL or macro blocks) and
+  // merges their extractMacroBlocks() results into one name -> {params, body}
+  // map. A macro name declared in more than one *listed file* is a collision,
+  // not a last-wins merge - same "no obvious precedence, reject rather than
+  // guess" posture config()'s at-most-one-call-per-model and
+  // extractSetStatements()'s duplicate-{% set %}-name checks already take
+  // elsewhere in this file. Each macro's own source file is stashed on its
+  // entry so the collision error can name both files.
+  //
+  // Also validates, once, that no macro's own body calls another declared
+  // macro - not just direct self-calls, any call to any other name in the
+  // merged map - which is what makes real cycle detection (a macro calling a
+  // macro calling itself) unnecessary: if no macro may call any macro at all,
+  // a cycle can't exist. Same "no general-purpose evaluator" scope discipline
+  // {% for %}'s own deliberate no-nesting restriction already takes. Checked
+  // here, once per registry build, rather than inside expandMacroCalls() on
+  // every call site - cheaper (a project's macro files are typically small
+  // and this only has to run once per cli() discovery pass, not once per
+  // model that happens to call a macro), and checking the macro's own
+  // undecorated body (before any call site's arguments are substituted into
+  // it) avoids a call-site argument value that happens to *look like* a
+  // macro call being mistaken for one.
+  //
+  // Called once per expandModelNodes() run, not once per model - macro files
+  // are project-wide state, the same status registry itself already has, not
+  // per-model state the way a model's own sqlFile is.
+  function readMacroDefinitions(macroFiles) {
+    var macros = emptyMap();
+    macroFiles.forEach(function (file) {
+      var blocks = extractMacroBlocks(readModelHtml(file));
+      Object.keys(blocks).forEach(function (name) {
+        if (has(macros, name)) {
+          throw new Error('model(): macro "' + name + '" is declared in more than one file listed in notsobigdataModels.macros ("' + macros[name].file + '" and "' + file + '").');
+        }
+        blocks[name].file = file;
+        macros[name] = blocks[name];
+      });
+    });
+    Object.keys(macros).forEach(function (name) {
+      scanTemplateExpressions(macros[name].body).forEach(function (expression) {
+        if (has(macros, expression.call)) {
+          throw new Error('model(): macro "' + name + '" calls another macro ("' + expression.call + '") - macro-to-macro calls are not supported.');
+        }
+      });
+    });
+    return macros;
+  }
+
+  // The argument shape a macro *call* site uses - positional, quoted strings
+  // only, comma-separated - e.g. {{ cents_to_dollars('amount') }} or
+  // {{ to_eur('amount', '0.92') }}. Same string-literal-only posture every
+  // other call in this file takes (parseSingleStringArgument/
+  // parseKwargsArgument/parseVarArguments/parseForIterable) - no numbers, no
+  // nested calls, no expressions. An empty argument list is valid (a call to
+  // a zero-parameter macro), unlike parseForIterable's list, which must have
+  // at least one item.
+  function parseMacroCallArguments(call, args) {
+    var trimmed = args.trim();
+    if (!trimmed) {
+      return [];
+    }
+    var itemPattern = /^(['"])([^'"]*)\1$/;
+    return trimmed.split(',').map(function (segment) {
+      var match = itemPattern.exec(segment.trim());
+      if (!match) {
+        throw new Error('model(): "' + call + '(' + args + ')" is not a valid macro call - every argument must be a quoted string, e.g. ' + call + '(\'value\').');
+      }
+      return match[2];
+    });
+  }
+
+  // {{ name(args) }}: a call to a user-authored macro, declared in one of the
+  // files notsobigdataModels.macros lists - the dbt-style equivalent of
+  // calling a macro out of a project's own macros/ directory. Like {% for %}'s
+  // expandForLoops() above, this is a text-expansion PRE-PASS, run once per
+  // model in expandModelNodes() right after expandForLoops() and before
+  // extractConfigOverrides()/validateSetUsage()/validateVarUsage()/
+  // extractRefDependencies() or compileModelSql() ever see the SQL - a
+  // {{ ref(...) }} or {{ var(...) }} living inside a macro's own body is
+  // picked up "for free" by those existing scans once expansion has already
+  // replaced the call with the macro's literal text, the same reasoning
+  // expandForLoops()'s own module comment gives for a loop body.
+  //
+  // A call name that ISN'T a known macro is left untouched (the raw match is
+  // returned as-is) rather than treated as an error here - it might be
+  // ref()/config()/var(), which this function has no business validating;
+  // compileModelSql()'s own dispatch (or its "unsupported template call"
+  // throw) is still the single place that decides a name is invalid.
+  // expandMacroCalls() only ever answers "is this a macro", never "is this a
+  // legal call".
+  function expandMacroCalls(sql, macros) {
+    return sql.replace(templateExpressionPattern(), function (raw, call, args) {
+      if (!has(macros, call)) {
+        return raw;
+      }
+      var macro = macros[call];
+      var callArgs = parseMacroCallArguments(call, args);
+      if (callArgs.length !== macro.params.length) {
+        throw new Error('model(): {{ ' + call + '(...) }} takes ' + macro.params.length
+          + ' argument(s) (' + macro.params.join(', ') + ') - got ' + callArgs.length + '.');
+      }
+      var body = macro.body;
+      macro.params.forEach(function (param, i) {
+        var paramPattern = new RegExp('\\{\\{\\s*' + param + '\\s*\\}\\}', 'g');
+        body = body.replace(paramPattern, callArgs[i]);
+      });
+      return body;
+    });
+  }
+
   // The discovery-time check for bare {{ key }} references: every one in the
   // file must resolve against extractSetStatements()'s map, or it's a
   // reference to a name that was never {% set %}. Same "fail loud at
@@ -2096,7 +2314,8 @@ var NotSoBigData = (function () {
         return resolveVar(registry, parsed.name, parsed.hasDefault, parsed.defaultValue);
       }
       if (call !== 'ref') {
-        throw new Error('model(): unsupported template call "' + call + '(...)" in SQL - only ref(), config() and var() are implemented so far.');
+        throw new Error('model(): unsupported template call "' + call + '(...)" in SQL - only ref(), config() and var() are implemented so far, '
+          + 'and this name did not match any macro declared in notsobigdataModels.macros either.');
       }
       return resolveRef(parseSingleStringArgument('ref', args));
     });
@@ -2400,6 +2619,16 @@ var NotSoBigData = (function () {
   // useful for exactly the errors that are cheapest to catch early.
   function expandModelNodes() {
     var registry = readModelsRegistry();
+    // Read once, hoisted above the per-model loop below - macro files are
+    // project-wide state, the same status registry itself already has, not
+    // per-model state the way a model's own sqlFile is. Deliberately NOT
+    // wrapped in a per-model try/catch (unlike everything inside the loop
+    // below): a malformed macros.html, a cross-file name collision, or a
+    // macro-to-macro call is a mistake in shared config every model might
+    // read, not any one model's own problem - same reasoning
+    // readModelsRegistry() above is already allowed to throw here for the
+    // same class of shared-config mistake.
+    var macros = readMacroDefinitions(registry.macroFiles);
     var htmlCache = emptyMap();
     function readCached(sqlFile) {
       if (!has(htmlCache, sqlFile)) {
@@ -2430,6 +2659,12 @@ var NotSoBigData = (function () {
         // expandForLoops()'s own comment for why this has to run first, not
         // as another case in compileModelSql()'s dispatch.
         config.sql = expandForLoops(config.sql);
+        // {{ macro(...) }} calls expand next, after {% for %} (so a macro
+        // call written inside a loop body is expanded once per iteration for
+        // free) and before everything below - see expandMacroCalls()'s own
+        // comment for why a ref()/var() living inside a macro body is picked
+        // up "for free" by the scans that follow.
+        config.sql = expandMacroCalls(config.sql, macros);
         // {{ config(...) }} overrides applied after resolveModelConfig()'s own
         // defaults+entry merge, so a model's own SQL wins over both the
         // registry's project-wide default and its own registry entry - see
