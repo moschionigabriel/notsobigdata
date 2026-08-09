@@ -252,18 +252,7 @@ function discoverNodes() {
       throw new Error('cli(): "' + key + '" is declared as a top-level var with kind "model" - models are declared as entries in notsobigdataModels.models instead, not their own var. See README.md\'s "The model kind" section.');
     }
     claimName(claimedNames, name, key);
-    if (dependsOn !== undefined && !Array.isArray(dependsOn)) {
-      throw new Error('cli(): node "' + name + '" has a "dependsOn" that is not an array - got ' + typeof dependsOn + '.');
-    }
-    // Normalized once, here, so "no dependsOn means no edges" is stated in
-    // one place instead of at each use. The copy matters: the node's edges
-    // must not alias the caller's array, which they could mutate later.
-    var edges = dependsOn ? dependsOn.slice() : [];
-    edges.forEach(function (dependency) {
-      if (typeof dependency !== 'string' || !dependency) {
-        throw new Error('cli(): node "' + name + '" has a "dependsOn" entry that is not a node name string.');
-      }
-    });
+    var edges = parseDependsOnList('cli(): node "' + name + '"', dependsOn);
     nodes.push({
       name: name,
       kind: kind,
@@ -285,6 +274,29 @@ function discoverNodes() {
     nodes.push(node);
   });
   return { nodes: nodes, ignored: ignored };
+}
+
+// Validates an optional dependsOn value and normalizes it to an edge list
+// (no dependsOn means no edges). Shared by discoverNodes() below (a move
+// node's own dependsOn) and model.js's expandModelNodes() (a model's
+// hand-written dependsOn, unioned with its {{ ref() }}-derived edges) -
+// same shape, same failure mode, validated once instead of twice. context
+// is the caller's own error-message prefix (e.g. 'cli(): node "orders"' or
+// 'model(): "orders_summary"'), so the thrown message still reads right
+// for whichever caller hit it. The copy on the valid path matters: the
+// node's edges must not alias the caller's array, which they could mutate
+// later.
+function parseDependsOnList(context, raw) {
+  if (raw !== undefined && !Array.isArray(raw)) {
+    throw new Error(context + ' has a "dependsOn" that is not an array - got ' + typeof raw + '.');
+  }
+  var edges = raw ? raw.slice() : [];
+  edges.forEach(function (dependency) {
+    if (typeof dependency !== 'string' || !dependency) {
+      throw new Error(context + ' has a "dependsOn" entry that is not a node name string.');
+    }
+  });
+  return edges;
 }
 
 // Every dependsOn entry must name a node that actually exists. Checked
