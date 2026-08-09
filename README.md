@@ -766,7 +766,8 @@ A model's `.html` file can hold its SQL three ways, chosen by how many
 
 - **No tag at all** — the whole file is the SQL. Simplest option for a
   model with its own dedicated file.
-- **One tag** — its content is the SQL, with or without an `id`.
+- **One tag** — its content is the SQL. An `id` is optional, but if present
+  it must match the model's name (same rule as the multi-tag case below).
 - **More than one tag** — several models can share one `.html` file, each
   in its own tagged block, as long as every tag's `id` matches a model
   name:

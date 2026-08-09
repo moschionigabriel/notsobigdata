@@ -12,8 +12,10 @@
 // <script type="text/sql"> tags it contains - see extractModelSql() below:
 //
 //   - zero tags: the whole file is the SQL (nothing else in it to be).
-//   - one tag: that tag's content is the SQL, whether or not it carries
-//     an "id".
+//   - one tag: that tag's content is the SQL. It may carry an "id", but if
+//     it does, the id must match the model name - same rule as the
+//     several-tags case below, so a copy-pasted tag with a stale id fails
+//     loudly instead of silently running under the wrong model.
 //   - more than one tag: every model sharing that file gets its own
 //     tagged block, and each tag needs an "id" matching a model name -
 //     this is what makes "several small models in one .html file" work,
@@ -245,9 +247,13 @@ function extractModelSql(html, sqlFile, modelName) {
 }
 
 // The dependency-derivation hook: a model's ref() calls *are* its edges,
-// so dependsOn is read out of the SQL instead of being hand-written.
+// so dependsOn is read out of the SQL instead of being hand-written. Scans
+// stripSqlComments()'s output (move.js's own comment-stripping, reused
+// rather than re-implemented) rather than the raw SQL, so a ref() a user
+// has commented out (e.g. "-- from {{ ref('old_model') }}") doesn't become
+// a real dependency edge on a model that may not even exist any more.
 function extractRefDependencies(sql) {
-  return scanTemplateExpressions(sql)
+  return scanTemplateExpressions(stripSqlComments(sql))
     .filter(function (expression) { return expression.call === 'ref'; })
     .map(function (expression) { return parseSingleStringArgument('ref', expression.args); });
 }
@@ -262,12 +268,24 @@ function extractRefDependencies(sql) {
 // text. Any *other* template call is rejected the same way, for the same
 // reason - see the module comment above about growing this later.
 function compileModelSql(sql, resolveRef) {
-  return sql.replace(templateExpressionPattern(), function (raw, call, args) {
+  var compiled = sql.replace(templateExpressionPattern(), function (raw, call, args) {
     if (call !== 'ref') {
       throw new Error('model(): unsupported template call "' + call + '(...)" in SQL - only ref() is implemented so far.');
     }
     return resolveRef(parseSingleStringArgument('ref', args));
   });
+  // templateExpressionPattern()'s args group is [^)]* - it can't match a
+  // call containing its own ")" (e.g. a ref() argument with a stray
+  // paren, or a macro call nesting another call), so that span is skipped
+  // over entirely rather than reaching the "unsupported call" check above.
+  // Left alone, that malformed placeholder would ship to BigQuery as
+  // literal, unsubstituted "{{ ... }}" text instead of being rejected -
+  // exactly the failure mode the module comment above says the generic
+  // scanner exists to avoid.
+  if (compiled.indexOf('{{') !== -1) {
+    throw new Error('model(): SQL still contains "{{" after substitution - check for a malformed template call (e.g. unbalanced parentheses inside {{ ref(...) }}).');
+  }
+  return compiled;
 }
 
 // Builds config.name's fully-qualified relation, reusing move.js's own
@@ -309,25 +327,61 @@ function resolveMaterialized(config) {
 // htmlCache is scoped to this one call, keyed by sqlFile: several models
 // can now share one file (see the module comment above), so without this
 // a shared file would be re-read from HtmlService once per model instead
-// of once total. Reuses cli.js's has()/emptyMap() prototype-pollution
-// guards for the same reason readModelsRegistry() does - sqlFile is a
-// caller-chosen string, same risk class as a node or model name.
+// of once total. Caches a read failure too (as { error }), not just a
+// success - several models can share one broken file just as easily as a
+// working one, and without this every one of them would retry the same
+// doomed HtmlService call. Reuses cli.js's has()/emptyMap()
+// prototype-pollution guards for the same reason readModelsRegistry()
+// does - sqlFile is a caller-chosen string, same risk class as a node or
+// model name.
+//
+// One model's own config/file/tag problem must not take down discovery
+// for every other node in the project - move nodes included, since this
+// is folded into the same discoverNodes() scan they come from. Each
+// model's own try/catch below is what makes that true: a bad sqlFile,
+// mismatched tag id, or duplicate id becomes that one node's
+// config.expandError (thrown by model() below, once this node's turn
+// comes up in the run loop) instead of an exception that unwinds
+// discoverNodes() itself and hides every node, of any kind, from
+// cli("hello")/cli("list")/cli("run --select ...") alike. A malformed
+// notsobigdataModels/registry.models shape is deliberately not covered
+// here - readModelsRegistry() above still throws for that, since it's a
+// mistake in the one shared config every model reads, not one model's own
+// problem.
 function expandModelNodes() {
   var registry = readModelsRegistry();
   var htmlCache = emptyMap();
-  return Object.keys(registry.models).map(function (name) {
-    var config = resolveModelConfig(name, registry);
-    if (!has(htmlCache, config.sqlFile)) {
-      htmlCache[config.sqlFile] = readModelHtml(config.sqlFile);
+  function readCached(sqlFile) {
+    if (!has(htmlCache, sqlFile)) {
+      try {
+        htmlCache[sqlFile] = { content: readModelHtml(sqlFile) };
+      } catch (error) {
+        htmlCache[sqlFile] = { error: error.message };
+      }
     }
-    config.sql = extractModelSql(htmlCache[config.sqlFile], config.sqlFile, name);
-    return {
+    return htmlCache[sqlFile];
+  }
+  return Object.keys(registry.models).map(function (name) {
+    var node = {
       name: name,
       kind: 'model',
       variable: 'notsobigdataModels.models.' + name,
-      config: config,
-      dependsOn: extractRefDependencies(config.sql)
+      config: { name: name },
+      dependsOn: []
     };
+    try {
+      var config = resolveModelConfig(name, registry);
+      var cached = readCached(config.sqlFile);
+      if (cached.error) {
+        throw new Error(cached.error);
+      }
+      config.sql = extractModelSql(cached.content, config.sqlFile, name);
+      node.config = config;
+      node.dependsOn = extractRefDependencies(config.sql);
+    } catch (error) {
+      node.config = { name: name, expandError: error.message };
+    }
+    return node;
   });
 }
 
@@ -340,11 +394,17 @@ function expandModelNodes() {
 // is a mistake either way, not a second statement this library intends
 // to run.
 //
-// config.sql is always already set by expandModelNodes() above by the
-// time this runs - every model node comes from there (discoverNodes()
-// rejects a hand-declared kind: 'model' var, see cli.js), so there's no
-// path into this function without it.
+// config.sql is set by expandModelNodes() above whenever that node's own
+// discovery succeeded - every model node comes from there (discoverNodes()
+// rejects a hand-declared kind: 'model' var, see cli.js). When it didn't
+// succeed, expandModelNodes() stashes the reason as config.expandError
+// instead, so this node reports "failed" (and blocks its own dependents,
+// same as any other failure - see cli.js's runNodes()) rather than
+// crashing config.sql's read below with a confusing "undefined" error.
 function model(config) {
+  if (config.expandError) {
+    throw new Error(config.expandError);
+  }
   var sql = config.sql;
   assertSingleStatement(sql, 'model(): "' + config.name + '"');
   var registry = readModelsRegistry();
