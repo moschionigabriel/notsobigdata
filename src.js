@@ -1430,12 +1430,19 @@ var NotSoBigData = (function () {
   // ordering and the run loop never learn the difference.
 
   // Every {{ ... }} placeholder this library understands is a call - either
-  // ref()'s or var()'s one positional string argument, or config()'s/set()'s
-  // kwarg-style key='value' arguments (see parseSingleStringArgument and
-  // parseKwargsArgument below). Written as a generic scan-and-dispatch rather
+  // ref()'s one positional string argument, config()'s kwarg-style
+  // key='value' arguments, or var()'s one-or-two positional string arguments
+  // (see parseSingleStringArgument, parseKwargsArgument and
+  // parseVarArguments below). Written as a generic scan-and-dispatch rather
   // than a ref()-only regex, since more calls beyond the first were always
   // expected: growing the dispatch in compileModelSql() below should stay an
   // added case, not a rewrite of the scanner.
+  //
+  // {% set key = 'value' %} is deliberately a different bracket shape
+  // ({% %}, not {{ }}) - see setStatementPattern()/bareVarPattern() below -
+  // because it is a real Jinja *statement* (it defines a name, it doesn't
+  // evaluate to a substituted value itself), unlike every call this pattern
+  // matches, which stands in for the value it evaluates to.
   //
   // Matches the call *shape* only - name plus whatever sits between its
   // parens - deliberately not either call's own stricter argument shape.
@@ -1443,11 +1450,34 @@ var NotSoBigData = (function () {
   // (a no-arg {{ macro() }}, some other kwarg-style call) fail to match at
   // all and pass through as literal, unsubstituted text instead of being
   // rejected by the "unsupported template call" check in compileModelSql()
-  // below - which defeats the point of that check. parseSingleStringArgument()
-  // and parseKwargsArgument() below enforce each call's own stricter shape
-  // once a call is already known by name.
+  // below - which defeats the point of that check. parseSingleStringArgument(),
+  // parseKwargsArgument() and parseVarArguments() below enforce each call's
+  // own stricter shape once a call is already known by name.
   function templateExpressionPattern() {
     return /\{\{\s*([a-zA-Z_][a-zA-Z0-9_]*)\(([^)]*)\)\s*\}\}/g;
+  }
+
+  // {% set key = 'value' %} - a real Jinja *statement*, not a {{ }} call:
+  // defines a name, scoped to this one model's SQL, read back later as a
+  // bare {{ key }} reference (see bareVarPattern() below) rather than
+  // through a var() wrapper. Deliberately a single-line, single
+  // string-literal assignment - not the general "any Jinja expression on
+  // the right-hand side" a real {% set %} allows - matching every other
+  // value in this file being string-only text substitution, not a real
+  // expression evaluator. A multi-line {% set %} block (the
+  // {% set x %}...{% endset %} form) is a different, larger construct and
+  // isn't implemented.
+  function setStatementPattern() {
+    return /\{%\s*set\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*=\s*(['"])([^'"]*)\2\s*%\}/g;
+  }
+
+  // A bare {{ key }} reference - no parens, so it can never collide with
+  // templateExpressionPattern()'s call shape above - reading back a value a
+  // {% set %} statement defined earlier in the same SQL. Scoped narrowly to
+  // what {% set %} needs; this is not a general "evaluate any Jinja
+  // expression" mechanism.
+  function bareVarPattern() {
+    return /\{\{\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*\}\}/g;
   }
 
   function scanTemplateExpressions(sql) {
@@ -1472,24 +1502,37 @@ var NotSoBigData = (function () {
     return match[2];
   }
 
-  // The kwarg-style argument shape config() and set() both share: one or more
+  // var()'s own argument shape: one quoted name, and an optional second
+  // quoted default - e.g. var('region') or var('region', 'US'). Separate
+  // from parseSingleStringArgument (ref() takes exactly one, always
+  // required) and parseKwargsArgument (config()'s key='value' pairs) because
+  // var() is positional but optionally two-argument - neither existing
+  // parser's shape fits. Deliberately string-only, same posture as every
+  // other value in this file.
+  function parseVarArguments(call, args) {
+    var match = /^\s*(['"])([^'"]*)\1(?:\s*,\s*(['"])([^'"]*)\3)?\s*$/.exec(args);
+    if (!match) {
+      throw new Error('model(): "' + call + '(' + args + ')" is not a valid call - ' + call + '() takes a quoted name and an optional quoted default, e.g. ' + call + '(\'region\') or ' + call + '(\'region\', \'US\').');
+    }
+    return { name: match[2], hasDefault: match[3] !== undefined, defaultValue: match[4] };
+  }
+
+  // The kwarg-style argument shape config() uses: one or more
   // comma-separated key='value' pairs, each value a quoted string - e.g.
-  // config(materialized='table') or set(min_amount='100', label='big'). Splits
-  // on top-level commas first, then matches each segment against a single
-  // key='value' pattern, so a bad segment (missing quotes, no "=", an empty
-  // key) names exactly which one is wrong rather than failing on the whole
-  // argument list at once. Deliberately string-only, same posture
-  // parseSingleStringArgument takes for ref()/var() - config()'s only key so
-  // far (materialized) is itself a closed enum ('view'/'table'), and set()'s
-  // keys are arbitrary caller-chosen names whose values are substituted as
-  // raw text (see var()'s handling in compileModelSql()) - neither needs
-  // numbers/booleans/nested values yet, and adding them later is an easy
-  // extension of this same function rather than a redesign.
+  // config(materialized='table'). Splits on top-level commas first, then
+  // matches each segment against a single key='value' pattern, so a bad
+  // segment (missing quotes, no "=", an empty key) names exactly which one
+  // is wrong rather than failing on the whole argument list at once.
+  // Deliberately string-only, same posture parseSingleStringArgument takes
+  // for ref() - config()'s only key so far (materialized) is itself a
+  // closed enum ('view'/'table'), so it doesn't need numbers/booleans/nested
+  // values yet, and adding them later is an easy extension of this same
+  // function rather than a redesign.
   //
   // Comma-splitting is naive - a value containing a literal "," would be cut
-  // in half - which is fine today (no config()/set() value needs one) but
-  // would need a real scanner if a future key's value legitimately contains
-  // a comma.
+  // in half - which is fine today (no config() value needs one) but would
+  // need a real scanner if a future key's value legitimately contains a
+  // comma.
   function parseKwargsArgument(call, args) {
     var trimmed = args.trim();
     if (!trimmed) {
@@ -1551,7 +1594,7 @@ var NotSoBigData = (function () {
   function readModelsRegistry() {
     var raw = readOptionalGlobal('notsobigdataModels');
     if (raw === undefined) {
-      return { defaults: {}, models: {} };
+      return { defaults: {}, models: {}, vars: {} };
     }
     if (!isPlainObject(raw)) {
       throw new Error('model(): notsobigdataModels must be an object - got ' + (Array.isArray(raw) ? 'an array' : typeof raw) + '.');
@@ -1569,7 +1612,19 @@ var NotSoBigData = (function () {
       }
       models = raw.models;
     }
-    return { defaults: defaults, models: models };
+    var vars = {};
+    if (raw.vars !== undefined) {
+      if (!isPlainObject(raw.vars)) {
+        throw new Error('model(): notsobigdataModels.vars must be an object - got ' + (Array.isArray(raw.vars) ? 'an array' : typeof raw.vars) + '.');
+      }
+      Object.keys(raw.vars).forEach(function (key) {
+        if (typeof raw.vars[key] !== 'string') {
+          throw new Error('model(): notsobigdataModels.vars.' + key + ' must be a string - got ' + typeof raw.vars[key] + '.');
+        }
+      });
+      vars = raw.vars;
+    }
+    return { defaults: defaults, models: models, vars: vars };
   }
 
   // Merges the registry's defaults with one model's own entry (the entry
@@ -1735,63 +1790,104 @@ var NotSoBigData = (function () {
     return overrides;
   }
 
-  // The set()/var() pair: a model's own SQL can define one or more named
-  // string values with {{ set(key='value', ...) }} and read them back
-  // elsewhere in the *same* file with {{ var('key') }} - a lightweight,
-  // file-local stand-in for Jinja's {% set %} statement, flattened into the
-  // same single-token call shape every other macro here uses (a real {% set
-  // %} is a block construct, out of scope for the reasons the module comment
-  // above gives for for()/if()). Deliberately file-local, not a project-wide
-  // vars dict on the registry - the value only exists to avoid repeating a
-  // literal twice in one query (e.g. the same threshold in a WHERE and a
-  // HAVING), not to parameterize a model from outside its own SQL.
+  // {% set %}: a model's own SQL can define one or more named string values
+  // with {% set key = 'value' %} and read them back elsewhere in the *same*
+  // file as a bare {{ key }} reference - a real Jinja statement, not a
+  // {{ }} call standing in for one (see setStatementPattern()/
+  // bareVarPattern() above), so it needs its own extraction/validation pair
+  // rather than reusing scanTemplateExpressions(). File-local by design -
+  // the value only exists to avoid repeating a literal twice in one query
+  // (e.g. the same threshold in a WHERE and a HAVING), not to parameterize a
+  // model from outside its own SQL. That's a different job from var() below,
+  // which is project-level - the two used to be conflated into one
+  // set()/var() pair (var() reading back whatever set() had just defined),
+  // which was a mistake: real dbt's var() has nothing to do with {% set %}
+  // at all, it reads a value from outside the model entirely. See
+  // src/model.md's "set()/var() corrected to match real dbt/Jinja" note for
+  // the fuller story.
   //
-  // extractSetValues() is the single source of truth both validateSetVarUsage()
-  // (discovery, below) and compileModelSql() (run time) call - scans
-  // stripSqlComments()'s output, same reasoning extractRefDependencies() and
-  // extractConfigOverrides() already give: a commented-out {{ set(...) }}
-  // must not define a usable value.
-  //
-  // Unlike config() (rejected outright on a second call, since materialized
-  // has no obvious two-call precedence), multiple {{ set(...) }} calls are
-  // allowed here - set() is meant to define several independently-named
-  // values, and forcing every one into a single call's argument list would
-  // be an awkward fit once a model needs more than one or two. What's
-  // rejected is the same key appearing twice, whether from one call
-  // (parseKwargsArgument's own duplicate-key guard) or across two separate
-  // calls (checked here) - two definitions of the same name have the same
-  // "no obvious precedence" problem config()'s rule already avoids.
-  function extractSetValues(sql) {
-    var calls = scanTemplateExpressions(stripSqlComments(sql))
-      .filter(function (expression) { return expression.call === 'set'; });
+  // extractSetStatements() is the single source of truth both
+  // validateSetUsage() (discovery, below) and compileModelSql() (run time)
+  // call - scans stripSqlComments()'s output, same reasoning
+  // extractRefDependencies() and extractConfigOverrides() already give: a
+  // commented-out {% set %} must not define a usable value. Multiple
+  // {% set %} statements are allowed (one per name) - only the same name
+  // being set twice is rejected, the same "no obvious precedence" reasoning
+  // config()'s at-most-one-call rule exists for.
+  function extractSetStatements(sql) {
+    var pattern = setStatementPattern();
+    var stripped = stripSqlComments(sql);
     var values = {};
-    calls.forEach(function (call) {
-      var pairs = parseKwargsArgument('set', call.args);
-      Object.keys(pairs).forEach(function (key) {
-        if (has(values, key)) {
-          throw new Error('model(): "' + key + '" is set by more than one {{ set(...) }} call in this SQL.');
-        }
-        values[key] = pairs[key];
-      });
-    });
+    var match;
+    while ((match = pattern.exec(stripped))) {
+      var key = match[1];
+      if (has(values, key)) {
+        throw new Error('model(): "' + key + '" is set by more than one {% set %} statement in this SQL.');
+      }
+      values[key] = match[3];
+    }
     return values;
   }
 
-  // The var()-side of discovery-time validation: every {{ var('x') }} in the
-  // file must resolve against extractSetValues()'s map, or it's a reference
-  // to a value that was never defined - same "fail loud at validation time,
-  // not two calls later" posture as validateModelTests() and
-  // extractConfigOverrides()'s key whitelist. Called from expandModelNodes()'s
-  // existing per-model try/catch, so a bad var() becomes that model's own
+  // The discovery-time check for bare {{ key }} references: every one in the
+  // file must resolve against extractSetStatements()'s map, or it's a
+  // reference to a name that was never {% set %}. Same "fail loud at
+  // validation time, not two calls later" posture as validateModelTests()
+  // and extractConfigOverrides()'s key whitelist. Called from
+  // expandModelNodes()'s existing per-model try/catch, so a bad reference
+  // becomes that model's own discoveryError, caught by cli('list') before
+  // any real run.
+  function validateSetUsage(sql, messagePrefix) {
+    var values = extractSetStatements(sql);
+    var pattern = bareVarPattern();
+    var stripped = stripSqlComments(sql);
+    var match;
+    while ((match = pattern.exec(stripped))) {
+      var name = match[1];
+      if (!has(values, name)) {
+        throw new Error(messagePrefix + ' {{ ' + name + ' }} references "' + name + '", which is never set via {% set ' + name + ' = ... %} in this SQL.');
+      }
+    }
+  }
+
+  // var(): real dbt semantics, not this library's own invention - reads a
+  // project-level value from notsobigdataModels.vars (the model-SQL
+  // equivalent of dbt_project.yml's vars: section), with an optional second
+  // argument as a default when the key isn't set there. Deliberately has no
+  // relationship to {% set %} above (a real dbt model's {% set %} value is
+  // never read back through var() either - it's referenced by bare name).
+  //
+  // Both validateVarUsage() (discovery, below) and resolveVar() (run time,
+  // called from compileModelSql()) share this one resolution rule, so a
+  // var() that will fail at run time is already caught at discovery instead.
+  function resolveVar(registry, name, hasDefault, defaultValue) {
+    if (has(registry.vars, name)) {
+      return registry.vars[name];
+    }
+    if (hasDefault) {
+      return defaultValue;
+    }
+    throw new Error('model(): {{ var(\'' + name + '\') }} references "' + name + '", which is not set in notsobigdataModels.vars and has no default.');
+  }
+
+  // The var()-side of discovery-time validation: every {{ var(...) }} call
+  // must resolve - either notsobigdataModels.vars has the key, or the call
+  // supplies its own default - same "fail loud at validation time, not two
+  // calls later" posture validateSetUsage() takes for bare {{ key }}
+  // references. Same resolution rule as resolveVar() above, duplicated
+  // rather than shared so this can embed messagePrefix the same way every
+  // other discovery-time validate* function in this file does - resolveVar()
+  // itself is also called at run time (from compileModelSql()), where no
+  // per-model prefix is available. Called from expandModelNodes()'s existing
+  // per-model try/catch, so a bad var() becomes that model's own
   // discoveryError, caught by cli('list') before any real run.
-  function validateSetVarUsage(sql, messagePrefix) {
-    var values = extractSetValues(sql);
+  function validateVarUsage(sql, registry, messagePrefix) {
     scanTemplateExpressions(stripSqlComments(sql))
       .filter(function (expression) { return expression.call === 'var'; })
       .forEach(function (expression) {
-        var name = parseSingleStringArgument('var', expression.args);
-        if (!has(values, name)) {
-          throw new Error(messagePrefix + ' {{ var(\'' + name + '\') }} references "' + name + '", which is never set via {{ set(' + name + '=...) }} in this SQL.');
+        var parsed = parseVarArguments('var', expression.args);
+        if (!parsed.hasDefault && !has(registry.vars, parsed.name)) {
+          throw new Error(messagePrefix + ' {{ var(\'' + parsed.name + '\') }} references "' + parsed.name + '", which is not set in notsobigdataModels.vars and has no default.');
         }
       });
   }
@@ -1840,55 +1936,71 @@ var NotSoBigData = (function () {
   // config() only would be its own small surprise) still throws instead of
   // silently vanishing.
   //
-  // {{ set(...) }} strips to '' the same way {{ config(...) }} does - its
-  // values live only in the setValues map computed once below, resolved
-  // entirely within this function. {{ var('x') }} substitutes that value
-  // raw/unquoted, same "string interpolation, not a typed system" posture
-  // ref()'s relation substitution already has - a caller wanting a SQL
-  // string literal puts the quotes in the set() value or around the var()
-  // call itself. setValues is computed once, before the single replace()
-  // pass below, rather than per-match - validateSetVarUsage() already ran
-  // this same scan at discovery time, so a var() reaching this function with
-  // no matching set() is not expected, but the lookup still throws instead
+  // {{ var(...) }} resolves via resolveVar() above - notsobigdataModels.vars
+  // (registry is the caller's, same one it already read for ref()
+  // resolution) or the call's own default. {{ config(...) }} is stripped to
+  // '' - its values were already folded into node.config back in
+  // expandModelNodes(), so by the time this runs the call has nothing left
+  // to do except disappear from the compiled statement. parseKwargsArgument
+  // is still called here (its result discarded) rather than just matching
+  // the call name, so a config() call this SQL string carries that somehow
+  // differs from the one discovery already validated (there is no
+  // legitimate way for that to happen today, since config.sql is set once
+  // and never mutated - but ref() gets this same redundant re-validation on
+  // every compile, and diverging from that precedent for config() only
+  // would be its own small surprise) still throws instead of silently
+  // vanishing.
+  //
+  // {% set key = 'value' %} strips to '' after this first pass, in its own
+  // second replace() below - it's a different bracket shape ({% %}, not
+  // {{ }}), so templateExpressionPattern()'s call-shaped regex never matches
+  // it in the first place. A bare {{ key }} reference is resolved in a third
+  // pass, against setValues (computed once up front, before either replace()
+  // pass, the same "once per compile, not once per match" reasoning ref()'s
+  // own resolution already has) - validateSetUsage() already ran this same
+  // scan at discovery time, so a {{ key }} reaching this function with no
+  // matching {% set %} is not expected, but the lookup still throws instead
   // of substituting undefined, for the same defense-in-depth reason ref()
   // and config() both re-validate here rather than trusting discovery alone.
   //
-  // Any *other* template call is rejected the same way ref()'s unknown name
-  // is, for the same reason - see the module comment above about growing
-  // this dispatch.
-  function compileModelSql(sql, resolveRef) {
-    var setValues = extractSetValues(sql);
+  // Any *other* {{ name(...) }} call is rejected the same way ref()'s
+  // unknown name is, for the same reason - see the module comment above
+  // about growing this dispatch.
+  function compileModelSql(sql, resolveRef, registry) {
+    var setValues = extractSetStatements(sql);
     var compiled = sql.replace(templateExpressionPattern(), function (raw, call, args) {
       if (call === 'config') {
         parseKwargsArgument('config', args);
         return '';
       }
-      if (call === 'set') {
-        parseKwargsArgument('set', args);
-        return '';
-      }
       if (call === 'var') {
-        var name = parseSingleStringArgument('var', args);
-        if (!has(setValues, name)) {
-          throw new Error('model(): {{ var(\'' + name + '\') }} references "' + name + '", which is never set via {{ set(' + name + '=...) }} in this SQL.');
-        }
-        return setValues[name];
+        var parsed = parseVarArguments('var', args);
+        return resolveVar(registry, parsed.name, parsed.hasDefault, parsed.defaultValue);
       }
       if (call !== 'ref') {
-        throw new Error('model(): unsupported template call "' + call + '(...)" in SQL - only ref(), config(), set() and var() are implemented so far.');
+        throw new Error('model(): unsupported template call "' + call + '(...)" in SQL - only ref(), config() and var() are implemented so far.');
       }
       return resolveRef(parseSingleStringArgument('ref', args));
+    });
+    compiled = compiled.replace(setStatementPattern(), '');
+    compiled = compiled.replace(bareVarPattern(), function (raw, name) {
+      if (!has(setValues, name)) {
+        throw new Error('model(): {{ ' + name + ' }} references "' + name + '", which is never set via {% set ' + name + ' = ... %} in this SQL.');
+      }
+      return setValues[name];
     });
     // templateExpressionPattern()'s args group is [^)]* - it can't match a
     // call containing its own ")" (e.g. a ref() argument with a stray
     // paren, or a macro call nesting another call), so that span is skipped
     // over entirely rather than reaching the "unsupported call" check above.
     // Left alone, that malformed placeholder would ship to BigQuery as
-    // literal, unsubstituted "{{ ... }}" text instead of being rejected -
-    // exactly the failure mode the module comment above says the generic
-    // scanner exists to avoid.
-    if (compiled.indexOf('{{') !== -1) {
-      throw new Error('model(): SQL still contains "{{" after substitution - check for a malformed template call (e.g. unbalanced parentheses inside {{ ref(...) }}).');
+    // literal, unsubstituted "{{ ... }}"/"{% ... %}" text instead of being
+    // rejected - exactly the failure mode the module comment above says the
+    // generic scanner exists to avoid. Checking for both "{{" and "{%"
+    // catches a malformed {% set %} (or an unimplemented {% if %}) the same
+    // way it already catches a malformed {{ ref(...) }}.
+    if (compiled.indexOf('{{') !== -1 || compiled.indexOf('{%') !== -1) {
+      throw new Error('model(): SQL still contains "{{" or "{%" after substitution - check for a malformed template call or {% set %} statement.');
     }
     return compiled;
   }
@@ -2203,7 +2315,8 @@ var NotSoBigData = (function () {
         var configOverrides = extractConfigOverrides(config.sql);
         Object.keys(configOverrides).forEach(function (key) { config[key] = configOverrides[key]; });
         validateModelTests(config.tests, 'model(): "' + name + '"');
-        validateSetVarUsage(config.sql, 'model(): "' + name + '"');
+        validateSetUsage(config.sql, 'model(): "' + name + '"');
+        validateVarUsage(config.sql, registry, 'model(): "' + name + '"');
         // Computed from config.dependsOn (whichever hand-written value won
         // MODEL_DEFAULT_KEYS's override), then deleted off config - node.config
         // must not keep its own, pre-merge "dependsOn" once node.dependsOn
@@ -2265,7 +2378,7 @@ var NotSoBigData = (function () {
     var registry = readModelsRegistry();
     var compiled = compileModelSql(sql, function (refName) {
       return qualifiedRelation(resolveModelConfig(refName, registry));
-    });
+    }, registry);
     var relation = qualifiedRelation(config);
     var materialized = resolveMaterialized(config);
     var statement = 'CREATE OR REPLACE ' + materialized.toUpperCase() + ' ' + relation + ' AS\n' + compiled;
