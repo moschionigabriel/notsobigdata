@@ -50,6 +50,32 @@ BigQuery's own atomic `CREATE OR REPLACE {VIEW|TABLE} ... AS SELECT` — no
 temp-table swap dance required. Incremental materialization isn't
 implemented yet.
 
+### Setting config from SQL: `{{ config(...) }}`
+
+A model can also set its own config from inside its SQL, dbt-style, instead
+of (or as well as) the registry entry:
+
+```html
+<!-- orders_summary.html -->
+<script type="text/sql">
+  {{ config(materialized='table') }}
+  select customer_id, count(*) as order_count
+  from {{ ref('stg_orders') }}
+  group by 1
+</script>
+```
+
+`{{ config(...) }}` wins over both the registry's project-wide default and
+the model's own registry entry for any key it sets — the same relationship
+a dbt model's own `config()` block has with `dbt_project.yml`. The call
+itself never appears in the SQL that actually runs against BigQuery; it's
+read once during discovery and stripped out of the compiled statement.
+
+Only `materialized` is supported today — an unrecognized key (or a second
+`{{ config(...) }}` call in the same model, which has no obvious precedence
+over the first) is a discovery-time error, caught by `cli('list')` the same
+way a bad `tests` entry is.
+
 Every model is then just another node: `cli('run')` picks up every entry in
 `notsobigdataModels.models` alongside your `move` nodes and orders the
 whole graph together, `cli('run --select model')` runs only models,
@@ -177,10 +203,11 @@ already sitting in the real relation by the time you find out. There's no
 run against a relation that's already fully written, not an in-memory row
 array you can still filter.
 
-`{{ ref() }}` is the only template call implemented so far — no macros, no
-`for`/`if`. Referencing a name that isn't a declared model is an error, not
-something silently passed through as literal text into SQL that runs with
-your live BigQuery credentials.
+`{{ ref() }}` and `{{ config() }}` (see above) are the only template calls
+implemented so far — no `set`/`for`/`if`. Referencing a name that isn't a
+declared model, or an unsupported template call, is an error, not something
+silently passed through as literal text into SQL that runs with your live
+BigQuery credentials.
 
 A model's SQL must be a single statement — no `;`-separated scripts, same
 restriction `move`'s BigQuery connector places on its own SQL (models can
