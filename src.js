@@ -1444,6 +1444,15 @@ var NotSoBigData = (function () {
   // evaluate to a substituted value itself), unlike every call this pattern
   // matches, which stands in for the value it evaluates to.
   //
+  // {% for x in [...] %}...{% endfor %} is a different, bigger construct
+  // still - a block, not a statement or a call - see
+  // forStatementOpenPattern()/expandForLoops() below. Unlike every other
+  // macro in this file, it doesn't join compileModelSql()'s dispatch at all:
+  // it's a text-expansion pass that runs once, at discovery time, before
+  // ref()/config()/set()/var() ever see the SQL, so a call inside a loop
+  // body is handled by the existing pipeline for free once the loop itself
+  // has been resolved into plain text.
+  //
   // Matches the call *shape* only - name plus whatever sits between its
   // parens - deliberately not either call's own stricter argument shape.
   // Matching narrowly here would let a call this library doesn't recognize
@@ -1478,6 +1487,21 @@ var NotSoBigData = (function () {
   // expression" mechanism.
   function bareVarPattern() {
     return /\{\{\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*\}\}/g;
+  }
+
+  // {% for x in ['a', 'b'] %}...{% endfor %} - a block construct, like
+  // {% set %} above, not a {{ }} call. Deliberately non-global (unlike every
+  // other pattern in this file): expandForLoops() below re-slices the
+  // remaining SQL after each block it resolves and calls .exec() fresh each
+  // time, rather than relying on a global regex's own lastIndex bookkeeping -
+  // simpler to reason about once the match is being used to cut the string
+  // into pieces, not just collected.
+  function forStatementOpenPattern() {
+    return /\{%\s*for\s+([a-zA-Z_][a-zA-Z0-9_]*)\s+in\s+(\[[^\]]*\])\s*%\}/;
+  }
+
+  function forEndPattern() {
+    return /\{%\s*endfor\s*%\}/;
   }
 
   function scanTemplateExpressions(sql) {
@@ -1827,6 +1851,100 @@ var NotSoBigData = (function () {
       values[key] = match[3];
     }
     return values;
+  }
+
+  // The one argument shape {% for %} accepts: a literal, comma-separated
+  // list of quoted strings - e.g. ['open', 'closed', 'cancelled']. Same
+  // string-literal-only posture parseKwargsArgument/parseVarArguments
+  // already take for config()/var() - no var()/ref() as the iterable, no
+  // numbers/booleans, nothing beyond what a model author would otherwise
+  // have hand-written as separate SQL fragments. raw still has its
+  // surrounding "[" "]" from forStatementOpenPattern()'s own capture group,
+  // stripped here rather than in the pattern itself so the pattern's capture
+  // group can stay a simple "whatever's bracketed" instead of duplicating
+  // this function's own item grammar.
+  function parseForIterable(raw) {
+    var inner = raw.slice(1, -1).trim();
+    if (!inner) {
+      throw new Error('model(): "{% for %}" list "' + raw + '" is empty - needs at least one quoted item, e.g. [\'a\', \'b\'].');
+    }
+    var itemPattern = /^\s*(['"])([^'"]*)\1\s*$/;
+    return inner.split(',').map(function (segment) {
+      var match = itemPattern.exec(segment);
+      if (!match) {
+        throw new Error('model(): "{% for %}" list "' + raw + '" is not valid - every item must be a quoted string, e.g. [\'a\', \'b\'].');
+      }
+      return match[2];
+    });
+  }
+
+  // {% for %}: repeats a block of SQL once per item in a literal list,
+  // substituting a bare {{ x }} reference to the loop variable within that
+  // block only (bareVarPattern()'s own shape, reused here as a fresh regex
+  // per loop variable name rather than the shared function, since the name
+  // to match isn't fixed the way {% set %}'s bareVarPattern scan is).
+  //
+  // This is a text-expansion PREPROCESSING pass, run once in
+  // expandModelNodes() right after a model's SQL is read - before
+  // extractConfigOverrides, validateSetUsage, validateVarUsage,
+  // extractRefDependencies, or compileModelSql ever see it. By the time any
+  // of those run, every {% for %} has already been resolved into plain SQL
+  // text, so a ref()/config()/{% set %}/var() call *inside* a loop body is
+  // handled by the existing pipeline for free, with zero changes needed to
+  // compileModelSql()'s own dispatch - the same "an added case, not a
+  // rewrite" reasoning the module comment above gives for config()/var(),
+  // just one level earlier in the pipeline since {% for %} is a block, not
+  // a single-token call.
+  //
+  // Deliberately non-nesting - same "single construct, not a general
+  // evaluator" posture {% set %} already takes for its own right-hand side.
+  // A {% for %} found inside another {% for %}'s own body is a clear error,
+  // not a best-effort attempt at handling it (nesting would need the
+  // non-greedy endfor search below to track depth, which is exactly the kind
+  // of general-purpose parser this file has deliberately avoided since
+  // templateExpressionPattern()'s own module comment). Processed
+  // left-to-right, one block at a time, so several separate (non-nested)
+  // {% for %} blocks in one model's SQL all expand correctly - each fully
+  // resolved block is spliced back into the result and scanning resumes in
+  // whatever text followed it.
+  //
+  // Using the loop variable as an argument to another call (e.g.
+  // {{ ref(x) }}, {{ var(x) }}) is not supported - only the bare {{ x }}
+  // shape is substituted, the same limit {% set %}'s own bareVarPattern
+  // substitution already has. A model that needs that would be reaching for
+  // a real expression evaluator, which is out of scope for the same reason
+  // it always has been in this file.
+  function expandForLoops(sql) {
+    var openPattern = forStatementOpenPattern();
+    var endPattern = forEndPattern();
+    var result = '';
+    var remaining = sql;
+    var openMatch;
+    while ((openMatch = openPattern.exec(remaining))) {
+      var before = remaining.slice(0, openMatch.index);
+      var afterOpen = remaining.slice(openMatch.index + openMatch[0].length);
+      var varName = openMatch[1];
+      var items = parseForIterable(openMatch[2]);
+      var endMatch = endPattern.exec(afterOpen);
+      if (!endMatch) {
+        throw new Error('model(): "{% for ' + varName + ' in ... %}" has no matching "{% endfor %}".');
+      }
+      var body = afterOpen.slice(0, endMatch.index);
+      if (openPattern.test(body)) {
+        throw new Error('model(): "{% for ' + varName + ' in ... %}" contains a nested "{% for %}" - nesting is not supported.');
+      }
+      var bodyVarPattern = new RegExp('\\{\\{\\s*' + varName + '\\s*\\}\\}', 'g');
+      var expanded = items.map(function (item) {
+        return body.replace(bodyVarPattern, item);
+      }).join('');
+      result += before + expanded;
+      remaining = afterOpen.slice(endMatch.index + endMatch[0].length);
+    }
+    result += remaining;
+    if (endPattern.test(result)) {
+      throw new Error('model(): SQL has a "{% endfor %}" with no matching "{% for %}".');
+    }
+    return result;
   }
 
   // The discovery-time check for bare {{ key }} references: every one in the
@@ -2308,6 +2426,10 @@ var NotSoBigData = (function () {
           throw new Error(cached.error);
         }
         config.sql = extractModelSql(cached.content, config.sqlFile, name);
+        // {% for %} expands before anything else scans this SQL - see
+        // expandForLoops()'s own comment for why this has to run first, not
+        // as another case in compileModelSql()'s dispatch.
+        config.sql = expandForLoops(config.sql);
         // {{ config(...) }} overrides applied after resolveModelConfig()'s own
         // defaults+entry merge, so a model's own SQL wins over both the
         // registry's project-wide default and its own registry entry - see
