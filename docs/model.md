@@ -298,7 +298,10 @@ means no model can call one.
 Every model is then just another node: `cli('run')` picks up every entry in
 `notsobigdataModels.models` alongside your `move` nodes and orders the
 whole graph together, `cli('run --select model')` runs only models,
-`cli('run --select orders_summary')` runs just that one.
+`cli('run --select orders_summary')` runs just that one. `cli('compile')`
+resolves the same SQL — every `ref()`/`var()`/`config()` substituted — but
+never issues the resulting statement to BigQuery, letting you see exactly
+what a model would run before it does; see [docs/cli.md](cli.md#clicompile--see-the-sql-before-it-runs).
 
 ### Depending on a `move` node
 

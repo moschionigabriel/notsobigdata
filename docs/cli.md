@@ -18,6 +18,8 @@ NotSoBigData.cli('run --select rawOrders')  // run only that node
 NotSoBigData.cli('run --select a,b')        // run only these, ordered among themselves
 NotSoBigData.cli('run --exclude a')         // run everything except these
 NotSoBigData.cli('list')                    // show what would run, in order — runs nothing
+NotSoBigData.cli('compile')                 // resolve model SQL, without running anything
+NotSoBigData.cli('compile --select orders') // resolve just that model's SQL
 NotSoBigData.cli('hello')                   // check the library loaded and see what it can find
 NotSoBigData.cli('help')                    // the command list
 ```
@@ -56,10 +58,28 @@ about the top-level-`var` rule, since that's almost always the cause.
 Objects carrying an unrecognized `kind` are listed too, so a typo like
 `kind: 'mvoe'` shows up instead of silently doing nothing.
 
+### cli('compile') — see the SQL before it runs
+
+Like `list`, `compile` is a dry run — nothing executes against BigQuery,
+Sheets, or Drive. Unlike `list`, it also resolves every `model` node's SQL —
+substituting `{{ ref() }}`, `{{ var() }}` and stripping `{{ config() }}`,
+exactly the substitution `run` itself does right before issuing a BigQuery
+job — and hands you the result, so you can see precisely what would run
+without running it. This is the same job dbt's own `dbt compile` does.
+
+```javascript
+NotSoBigData.cli('compile')                  // resolve every model's SQL
+NotSoBigData.cli('compile --select orders')  // just that model
+```
+
+A `move` node has no `{{ }}`-style templating to resolve, so it's reported
+`planned` under `compile` exactly the way it already is under `list` — no
+`compiledSql`, nothing else attached. Only `model` nodes get one.
+
 ### What cli() returns
 
-`hello` and `help` return their message as a string. `run` and `list` return
-a report:
+`hello` and `help` return their message as a string. `run`, `list` and
+`compile` all return a report:
 
 ```javascript
 {
@@ -81,14 +101,31 @@ its own dependents too), and **unrelated branches still run**. That matters
 more here than in a normal scheduler: each run is you clicking Run in the
 Apps Script editor and waiting, so seeing every independent failure in one
 pass beats fixing them one run at a time. Under `list`, every node's status
-is `planned` and nothing executes — and there's no `manifest` field, since
-`list` doesn't run anything worth recording (see below).
+is `planned` and nothing executes. Under `compile`, every node is also
+`planned` — a `model` node additionally carries `compiledSql`, and a model
+that fails to compile (rare — most template mistakes are already caught
+before this point) is `failed` instead, blocking its dependents the same
+way a real run failure does:
 
-`manifest` is present only on `run`, and is always one of:
+```javascript
+{
+  ok: true,
+  command: 'compile',
+  nodes: [
+    { name: 'rawOrders', kind: 'move',  status: 'planned' },
+    { name: 'orders',    kind: 'model', status: 'planned', compiledSql: 'SELECT * FROM `proj.ds.rawOrders`' }
+  ],
+  ignored: [],
+  manifest: { written: true, fileId: '...' }
+}
+```
+
+`manifest` is present on `run` and `compile`, never `list` (a pure dry run
+with nothing, not even compiled SQL, to record), and is always one of:
 
 ```javascript
 { written: true, fileId: '...' }                      // wrote/overwrote the manifest file
-{ written: false, reason: 'disabled' }                 // notsobigdataManifest.enabled is false
+{ written: false, reason: 'disabled' }                 // *Manifest.enabled is false
 { written: false, reason: 'error', error: '...' }      // Drive write failed - never throws, never affects ok
 ```
 
@@ -119,7 +156,9 @@ get its own confirmation line by default: `START` plus the absence of a
 it's always in the returned `report.nodes[]` and, for `run`, the [Drive
 manifest](#the-run-manifest) below, whether or not it hits the console.
 `cli('list')`'s dry run only ever logs one `PLAN` line per node — nothing
-executes, so there's no "in progress" to signal.
+executes, so there's no "in progress" to signal. `cli('compile')` logs the
+same `PLAN` line (with " - compiled" appended for a `model` node that
+resolved successfully), or `FAIL` for one that didn't.
 
 Want the full detail back, e.g. while actively debugging a run? Set
 `verbose: true`:
@@ -181,6 +220,49 @@ var notsobigdataManifest = {
   enabled: true,                           // set false to turn it off entirely
   folderId: null,                          // default: auto-detected, the folder the Apps Script project itself lives in
   fileName: 'notsobigdata-manifest.json'   // default filename inside that folder
+};
+```
+
+All three keys are optional — omit the whole `var` to get every default.
+
+## The compile manifest
+
+Every `cli('compile ...')` writes its own small JSON file to Drive — same
+upsert-by-name shape as the run manifest above, but a **separate file**,
+never the run manifest itself. A compile pass doesn't touch BigQuery,
+Sheets, or Drive, so overwriting the run manifest with it would replace the
+record of what your last real run actually did with a record of a run that
+never happened. The execution log has the same three-outcome line, prefixed
+`COMPILE MANIFEST` instead of `MANIFEST`, so you can tell the two apart at a
+glance.
+
+```json
+{
+  "notsobigdata": "manifest",
+  "version": 1,
+  "generatedAt": "2026-08-09T12:34:56.789Z",
+  "command": "compile --select orders",
+  "ok": true,
+  "nodes": [
+    { "name": "orders", "kind": "model", "status": "planned", "compiledSql": "SELECT * FROM `proj.ds.rawOrders`" }
+  ],
+  "ignored": []
+}
+```
+
+Unlike the run manifest, this one *does* carry full SQL text per model —
+being able to open the file and read exactly what would run is the entire
+point of it existing, and unlike a `move` node's rows, compiled SQL text is
+never large enough to make file size a concern.
+
+On by default, configured the same way as the run manifest, via its own
+top-level `var` so the two never fight over one filename:
+
+```javascript
+var notsobigdataCompileManifest = {
+  enabled: true,                                   // set false to turn it off entirely
+  folderId: null,                                  // default: auto-detected, the folder the Apps Script project itself lives in
+  fileName: 'notsobigdata-compile-manifest.json'   // default filename inside that folder
 };
 ```
 
