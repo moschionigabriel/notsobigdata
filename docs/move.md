@@ -39,6 +39,11 @@ source: {
   pagination: { param: 'pageToken', tokenPath: 'nextPageToken', maxPages: 10 }
 }
 
+// Raw file over HTTP — fileType selects the parser, same three options as
+// drive. Useful for a public dataset you don't want to copy into Drive
+// first, e.g. a CSV published in a GitHub repo
+source: { type: 'url', url: 'https://raw.githubusercontent.com/dbt-labs/jaffle-shop-classic/main/seeds/raw_customers.csv', fileType: 'csv' }
+
 // Custom — fn is a function you already defined in your own Apps Script
 // project; it's called as fn(source) and its return value is used directly
 function myCustomExtract(source) {
@@ -48,7 +53,7 @@ function myCustomExtract(source) {
 source: { type: 'custom', fn: myCustomExtract }
 ```
 
-For `drive` and `api` sources, a JSON array of objects is flattened into a
+For `drive`, `url`, and `api` sources, a JSON array of objects is flattened into a
 header row plus data rows using the **union of every object's keys** as the
 column list — any object missing a given key just gets a blank cell there.
 A value that's itself an object or array — a nested field like the YouTube
@@ -60,10 +65,21 @@ drive `csv`). If a table shaped like that also has too little type
 contrast between its header and data rows for BigQuery's `autodetect` to
 reliably find the header row, pass `target.schema` (see the `bigquery`
 target section below) instead of relying on autodetect.
-`xlsx` files are converted to a temporary Google Sheet under the hood (Apps
-Script has no native XLSX parser), read, and the temporary copy is deleted
-immediately after — this requires the Advanced Drive Service enabled in
-your Apps Script project.
+`xlsx` files (`drive` or `url`) are converted to a temporary Google Sheet
+under the hood (Apps Script has no native XLSX parser), read, and the
+temporary copy is deleted immediately after — this requires the Advanced
+Drive Service enabled in your Apps Script project.
+
+`url` sources fetch `url` directly with `UrlFetchApp` and parse the
+response body the same way the equivalent `drive` `fileType` does — `fileType`
+is required, with no default, same as `drive`. A `github.com/.../blob/...`
+link (what you get from copying the URL out of GitHub's file-view UI) is
+rewritten to the equivalent `raw.githubusercontent.com` link automatically,
+so you can paste either form. No other hosts get this treatment — a Kaggle
+dataset page isn't a raw file URL at all (downloading one needs Kaggle's
+authenticated API, which is out of scope for this library). For Kaggle or
+any other source that needs auth to download, fetch the file once by hand,
+drop it in Drive, and use a `drive` source instead.
 
 `api` sources also accept two optional keys for REST APIs that don't hand
 back a bare JSON array — both omittable, and omitting both keeps the

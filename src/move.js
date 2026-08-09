@@ -173,6 +173,78 @@ function extractDrive(source) {
   }
 }
 
+// A URL pasted straight from the GitHub UI points at an HTML page
+// (github.com/.../blob/...), not the file's raw bytes - rewriting it to
+// the equivalent raw.githubusercontent.com URL is the one host-specific
+// convenience the url source makes, so a link copied out of a browser tab
+// works without the pipeline author having to know "raw" links exist.
+// Anything that isn't that exact shape (including an already-raw URL, or
+// any non-GitHub host - Kaggle included, which needs authenticated API
+// access this library deliberately doesn't take on) passes through
+// unchanged.
+function rewriteGithubBlobUrl(url) {
+  var match = /^https:\/\/github\.com\/([^\/]+)\/([^\/]+)\/blob\/(.+)$/.exec(url);
+  return match ? 'https://raw.githubusercontent.com/' + match[1] + '/' + match[2] + '/' + match[3] : url;
+}
+
+// Fetches a URL's body as text. Shared by extractUrlCsv/Json below - the
+// url source's equivalent of readDriveFileText.
+function readUrlText(url, options) {
+  var response = UrlFetchApp.fetch(url, options || {});
+  assertHttpOk(response, 'move(): url source request to "' + url + '" failed');
+  return response.getContentText();
+}
+
+function extractUrlCsv(url, options) {
+  var values = Utilities.parseCsv(readUrlText(url, options));
+  return isBlankGrid(values) ? [] : values;
+}
+
+function extractUrlJson(url, options) {
+  return objectsToRows(JSON.parse(readUrlText(url, options)));
+}
+
+// Mirrors extractDriveXlsx's temp-Google-Sheet trick, but starting from a
+// fetched blob instead of an existing Drive file id: Drive.Files.insert
+// converts on upload when given a GOOGLE_SHEETS mimeType, same as
+// Files.copy does on an existing file. The temp file lives in the user's
+// own Drive only for the duration of this call and is always removed,
+// including on error, so a failed conversion never leaves an orphan
+// behind - same guarantee extractDriveXlsx makes for its own temp copy.
+function extractUrlXlsx(url, options) {
+  var response = UrlFetchApp.fetch(url, options || {});
+  assertHttpOk(response, 'move(): url source request to "' + url + '" failed');
+  var tempFileName = 'notsobigdata-xlsx-import-' + Utilities.getUuid();
+  var tempFileMetadata = Drive.Files.insert(
+    { name: tempFileName, title: tempFileName, mimeType: MimeType.GOOGLE_SHEETS },
+    response.getBlob()
+  );
+  try {
+    var spreadsheet = SpreadsheetApp.openById(tempFileMetadata.id);
+    var values = spreadsheet.getActiveSheet().getDataRange().getValues();
+    return isBlankGrid(values) ? [] : values;
+  } finally {
+    Drive.Files.remove(tempFileMetadata.id);
+  }
+}
+
+function extractUrl(source) {
+  if (!source.url) {
+    throw new Error('move(): url source requires "url".');
+  }
+  var url = rewriteGithubBlobUrl(source.url);
+  switch (source.fileType) {
+    case 'csv':
+      return extractUrlCsv(url, source.options);
+    case 'json':
+      return extractUrlJson(url, source.options);
+    case 'xlsx':
+      return extractUrlXlsx(url, source.options);
+    default:
+      throw new Error('move(): unsupported url source fileType "' + source.fileType + '". Expected "csv", "json", or "xlsx".');
+  }
+}
+
 // Resolves the SQL text for a bigquery source: a whole table (existing
 // behavior, backward compatible), a raw query string, or a query read
 // from a Drive .sql file. Exactly one of table/query/queryFileId must be
@@ -459,10 +531,12 @@ function extract(source) {
       return assertRows(extractBigQuery(source), 'bigquery');
     case 'api':
       return assertRows(extractApi(source), 'api');
+    case 'url':
+      return assertRows(extractUrl(source), 'url');
     case 'custom':
       return assertRows(extractCustom(source), 'custom');
     default:
-      throw new Error('move(): unsupported source type "' + source.type + '". Expected "sheets", "drive", "bigquery", "api", or "custom".');
+      throw new Error('move(): unsupported source type "' + source.type + '". Expected "sheets", "drive", "bigquery", "api", "url", or "custom".');
   }
 }
 
