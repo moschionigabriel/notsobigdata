@@ -269,7 +269,12 @@ function discoverNodes() {
   // (assertDependenciesExist, selection, ordering, running) sees one flat
   // node list and never has to know two different discovery mechanisms
   // produced it.
-  expandModelNodes().forEach(function (node) {
+  //
+  // nodes (everything the scan above already found - today, only move) is
+  // passed in so a model's {{ ref() }} can also resolve a move node with a
+  // bigquery target, not just another model - see expandModelNodes()'s own
+  // comment for how it uses this list.
+  expandModelNodes(nodes).forEach(function (node) {
     claimName(claimedNames, node.name, node.variable);
     nodes.push(node);
   });
