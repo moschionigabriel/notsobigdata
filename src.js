@@ -1370,9 +1370,12 @@ var NotSoBigData = (function () {
   // time with HtmlService because .html is the only plain-text file Apps
   // Script lets a project hold. Models reference each other dbt-style, with
   // {{ ref('other_model') }} placeholders inside the SQL. Those refs *are*
-  // the dependency declaration: a model never writes its own dependsOn, and
-  // they get substituted with the real table identifier just before the
-  // SQL runs.
+  // the model-to-model dependency declaration - a model never hand-writes
+  // dependsOn for another *model*, and refs get substituted with the real
+  // table identifier just before the SQL runs. A model can still have its
+  // own hand-written dependsOn for a non-model (move) dependency ref()
+  // can't reach - see MODEL_DEFAULT_KEYS and mergeDependsOn() below, and
+  // docs/model.md's "Depending on a move node" for the user-facing version.
   //
   // A model's .html file can hold its SQL three ways, chosen by how many
   // <script type="text/sql"> tags it contains - see extractModelSql() below:
@@ -1457,11 +1460,18 @@ var NotSoBigData = (function () {
   }
 
   // The keys a model entry or the registry's top level may set as a
-  // materialization default. Kept as an explicit list rather than copying
-  // every key on notsobigdataModels, so an unrelated key a user attaches to
-  // the registry (notes, a comment, anything) never leaks into a model's
-  // resolved config.
-  var MODEL_DEFAULT_KEYS = ['projectId', 'dataset', 'materialized'];
+  // default. Kept as an explicit list rather than copying every key on
+  // notsobigdataModels, so an unrelated key a user attaches to the registry
+  // (notes, a comment, anything) never leaks into a model's resolved
+  // config. dependsOn joins this list for the same reason a project-wide
+  // materialized default is useful - a registry-wide "every model waits on
+  // this" is a real shape (e.g. a shared staging load) - and it gets the
+  // override behavior below (an entry's own dependsOn replaces the
+  // registry's, not merges with it) for free, the same way materialized
+  // already does. (Union-with-ref() semantics - dependsOn can never
+  // suppress a real ref() - are enforced separately in mergeDependsOn()
+  // below, not by this override.)
+  var MODEL_DEFAULT_KEYS = ['projectId', 'dataset', 'materialized', 'dependsOn'];
 
   // Guarded read of the single notsobigdataModels global, reusing cli.js's
   // readOptionalGlobal() - same "never throw because of a global this
@@ -1612,8 +1622,11 @@ var NotSoBigData = (function () {
     return matches[0].sql.trim();
   }
 
-  // The dependency-derivation hook: a model's ref() calls *are* its edges,
-  // so dependsOn is read out of the SQL instead of being hand-written. Scans
+  // The dependency-derivation hook: a model's ref() calls *are* its edges to
+  // other models, so a model-to-model dependency is read out of the SQL
+  // instead of being hand-written - see mergeDependsOn() below for the one
+  // other source of edges a model can have (a hand-written dependsOn,
+  // naming a non-model node the SQL has no way to ref()). Scans
   // stripSqlComments()'s output (move.js's own comment-stripping, reused
   // rather than re-implemented) rather than the raw SQL, so a ref() a user
   // has commented out (e.g. "-- from {{ ref('old_model') }}") doesn't become
@@ -1622,6 +1635,29 @@ var NotSoBigData = (function () {
     return scanTemplateExpressions(stripSqlComments(sql))
       .filter(function (expression) { return expression.call === 'ref'; })
       .map(function (expression) { return parseSingleStringArgument('ref', expression.args); });
+  }
+
+  // Unions a model's {{ ref() }}-derived edges with its hand-written
+  // dependsOn (see MODEL_DEFAULT_KEYS above for where that value comes
+  // from - a model entry's own dependsOn, or the registry's project-wide
+  // default), preserving first-seen order and dropping duplicates. The
+  // union is deliberate, not a merge choice made lightly: dependsOn is for
+  // naming a node ref() cannot reach (a move node, by convention - see
+  // docs/model.md), and must never be able to suppress an edge the SQL
+  // itself already declares via a real ref(). Reuses cli.js's
+  // emptyMap()/has() rather than Array#indexOf, same prototype-pollution
+  // reasoning as every other name-keyed lookup in this library.
+  function mergeDependsOn(refDeps, handWrittenDeps) {
+    var seen = emptyMap();
+    var merged = [];
+    refDeps.concat(handWrittenDeps).forEach(function (name) {
+      if (has(seen, name)) {
+        return;
+      }
+      seen[name] = true;
+      merged.push(name);
+    });
+    return merged;
   }
 
   // Substitutes every {{ ref('x') }} with x's resolved, backtick-quoted
@@ -1749,8 +1785,16 @@ var NotSoBigData = (function () {
           throw new Error(cached.error);
         }
         config.sql = extractModelSql(cached.content, config.sqlFile, name);
+        // Computed from config.dependsOn (whichever hand-written value won
+        // MODEL_DEFAULT_KEYS's override), then deleted off config - node.config
+        // must not keep its own, pre-merge "dependsOn" once node.dependsOn
+        // holds the real, merged edges below; two dependsOn-shaped values on
+        // one node, disagreeing with each other, is exactly the kind of stale
+        // state that confuses whoever inspects a node's config next.
+        var handWritten = parseDependsOnList('model(): "' + name + '"', config.dependsOn);
+        delete config.dependsOn;
         node.config = config;
-        node.dependsOn = extractRefDependencies(config.sql);
+        node.dependsOn = mergeDependsOn(extractRefDependencies(config.sql), handWritten);
       } catch (error) {
         node.discoveryError = error.message;
       }
@@ -2043,18 +2087,7 @@ var NotSoBigData = (function () {
         throw new Error('cli(): "' + key + '" is declared as a top-level var with kind "model" - models are declared as entries in notsobigdataModels.models instead, not their own var. See README.md\'s "The model kind" section.');
       }
       claimName(claimedNames, name, key);
-      if (dependsOn !== undefined && !Array.isArray(dependsOn)) {
-        throw new Error('cli(): node "' + name + '" has a "dependsOn" that is not an array - got ' + typeof dependsOn + '.');
-      }
-      // Normalized once, here, so "no dependsOn means no edges" is stated in
-      // one place instead of at each use. The copy matters: the node's edges
-      // must not alias the caller's array, which they could mutate later.
-      var edges = dependsOn ? dependsOn.slice() : [];
-      edges.forEach(function (dependency) {
-        if (typeof dependency !== 'string' || !dependency) {
-          throw new Error('cli(): node "' + name + '" has a "dependsOn" entry that is not a node name string.');
-        }
-      });
+      var edges = parseDependsOnList('cli(): node "' + name + '"', dependsOn);
       nodes.push({
         name: name,
         kind: kind,
@@ -2076,6 +2109,29 @@ var NotSoBigData = (function () {
       nodes.push(node);
     });
     return { nodes: nodes, ignored: ignored };
+  }
+
+  // Validates an optional dependsOn value and normalizes it to an edge list
+  // (no dependsOn means no edges). Shared by discoverNodes() below (a move
+  // node's own dependsOn) and model.js's expandModelNodes() (a model's
+  // hand-written dependsOn, unioned with its {{ ref() }}-derived edges) -
+  // same shape, same failure mode, validated once instead of twice. context
+  // is the caller's own error-message prefix (e.g. 'cli(): node "orders"' or
+  // 'model(): "orders_summary"'), so the thrown message still reads right
+  // for whichever caller hit it. The copy on the valid path matters: the
+  // node's edges must not alias the caller's array, which they could mutate
+  // later.
+  function parseDependsOnList(context, raw) {
+    if (raw !== undefined && !Array.isArray(raw)) {
+      throw new Error(context + ' has a "dependsOn" that is not an array - got ' + typeof raw + '.');
+    }
+    var edges = raw ? raw.slice() : [];
+    edges.forEach(function (dependency) {
+      if (typeof dependency !== 'string' || !dependency) {
+        throw new Error(context + ' has a "dependsOn" entry that is not a node name string.');
+      }
+    });
+    return edges;
   }
 
   // Every dependsOn entry must name a node that actually exists. Checked
