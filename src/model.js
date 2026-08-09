@@ -378,21 +378,31 @@ MODEL_TEST_REQUIRES.relationships = 'to';
 // test SQL - MODEL_TEST_COMPILERS below builds SQL text out of
 // config-supplied identifiers (test.column, test.field), and an unquoted
 // identifier that happens to be a reserved word (order, group, ...) would
-// otherwise break. Throws rather than stripping a stray backtick, since a
-// name that already contains one can't be safely quoted at all - same
-// "reject, don't guess" posture as every other config-shape check in this
-// file.
+// otherwise break. Throws rather than stripping a stray backtick or
+// backslash, since a name that already contains either can't be safely
+// quoted at all - a backtick-quoted identifier uses the same backslash
+// escape sequences a string literal does (see quoteSqlLiteral below), so
+// a trailing backslash could otherwise escape the closing backtick the
+// same way it can escape a string literal's closing quote. Same "reject,
+// don't guess" posture as every other config-shape check in this file -
+// a real BigQuery column name has no legitimate use for either character.
 function quoteIdentifier(name) {
-  if (name.indexOf('`') !== -1) {
-    throw new Error('model(): "' + name + '" is not a valid column/field name - it contains a backtick.');
+  if (name.indexOf('`') !== -1 || name.indexOf('\\') !== -1) {
+    throw new Error('model(): "' + name + '" is not a valid column/field name - it contains a backtick or backslash.');
   }
   return '`' + name + '`';
 }
 
 // Renders one accepted_values entry as a SQL literal - numbers/booleans
-// unquoted, strings single-quoted with an embedded "'" backslash-escaped
-// (valid GoogleSQL string-literal escaping, matching the useLegacySql:
-// false this whole file already runs under). Scoped narrowly to what
+// unquoted, strings single-quoted with a backslash escaped first, then an
+// embedded "'" (valid GoogleSQL string-literal escaping, matching the
+// useLegacySql: false this whole file already runs under). Escaping "\"
+// before "'" matters, not just for style: a value ending in an odd number
+// of backslashes would otherwise turn the escaped-quote sequence this
+// function emits for the *next* value into an escaped quote inside the
+// *current* one, closing the literal in the wrong place and letting
+// whatever text follows (the rest of a comma-joined values list) be
+// parsed as SQL instead of string content. Scoped narrowly to what
 // accepted_values needs (test.values is config-supplied text landing in
 // generated SQL, same trust model as everything else in this file), not a
 // general-purpose SQL serializer - nothing else needs one yet.
@@ -401,7 +411,7 @@ function quoteSqlLiteral(value) {
     return String(value);
   }
   if (typeof value === 'string') {
-    return '\'' + value.replace(/'/g, '\\\'') + '\'';
+    return '\'' + value.replace(/\\/g, '\\\\').replace(/'/g, '\\\'') + '\'';
   }
   throw new Error('model(): accepted_values "values" entries must be a string, number, or boolean - got ' + typeof value + '.');
 }
