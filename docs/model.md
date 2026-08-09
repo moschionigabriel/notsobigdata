@@ -76,45 +76,79 @@ Only `materialized` is supported today — an unrecognized key (or a second
 over the first) is a discovery-time error, caught by `cli('list')` the same
 way a bad `tests` entry is.
 
-### Reusing a value within one model: `{{ set(...) }}` / `{{ var(...) }}`
+### Reusing a value within one model: `{% set %}`
 
-A model can define one or more named values with `{{ set(...) }}` and read
-them back elsewhere in the *same* SQL with `{{ var(...) }}` — useful when
-one literal (a threshold, a date cutoff) needs to appear more than once in
-a query and you don't want the two copies to drift apart:
+A model can define one or more named values with `{% set key = 'value' %}`
+and read them back elsewhere in the *same* SQL as a bare `{{ key }}`
+reference — real Jinja statement syntax, the same way dbt itself uses
+`{% set %}` — useful when one literal (a threshold, a date cutoff) needs to
+appear more than once in a query and you don't want the two copies to
+drift apart:
 
 ```html
 <!-- orders_summary.html -->
 <script type="text/sql">
-  {{ set(min_amount='100') }}
+  {% set min_amount = '100' %}
   select customer_id, count(*) as order_count
   from {{ ref('stg_orders') }}
-  where amount > {{ var('min_amount') }}
+  where amount > {{ min_amount }}
   group by 1
-  having sum(amount) > {{ var('min_amount') }}
+  having sum(amount) > {{ min_amount }}
 </script>
 ```
 
-Both calls are stripped out of (`set`) or substituted into (`var`) the SQL
-that actually runs against BigQuery — same "read once during discovery,
-resolved before execution" treatment `{{ ref() }}`/`{{ config() }}` already
-get. `{{ var('min_amount') }}` substitutes the literal value `set()` gave
-it, raw and unquoted — if the value needs to be a SQL string literal, put
-the quotes in the `set()` value itself (e.g. `set(status="'active'")`) or
-around the `{{ var() }}` call in your SQL.
+The `{% set %}` statement is stripped out of the SQL that actually runs
+against BigQuery; every `{{ min_amount }}` reference is substituted with
+the raw, unquoted value it was given — if the value needs to be a SQL
+string literal, put the quotes in the `{% set %}` value itself (e.g.
+`{% set status = "'active'" %}`) or around the `{{ min_amount }}`
+reference in your SQL.
 
-A `{{ var(...) }}` referencing a name that was never `set()` anywhere in
-the model's SQL is a discovery-time error, same as an unrecognized
-`config()` key. Unlike `config()`, more than one `{{ set(...) }}` call is
-allowed in the same model — each may define a different name — but the
-same name can only be set once; a second definition (in the same call or a
-separate one) has no obvious precedence and is rejected the same way a
-second `config()` call is.
+A bare `{{ key }}` referencing a name that was never `{% set %}` anywhere
+in the model's SQL is a discovery-time error, same as an unrecognized
+`config()` key. More than one `{% set %}` statement is allowed in the same
+model — each may define a different name — but the same name can only be
+set once; a second definition has no obvious precedence and is rejected
+the same way a second `config()` call is.
 
-`{{ set(...) }}`/`{{ var(...) }}` are file-local: a value defined in one
-model's SQL isn't visible to any other model, and neither call creates a
-dependency edge — they exist purely to avoid repeating yourself within one
-query, not to parameterize a model from outside its own SQL.
+`{% set %}` is file-local: a value defined in one model's SQL isn't
+visible to any other model, and it creates no dependency edge — it exists
+purely to avoid repeating yourself within one query, not to parameterize a
+model from outside its own SQL. (For that, see `{{ var(...) }}` below.)
+Only a single-line, single string-literal assignment is supported — not a
+full Jinja expression on the right-hand side, and not the block
+`{% set x %}...{% endset %}` form.
+
+### Project-level values: `{{ var(...) }}`
+
+`{{ var('key') }}` reads a value from `notsobigdataModels.vars` — a flat
+dict of project-wide values, the model-SQL equivalent of dbt's
+`dbt_project.yml` `vars:` section:
+
+```javascript
+var notsobigdataModels = {
+  projectId: 'my-project', dataset: 'analytics',
+  vars: { region: 'US' },
+  models: {
+    orders_summary: {
+      // SQL: ... where region = {{ var('region') }}
+    }
+  }
+};
+```
+
+An optional second argument supplies a default for when the key isn't set
+in `vars`: `{{ var('region', 'US') }}` resolves to `'US'` even if
+`notsobigdataModels.vars` has no `region` key at all. `{{ var(...) }}`
+substitutes its value raw and unquoted, same posture `{% set %}`'s
+substitution has. A `{{ var(...) }}` call with no default, naming a key
+`vars` doesn't have, is a discovery-time error — same "fail loud before any
+BigQuery call" treatment every other model misconfiguration gets.
+
+`{{ var(...) }}` and `{% set %}` are unrelated features, on purpose — the
+same way they are in real dbt/Jinja. `{% set %}` is a value scoped to one
+model's own SQL; `{{ var(...) }}` is a value scoped to the whole project,
+declared once on the registry. Neither can read the other's values.
 
 Every model is then just another node: `cli('run')` picks up every entry in
 `notsobigdataModels.models` alongside your `move` nodes and orders the
@@ -243,12 +277,13 @@ already sitting in the real relation by the time you find out. There's no
 run against a relation that's already fully written, not an in-memory row
 array you can still filter.
 
-`{{ ref() }}`, `{{ config() }}`, `{{ set() }}` and `{{ var() }}` (see above)
-are the only template calls implemented so far — no `for`/`if` (those are
-block constructs, a materially bigger undertaking than a single-token
-call). Referencing a name that isn't a declared model, an undefined
-`var()`, or an unsupported template call, is an error, not something
-silently passed through as literal text into SQL that runs with your live
+`{{ ref() }}`, `{{ config() }}` and `{{ var() }}` are the only `{{ }}`
+calls implemented so far, alongside the `{% set %}` statement (see above)
+— no `for`/`if` (those are block constructs, a materially bigger
+undertaking than a single-line statement). Referencing a name that isn't a
+declared model, an undefined `{% set %}`/`var()`, or an unsupported
+template call, is an error, not something silently passed through as
+literal text into SQL that runs with your live
 BigQuery credentials.
 
 A model's SQL must be a single statement — no `;`-separated scripts, same
