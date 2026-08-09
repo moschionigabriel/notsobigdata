@@ -751,6 +751,15 @@ whole graph together, `cli('run --select model')` runs only models,
 something silently passed through as literal text into SQL that runs with
 your live BigQuery credentials.
 
+A model's `.html` file needs exactly one `<script type="text/sql">` tag,
+and its SQL must be a single statement — no `;`-separated scripts, same
+restriction `move`'s BigQuery connector places on its own SQL (models can
+still write, unlike `move`; this is about one statement, not read-only).
+Models are declared as entries in `notsobigdataModels.models`, never as
+their own `var { kind: 'model', ... }` — that shape is a `move` node's
+pattern, not a model's, and is rejected with a clear error rather than
+silently misbehaving.
+
 ## Scheduling
 
 There's no separate scheduler. A `cli('run')` call is an ordinary Apps

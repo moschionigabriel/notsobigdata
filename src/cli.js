@@ -57,6 +57,32 @@ function emptyMap() {
   return Object.create(null);
 }
 
+// Claims a node name against the shared map every discovery path
+// populates - the plain var-scan below and model.js's expandModelNodes()
+// fold-in both need "is this name already taken, and by what" to agree,
+// so the check and its error message live in one place instead of being
+// copy-pasted per discovery path.
+function claimName(claimedNames, name, variable) {
+  if (has(claimedNames, name)) {
+    throw new Error('cli(): two nodes are both named "' + name + '" (declared as "' + claimedNames[name] + '" and "' + variable + '"). Node names must be unique - set an explicit "name" on one of them.');
+  }
+  claimedNames[name] = variable;
+}
+
+// Guarded read of a single optional global - shared by every "config
+// object declared as a top-level var, or omitted entirely" reader in this
+// library (resolveManifestConfig/resolveLoggingConfig below, and
+// model.js's readModelsRegistry). Never throws because of a global this
+// library doesn't own, same reasoning discoverNodes()'s own scan already
+// applies to every global it walks past.
+function readOptionalGlobal(name) {
+  try {
+    return globalThis[name];
+  } catch (error) {
+    return undefined;
+  }
+}
+
 // Node lists appear in three different error messages and in hello()'s
 // output. Going through one helper keeps them rendering identically by
 // construction rather than by coincidence.
@@ -203,10 +229,19 @@ function discoverNodes() {
       ignored.push({ name: name, kind: kind, variable: key });
       return;
     }
-    if (has(claimedNames, name)) {
-      throw new Error('cli(): two nodes are both named "' + name + '" (declared as "' + claimedNames[name] + '" and "' + key + '"). Node names must be unique - set an explicit "name" on one of them.');
+    // model is a known kind but not one this scan can ever build a
+    // correct node for: its dependsOn comes from parsing {{ ref() }} out
+    // of its SQL (see expandModelNodes() below), which this loop has no
+    // way to do for a bare top-level var. Without this check, a var
+    // written this way - the shape an earlier version of this README
+    // documented - wouldn't be ignored (model is a real EXECUTORS entry
+    // now) and wouldn't fail loudly either: it would silently become a
+    // node with no derived edges at all, ordering wrong relative to
+    // whatever it actually ref()s.
+    if (kind === 'model') {
+      throw new Error('cli(): "' + key + '" is declared as a top-level var with kind "model" - models are declared as entries in notsobigdataModels.models instead, not their own var. See README.md\'s "The model kind" section.');
     }
-    claimedNames[name] = key;
+    claimName(claimedNames, name, key);
     if (dependsOn !== undefined && !Array.isArray(dependsOn)) {
       throw new Error('cli(): node "' + name + '" has a "dependsOn" that is not an array - got ' + typeof dependsOn + '.');
     }
@@ -236,10 +271,7 @@ function discoverNodes() {
   // node list and never has to know two different discovery mechanisms
   // produced it.
   expandModelNodes().forEach(function (node) {
-    if (has(claimedNames, node.name)) {
-      throw new Error('cli(): two nodes are both named "' + node.name + '" (declared as "' + claimedNames[node.name] + '" and "' + node.variable + '"). Node names must be unique - set an explicit "name" on one of them.');
-    }
-    claimedNames[node.name] = node.variable;
+    claimName(claimedNames, node.name, node.variable);
     nodes.push(node);
   });
   return { nodes: nodes, ignored: ignored };
@@ -460,12 +492,7 @@ function formatStatusCounts(results) {
 // because of something this library doesn't own. Every field is
 // optional; omitting the global entirely gives all three defaults.
 function resolveManifestConfig() {
-  var raw;
-  try {
-    raw = globalThis.notsobigdataManifest;
-  } catch (error) {
-    raw = undefined;
-  }
+  var raw = readOptionalGlobal('notsobigdataManifest');
   var config = (raw && typeof raw === 'object') ? raw : {};
   return {
     enabled: config.enabled !== false,
@@ -481,12 +508,7 @@ function resolveManifestConfig() {
 // nodes happened to succeed. Set true to restore an OK line for every
 // successful node too.
 function resolveLoggingConfig() {
-  var raw;
-  try {
-    raw = globalThis.notsobigdataLogging;
-  } catch (error) {
-    raw = undefined;
-  }
+  var raw = readOptionalGlobal('notsobigdataLogging');
   var config = (raw && typeof raw === 'object') ? raw : {};
   return { verbose: config.verbose === true };
 }

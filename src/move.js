@@ -198,6 +198,31 @@ function resolveBigQuerySql(source) {
   return readDriveFileText(source.queryFileId);
 }
 
+// Strips SQL comments and a trailing ";" - shared by assertReadOnlySelect
+// below and assertSingleStatement, so the two checks that read pipeline-
+// author-supplied SQL agree on what "the statement" is before either one
+// judges it.
+function stripSqlComments(sql) {
+  return sql
+    .replace(/--[^\n]*/g, '')
+    .replace(/\/\*[\s\S]*?\*\//g, '')
+    .trim()
+    .replace(/;\s*$/, '');
+}
+
+// Rejects multiple ";"-separated statements. Split out of
+// assertReadOnlySelect below so model() can reuse just this half - a
+// model is meant to write, so it has no read-only requirement to check,
+// but it should still reject a multi-statement script the same way move()
+// does. messagePrefix is the caller's own full "move(): ..."/"model(): ..."
+// lead-in, so the thrown message reads the same regardless of which
+// module raised it.
+function assertSingleStatement(sql, messagePrefix) {
+  if (stripSqlComments(sql).indexOf(';') !== -1) {
+    throw new Error(messagePrefix + ' must be a single statement - multi-statement scripts (separated by ";") are not allowed.');
+  }
+}
+
 // Guards against a piece of pipeline-author-supplied SQL doing anything
 // other than a single read statement. This is a footgun-preventing
 // keyword/shape check, not a security boundary: it only strips comments,
@@ -212,17 +237,11 @@ function resolveBigQuerySql(source) {
 // sqlTests[].query) rather than each one repeating this same check with
 // its own wording.
 function assertReadOnlySelect(sql, context) {
-  var stripped = sql
-    .replace(/--[^\n]*/g, '')
-    .replace(/\/\*[\s\S]*?\*\//g, '')
-    .trim()
-    .replace(/;\s*$/, '');
+  var stripped = stripSqlComments(sql);
   if (!/^(select|with)\b/i.test(stripped)) {
     throw new Error('move(): ' + context + ' must be a read-only SELECT (optionally starting with WITH). move() only extracts/asserts on data - transform or write logic belongs in model().');
   }
-  if (stripped.indexOf(';') !== -1) {
-    throw new Error('move(): ' + context + ' must be a single statement - multi-statement scripts (separated by ";") are not allowed.');
-  }
+  assertSingleStatement(sql, 'move(): ' + context);
 }
 
 // Runs a BigQuery query job (Jobs.query) to completion and returns

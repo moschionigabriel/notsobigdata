@@ -84,30 +84,39 @@ function parseSingleStringArgument(call, args) {
 // resolved config.
 var MODEL_DEFAULT_KEYS = ['projectId', 'dataset', 'materialized'];
 
-// Guarded read of the single notsobigdataModels global, same "never throw
-// because of a global this library doesn't own" pattern discoverNodes()
-// uses for every other global. Absent or malformed just means "no models
-// declared" - only a specific model *entry* being malformed is this
-// library's business, and that's checked in resolveModelConfig below,
-// once we know a caller actually wants that entry.
+// Guarded read of the single notsobigdataModels global, reusing cli.js's
+// readOptionalGlobal() - same "never throw because of a global this
+// library doesn't own" reasoning discoverNodes() applies to every other
+// global. Absent entirely means "no models declared" and returns quietly,
+// so a move-only project never notices this global exists. But once it
+// *is* declared, its shape is this library's business - unlike an
+// unrelated global that happens to exist, nobody else would coincidentally
+// declare something named notsobigdataModels, so a malformed one (an
+// array, a string, a models field that isn't itself a plain object) is a
+// clear mistake worth failing loudly on rather than silently treating the
+// same as "not declared at all". Only a specific model *entry* being
+// malformed is deferred to resolveModelConfig below, once we know a
+// caller actually wants that entry.
 function readModelsRegistry() {
-  var raw;
-  try {
-    raw = globalThis.notsobigdataModels;
-  } catch (error) {
-    raw = undefined;
+  var raw = readOptionalGlobal('notsobigdataModels');
+  if (raw === undefined) {
+    return { defaults: {}, models: {} };
+  }
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+    throw new Error('model(): notsobigdataModels must be an object - got ' + (Array.isArray(raw) ? 'an array' : typeof raw) + '.');
   }
   var defaults = {};
-  var models = {};
-  if (raw && typeof raw === 'object') {
-    MODEL_DEFAULT_KEYS.forEach(function (key) {
-      if (raw[key] !== undefined) {
-        defaults[key] = raw[key];
-      }
-    });
-    if (raw.models && typeof raw.models === 'object' && !Array.isArray(raw.models)) {
-      models = raw.models;
+  MODEL_DEFAULT_KEYS.forEach(function (key) {
+    if (raw[key] !== undefined) {
+      defaults[key] = raw[key];
     }
+  });
+  var models = {};
+  if (raw.models !== undefined) {
+    if (!raw.models || typeof raw.models !== 'object' || Array.isArray(raw.models)) {
+      throw new Error('model(): notsobigdataModels.models must be an object - got ' + (Array.isArray(raw.models) ? 'an array' : typeof raw.models) + '.');
+    }
+    models = raw.models;
   }
   return { defaults: defaults, models: models };
 }
@@ -148,18 +157,33 @@ function resolveModelConfig(name) {
 // that lives in the Apps Script project itself, unlike move.js's
 // readDriveFileText (a Drive file, found by id) - models are project
 // source, not a data source.
+//
+// createHtmlOutputFromFile() takes the file's name as registered in the
+// project, which Google's own examples always give without the ".html"
+// extension (e.g. HtmlService.createHtmlOutputFromFile('Dialog') for a
+// file created as "Dialog.html") - sqlFile keeps its extension as a
+// config value, since "a model's SQL file" reads more naturally that way
+// and matches every fixture/example in this repo, but it's stripped here
+// before the actual API call so this matches the documented contract
+// rather than depending on any leniency the runtime may or may not have.
 function readModelSql(sqlFile) {
+  var scriptFileName = sqlFile.replace(/\.html$/i, '');
   var html;
   try {
-    html = HtmlService.createHtmlOutputFromFile(sqlFile).getContent();
+    html = HtmlService.createHtmlOutputFromFile(scriptFileName).getContent();
   } catch (error) {
     throw new Error('model(): could not read "' + sqlFile + '" - ' + error.message + '. Every model needs a matching .html file with a <script type="text/sql"> tag - see README.md\'s "The model kind" section.');
   }
-  var match = /<script[^>]*type=["']text\/sql["'][^>]*>([\s\S]*?)<\/script>/i.exec(html);
-  if (!match) {
-    throw new Error('model(): "' + sqlFile + '" has no <script type="text/sql"> tag.');
+  var pattern = /<script[^>]*type=["']text\/sql["'][^>]*>([\s\S]*?)<\/script>/gi;
+  var matches = [];
+  var match;
+  while ((match = pattern.exec(html))) {
+    matches.push(match[1]);
   }
-  return match[1].trim();
+  if (matches.length !== 1) {
+    throw new Error('model(): "' + sqlFile + '" must have exactly one <script type="text/sql"> tag - found ' + matches.length + '.');
+  }
+  return matches[0].trim();
 }
 
 // The dependency-derivation hook: a model's ref() calls *are* its edges,
@@ -213,17 +237,22 @@ function resolveMaterialized(config) {
 // for why models need this instead of being found by that scan directly.
 // Absent notsobigdataModels means "no models declared", not an error:
 // this returns [] and a move-only project never notices model.js exists.
+//
+// Stashes the SQL it had to read anyway (to derive dependsOn) onto the
+// node's config, so model() below - which runs later, once this node's
+// turn comes up in cli()'s run loop - reuses it instead of asking
+// HtmlService for the same file a second time.
 function expandModelNodes() {
   var registry = readModelsRegistry();
   return Object.keys(registry.models).map(function (name) {
     var config = resolveModelConfig(name);
-    var sql = readModelSql(config.sqlFile);
+    config.sql = readModelSql(config.sqlFile);
     return {
       name: name,
       kind: 'model',
       variable: 'notsobigdataModels.models.' + name,
       config: config,
-      dependsOn: extractRefDependencies(sql)
+      dependsOn: extractRefDependencies(config.sql)
     };
   });
 }
@@ -231,9 +260,19 @@ function expandModelNodes() {
 // The EXECUTORS.model entry: compiles the model's SQL (substituting every
 // ref()) and materializes it as a view or table. Deliberately does not
 // call move.js's assertReadOnlySelect - that guard exists to keep move()
-// read-only, and a model's whole job is writing.
+// read-only, and a model's whole job is writing. It does reuse
+// assertSingleStatement, move.js's other SQL-shape guard: a model can
+// write, but a stray ";" splitting its SQL into more than one statement
+// is a mistake either way, not a second statement this library intends
+// to run.
+//
+// config.sql is always already set by expandModelNodes() above by the
+// time this runs - every model node comes from there (discoverNodes()
+// rejects a hand-declared kind: 'model' var, see cli.js), so there's no
+// path into this function without it.
 function model(config) {
-  var sql = readModelSql(config.sqlFile);
+  var sql = config.sql;
+  assertSingleStatement(sql, 'model(): "' + config.name + '"');
   var compiled = compileModelSql(sql, function (refName) {
     return qualifiedRelation(resolveModelConfig(refName));
   });
