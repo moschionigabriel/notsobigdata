@@ -4,9 +4,12 @@
 // time with HtmlService because .html is the only plain-text file Apps
 // Script lets a project hold. Models reference each other dbt-style, with
 // {{ ref('other_model') }} placeholders inside the SQL. Those refs *are*
-// the dependency declaration: a model never writes its own dependsOn, and
-// they get substituted with the real table identifier just before the
-// SQL runs.
+// the model-to-model dependency declaration - a model never hand-writes
+// dependsOn for another *model*, and refs get substituted with the real
+// table identifier just before the SQL runs. A model can still have its
+// own hand-written dependsOn for a non-model (move) dependency ref()
+// can't reach - see MODEL_DEFAULT_KEYS and mergeDependsOn() below, and
+// docs/model.md's "Depending on a move node" for the user-facing version.
 //
 // A model's .html file can hold its SQL three ways, chosen by how many
 // <script type="text/sql"> tags it contains - see extractModelSql() below:
@@ -99,10 +102,9 @@ function parseSingleStringArgument(call, args) {
 // this" is a real shape (e.g. a shared staging load) - and it gets the
 // override behavior below (an entry's own dependsOn replaces the
 // registry's, not merges with it) for free, the same way materialized
-// already does. That override is deliberately about *this* value only:
-// expandModelNodes() below still always unions whichever dependsOn wins
-// here with the model's own {{ ref() }}-derived edges - dependsOn can
-// never suppress a real ref().
+// already does. (Union-with-ref() semantics - dependsOn can never
+// suppress a real ref() - are enforced separately in mergeDependsOn()
+// below, not by this override.)
 var MODEL_DEFAULT_KEYS = ['projectId', 'dataset', 'materialized', 'dependsOn'];
 
 // Guarded read of the single notsobigdataModels global, reusing cli.js's
@@ -417,8 +419,15 @@ function expandModelNodes() {
         throw new Error(cached.error);
       }
       config.sql = extractModelSql(cached.content, config.sqlFile, name);
-      node.config = config;
+      // Computed from config.dependsOn (whichever hand-written value won
+      // MODEL_DEFAULT_KEYS's override), then deleted off config - node.config
+      // must not keep its own, pre-merge "dependsOn" once node.dependsOn
+      // holds the real, merged edges below; two dependsOn-shaped values on
+      // one node, disagreeing with each other, is exactly the kind of stale
+      // state that confuses whoever inspects a node's config next.
       var handWritten = parseDependsOnList('model(): "' + name + '"', config.dependsOn);
+      delete config.dependsOn;
+      node.config = config;
       node.dependsOn = mergeDependsOn(extractRefDependencies(config.sql), handWritten);
     } catch (error) {
       node.discoveryError = error.message;
