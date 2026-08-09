@@ -215,26 +215,41 @@ var NotSoBigData = (function () {
   }
 
   // Mirrors extractDriveXlsx's temp-Google-Sheet trick, but starting from a
-  // fetched blob instead of an existing Drive file id: Drive.Files.insert
-  // converts on upload when given a GOOGLE_SHEETS mimeType, same as
-  // Files.copy does on an existing file. The temp file lives in the user's
-  // own Drive only for the duration of this call and is always removed,
-  // including on error, so a failed conversion never leaves an orphan
-  // behind - same guarantee extractDriveXlsx makes for its own temp copy.
+  // fetched blob instead of an existing Drive file id. Getting from "a blob"
+  // to "a Drive file id" needs a plain DriveApp upload first (no conversion,
+  // just bytes) - Drive.Files.insert would do that upload *and* the GOOGLE_
+  // SHEETS conversion in one call, but insert is Drive API v2 only; v3 (what
+  // a newly-enabled Advanced Drive Service defaults to today) renamed it to
+  // Files.create, and guessing which one a consumer's appsscript.json has
+  // enabled is exactly the kind of version split extractDriveXlsx's own
+  // name/title comment already works around for metadata fields - but there
+  // there's no method-name equivalent to fall back to. So this reuses the
+  // same DriveApp.createFile + Drive.Files.copy pair loadDriveXlsx already
+  // proves works project-wide (SpreadsheetApp.create there, DriveApp.
+  // createFile here - either way, a plain create followed by Drive.Files.copy
+  // doing the conversion), rather than adding a second untested code path.
+  // Both temp files - the raw upload and the converted sheet - are removed
+  // in nested finally blocks, including on error, so a failure at either
+  // step never leaves an orphan behind.
   function extractUrlXlsx(url, options) {
     var response = UrlFetchApp.fetch(url, options || {});
     assertHttpOk(response, 'move(): url source request to "' + url + '" failed');
     var tempFileName = 'notsobigdata-xlsx-import-' + Utilities.getUuid();
-    var tempFileMetadata = Drive.Files.insert(
-      { name: tempFileName, title: tempFileName, mimeType: MimeType.GOOGLE_SHEETS },
-      response.getBlob()
-    );
+    var rawFileId = DriveApp.getRootFolder().createFile(response.getBlob().setName(tempFileName)).getId();
     try {
-      var spreadsheet = SpreadsheetApp.openById(tempFileMetadata.id);
-      var values = spreadsheet.getActiveSheet().getDataRange().getValues();
-      return isBlankGrid(values) ? [] : values;
+      var tempFileMetadata = Drive.Files.copy(
+        { name: tempFileName, title: tempFileName, mimeType: MimeType.GOOGLE_SHEETS },
+        rawFileId
+      );
+      try {
+        var spreadsheet = SpreadsheetApp.openById(tempFileMetadata.id);
+        var values = spreadsheet.getActiveSheet().getDataRange().getValues();
+        return isBlankGrid(values) ? [] : values;
+      } finally {
+        Drive.Files.remove(tempFileMetadata.id);
+      }
     } finally {
-      Drive.Files.remove(tempFileMetadata.id);
+      Drive.Files.remove(rawFileId);
     }
   }
 
