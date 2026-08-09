@@ -1411,6 +1411,51 @@ function expandModelNodes(otherNodes) {
 // caught - see modelTableStaged()'s own comment for the fix and why the
 // previous "would double BigQuery compute" reasoning here didn't hold).
 //
+// The ref()-resolution closure both model() and compileModel() need:
+// a name resolves against either a declared model (via
+// resolveModelConfig()+qualifiedRelation()) or a bigquery-target move node
+// (config.moveRefTargets, already resolved and validated once by
+// expandModelNodes() at discovery time - see its own comment). Extracted
+// out of model() rather than duplicated into compileModel() below, since
+// the two functions differ only in what they do with the compiled SQL
+// (run it vs. return it), not in how a ref() gets substituted.
+//
+// Not a model - must be a bigquery-target move node lookup, which is a
+// cheap lookup, not a fresh resolution - same "redundant re-validation,
+// cheap defense in depth" posture the model branch already has via
+// resolveModelConfig's own throw. Unreachable in practice (discovery
+// already rejects anything that wouldn't resolve here), but a node's own
+// config could in principle be mutated between discovery and run, so this
+// still throws rather than substituting undefined into a live BigQuery
+// statement.
+function buildRefResolver(config, registry) {
+  return function (refName) {
+    if (has(registry.models, refName)) {
+      return qualifiedRelation(resolveModelConfig(refName, registry));
+    }
+    if (has(config.moveRefTargets, refName)) {
+      return config.moveRefTargets[refName];
+    }
+    throw new Error('model(): "' + config.name + '" has {{ ref(\'' + refName + '\') }}, which does not match a declared model or a move node with a bigquery target.');
+  };
+}
+
+// The EXECUTORS.compile entry (see cli.js's COMPILERS map): resolves a
+// model's SQL exactly the way model() itself is about to, right down to
+// reusing the same buildRefResolver()/compileModelSql() calls, but stops
+// there and returns the compiled text instead of ever calling BigQuery -
+// this is cli('compile')'s whole point, the same "resolve Jinja, touch
+// nothing" job dbt's own `dbt compile` does. Kept as a second function
+// rather than a flag on model() itself, since the two have different
+// return shapes (a compiled string vs. a materialization result) and
+// model() already has enough branches (staged vs. direct, tested vs. not).
+function compileModel(config) {
+  var sql = config.sql;
+  assertSingleStatement(sql, 'model(): "' + config.name + '"');
+  var registry = readModelsRegistry();
+  return compileModelSql(sql, buildRefResolver(config, registry), registry);
+}
+
 // config.sql is always already set by expandModelNodes() above by the
 // time this runs. A node whose own discovery failed instead carries a
 // node-level discoveryError, which cli.js's runNodes() checks and reports
@@ -1421,24 +1466,7 @@ function model(config) {
   var sql = config.sql;
   assertSingleStatement(sql, 'model(): "' + config.name + '"');
   var registry = readModelsRegistry();
-  var compiled = compileModelSql(sql, function (refName) {
-    if (has(registry.models, refName)) {
-      return qualifiedRelation(resolveModelConfig(refName, registry));
-    }
-    // Not a model - must be a bigquery-target move node, already resolved
-    // and validated once by expandModelNodes() at discovery time (see its
-    // own comment), so this is a cheap lookup, not a fresh resolution -
-    // same "redundant re-validation, cheap defense in depth" posture the
-    // model branch above already has via resolveModelConfig's own throw.
-    // Unreachable in practice (discovery already rejects anything that
-    // wouldn't resolve here), but a node's own config could in principle be
-    // mutated between discovery and run, so this still throws rather than
-    // substituting undefined into a live BigQuery statement.
-    if (has(config.moveRefTargets, refName)) {
-      return config.moveRefTargets[refName];
-    }
-    throw new Error('model(): "' + config.name + '" has {{ ref(\'' + refName + '\') }}, which does not match a declared model or a move node with a bigquery target.');
-  }, registry);
+  var compiled = compileModelSql(sql, buildRefResolver(config, registry), registry);
   var relation = qualifiedRelation(config);
   var materialized = resolveMaterialized(config);
   var hasTests = !!(config.tests && config.tests.length);

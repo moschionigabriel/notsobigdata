@@ -29,6 +29,19 @@ var EXECUTORS = {
   model: model
 };
 
+// The compile-time counterpart to EXECUTORS, consulted only by
+// cli('compile') (see runNodes()'s 'compile' branch below). Not every kind
+// has something to compile - move has no {{ }}-style templating, so a move
+// node under cli('compile') just reports 'planned' with no compiledSql,
+// the same as it already does under cli('list'). Deliberately its own
+// small map rather than folded into EXECUTORS: EXECUTORS answers "how do I
+// run this kind for real", COMPILERS answers a different, narrower
+// question ("can this kind's SQL be resolved without running it") that
+// only 'model' can answer yes to today.
+var COMPILERS = {
+  model: compileModel
+};
+
 function knownKinds() {
   return Object.keys(EXECUTORS);
 }
@@ -108,7 +121,7 @@ function nodeLabel(node) {
   return node.name + ' (' + node.kind + ')';
 }
 
-var COMMANDS = ['run', 'list', 'hello', 'help'];
+var COMMANDS = ['run', 'list', 'compile', 'hello', 'help'];
 
 function usage() {
   return [
@@ -119,6 +132,7 @@ function usage() {
     '  cli("run --select a,b")        run only the named nodes',
     '  cli("run --exclude a")         run everything except the named nodes',
     '  cli("list")                    show what would run, in order, without running it',
+    '  cli("compile")                 resolve model SQL ({{ ref() }}/var()/config()) without running anything',
     '  cli("hello")                   check the library loaded and see which nodes it can find',
     '  cli("help")                    this message',
     '',
@@ -443,13 +457,13 @@ function orderNodes(nodes) {
 //
 // START logs immediately before the one branch that can actually take
 // real time - the EXECUTORS[node.kind] call - not before the blocked-check
-// or the dry-run check above it, since neither of those waits on anything:
-// a skipped or planned node is decided instantly, so a START line there
-// would never carry the "is this still working" signal it exists for. That
-// signal matters for real execution (a BigQuery job can poll for tens of
-// seconds) - without it, a human watching the Apps Script log during a
-// long run can only see which nodes have already finished, never which one
-// is currently in flight.
+// or the dry-run/compile checks above it, since none of those waits on
+// anything: a skipped, planned or compiled node is decided instantly, so a
+// START line there would never carry the "is this still working" signal it
+// exists for. That signal matters for real execution (a BigQuery job can
+// poll for tens of seconds) - without it, a human watching the Apps Script
+// log during a long run can only see which nodes have already finished,
+// never which one is currently in flight.
 //
 // SKIP and FAIL always log - they're exactly what needs a human's
 // attention. OK only logs when verbose is true: nothing failed is already
@@ -460,7 +474,18 @@ function orderNodes(nodes) {
 // verbose defaults false (see resolveLoggingConfig()) precisely so a
 // normal run's console output stays proportional to what needs attention,
 // not to how many nodes happened to succeed.
-function runNodes(nodes, dryRun, verbose) {
+//
+// command is one of 'run', 'list' or 'compile' - not a bare dryRun boolean,
+// since 'list' and 'compile' are both "don't touch BigQuery/Sheets/Drive"
+// modes but differ in what they report: 'list' always reports 'planned'
+// with nothing else attached, kind-agnostically; 'compile' additionally
+// resolves a model's SQL via COMPILERS (see its own comment above
+// EXECUTORS) for any kind that has something to compile, attaching the
+// result as compiledSql on the same 'planned' status, and treating a
+// compile failure the same way a real run failure is treated - it blocks
+// dependents transitively via the same `blocked` map, rather than needing
+// a parallel skip mechanism just for this mode.
+function runNodes(nodes, command, verbose) {
   var results = [];
   var blocked = emptyMap();
   nodes.forEach(function (node) {
@@ -469,12 +494,12 @@ function runNodes(nodes, dryRun, verbose) {
     // configuration is bad, discovered while building the graph, well
     // before any node's turn to actually run. Checked here, kind-
     // agnostically (a plain node-level field, not something only model
-    // nodes could have), and ahead of the dryRun branch below: the whole
-    // point of a "list" dry run is surfacing a config mistake before
-    // anything executes for real, and this error is already fully known
-    // with nothing to execute to see it - reporting it only on a real
-    // "run" would make "list" strictly less useful for exactly the
-    // errors that are cheapest to catch early.
+    // nodes could have), and ahead of the dry-run/compile branches below:
+    // the whole point of a "list"/"compile" dry run is surfacing a config
+    // mistake before anything executes for real, and this error is already
+    // fully known with nothing to execute to see it - reporting it only on
+    // a real "run" would make "list"/"compile" strictly less useful for
+    // exactly the errors that are cheapest to catch early.
     if (node.discoveryError) {
       blocked[node.name] = true;
       results.push({ name: node.name, kind: node.kind, status: 'failed', error: node.discoveryError });
@@ -488,7 +513,24 @@ function runNodes(nodes, dryRun, verbose) {
       Logger.log('SKIP  ' + nodeLabel(node) + ' - waiting on ' + blockers.join(', '));
       return;
     }
-    if (dryRun) {
+    if (command === 'compile') {
+      if (!has(COMPILERS, node.kind)) {
+        results.push({ name: node.name, kind: node.kind, status: 'planned' });
+        Logger.log('PLAN  ' + nodeLabel(node));
+        return;
+      }
+      try {
+        var compiledSql = COMPILERS[node.kind](node.config);
+        results.push({ name: node.name, kind: node.kind, status: 'planned', compiledSql: compiledSql });
+        Logger.log('PLAN  ' + nodeLabel(node) + ' - compiled');
+      } catch (error) {
+        blocked[node.name] = true;
+        results.push({ name: node.name, kind: node.kind, status: 'failed', error: error.message });
+        Logger.log('FAIL  ' + nodeLabel(node) + ' - ' + error.message);
+      }
+      return;
+    }
+    if (command === 'list') {
       results.push({ name: node.name, kind: node.kind, status: 'planned' });
       Logger.log('PLAN  ' + nodeLabel(node));
       return;
@@ -585,6 +627,14 @@ function summarizeNodeResult(result) {
   } else if (result.status === 'failed') {
     summary.ms = result.ms;
     summary.error = result.error;
+  } else if (result.status === 'planned') {
+    // Only cli('compile') ever sets this - cli('list')'s own 'planned'
+    // results never carry a compiledSql, and 'list' never calls
+    // buildManifest() at all (see cli()'s dispatch below), so this branch
+    // is a no-op for every manifest except the compile one.
+    if (result.compiledSql !== undefined) {
+      summary.compiledSql = result.compiledSql;
+    }
   } else if (result.status === 'success') {
     summary.ms = result.ms;
     if (Array.isArray(result.result)) {
@@ -658,6 +708,51 @@ function writeManifest(commandText, ok, results, ignored) {
   }
 }
 
+// Reads the optional notsobigdataCompileManifest global, same guarded
+// pattern and shape as resolveManifestConfig() above - a deliberately
+// separate global, not a second field on notsobigdataManifest, so
+// configuring (or disabling) the compile manifest can never accidentally
+// touch the run manifest's own settings. Different default fileName for
+// the same reason: the two are meant to coexist as two files, not fight
+// over one.
+function resolveCompileManifestConfig() {
+  var raw = readOptionalGlobal('notsobigdataCompileManifest');
+  var config = (raw && typeof raw === 'object') ? raw : {};
+  return {
+    enabled: config.enabled !== false,
+    folderId: typeof config.folderId === 'string' && config.folderId ? config.folderId : null,
+    fileName: typeof config.fileName === 'string' && config.fileName ? config.fileName : 'notsobigdata-compile-manifest.json'
+  };
+}
+
+// cli('compile')'s counterpart to writeManifest() above - same
+// upsert-by-name Drive write, same best-effort/never-throw contract, same
+// "every outcome gets a Logger.log line" reasoning - but to its own file,
+// via resolveCompileManifestConfig() rather than resolveManifestConfig().
+// A compile pass never touches BigQuery/Sheets/Drive, so it must never
+// overwrite the run manifest's own record of what the last real run
+// actually did - see docs/cli.md's "The compile manifest" for the
+// user-facing version of this reasoning.
+function writeCompileManifest(commandText, ok, results, ignored) {
+  var config = resolveCompileManifestConfig();
+  if (!config.enabled) {
+    Logger.log('COMPILE MANIFEST skipped - notsobigdataCompileManifest.enabled is false');
+    return { written: false, reason: 'disabled' };
+  }
+  try {
+    var folderId = resolveManifestFolderId(config.folderId);
+    var manifest = buildManifest(commandText, ok, results, ignored);
+    var target = { folderId: folderId, fileName: config.fileName, upsertByName: true };
+    var fileId = resolveDriveWriteTarget(target);
+    fileId = writeDriveText(fileId, target, JSON.stringify(manifest, null, 2), MimeType.PLAIN_TEXT);
+    Logger.log('COMPILE MANIFEST written to ' + fileId);
+    return { written: true, fileId: fileId };
+  } catch (error) {
+    Logger.log('COMPILE MANIFEST failed - ' + error.message);
+    return { written: false, reason: 'error', error: error.message };
+  }
+}
+
 // The smoke test. This is the first thing to run when anything looks
 // wrong, so it is the one command that never throws: it has to be able
 // to report "I found nothing" as a finding rather than as a failure,
@@ -692,8 +787,8 @@ function hello() {
 }
 
 // The single public entrypoint. Takes one command string and returns
-// either a run report (for "run"/"list") or a message string (for
-// "hello"/"help").
+// either a run report (for "run"/"list"/"compile") or a message string
+// (for "hello"/"help").
 //
 // Logs "START"/"DONE" bookends around every call, padded to the same
 // six characters as runNodes()'s own "OK"/"FAIL"/"SKIP"/"PLAN" labels so
@@ -701,9 +796,9 @@ function hello() {
 // thing this function does, before parseCommand() - so a call that
 // throws immediately (an unknown command, zero discovered nodes) still
 // leaves a marker that cli() actually ran, not silence up to the error.
-// "DONE" only fires for "run"/"list": hello()/help() already log their
-// own single result line and have no per-node pass/fail/skip status to
-// roll up. Both are pure Logger.log side effects - report is unchanged.
+// "DONE" only fires for "run"/"list"/"compile": hello()/help() already log
+// their own single result line and have no per-node pass/fail/skip status
+// to roll up. Both are pure Logger.log side effects - report is unchanged.
 function cli(input) {
   Logger.log('START cli("' + input + '")');
   var parsed = parseCommand(input);
@@ -725,7 +820,7 @@ function cli(input) {
     throw new Error('cli(): the selection matched no nodes. Run cli("list") to see everything available.');
   }
   var ordered = orderNodes(selected);
-  var results = runNodes(ordered, parsed.command === 'list', resolveLoggingConfig().verbose);
+  var results = runNodes(ordered, parsed.command, resolveLoggingConfig().verbose);
   var ok = results.every(function (result) { return result.status !== 'failed' && result.status !== 'skipped'; });
   Logger.log('DONE  cli("' + input + '") - ' + formatStatusCounts(results) + ' (' + results.length + ' total).');
   var report = {
@@ -734,11 +829,16 @@ function cli(input) {
     nodes: results,
     ignored: discovered.ignored
   };
-  // Only "run" writes a manifest - "list" is a dry run where nothing
-  // executed, and overwriting the last real run's record with a no-op
-  // would defeat the "reflects what actually happened" point of it.
+  // "run" and "compile" each write their own manifest; "list" writes
+  // neither - it's a pure dry run with nothing, not even compiled SQL, to
+  // record. "compile" gets a *separate* file from "run" (writeCompileManifest,
+  // not writeManifest) rather than sharing one: a compile pass never
+  // touches BigQuery/Sheets/Drive, so it must never overwrite the run
+  // manifest's own record of what the last real run actually did.
   if (parsed.command === 'run') {
     report.manifest = writeManifest(input, ok, results, discovered.ignored);
+  } else if (parsed.command === 'compile') {
+    report.manifest = writeCompileManifest(input, ok, results, discovered.ignored);
   }
   return report;
 }
