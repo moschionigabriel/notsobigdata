@@ -118,6 +118,7 @@ NotSoBigData.cli('run --select a,b')        // run only these, ordered among the
 NotSoBigData.cli('run --exclude a')         // run everything except these
 NotSoBigData.cli('list')                    // show what would run, in order — runs nothing
 NotSoBigData.cli('compile')                 // resolve model SQL, without running anything
+NotSoBigData.cli('debug')                   // check OAuth scopes/services per connector, without writing anything
 NotSoBigData.cli('hello')                   // check the library loaded and see what it can find
 NotSoBigData.cli('help')                    // the command list
 ```
