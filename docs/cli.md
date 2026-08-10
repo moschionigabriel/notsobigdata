@@ -20,6 +20,8 @@ NotSoBigData.cli('run --exclude a')         // run everything except these
 NotSoBigData.cli('list')                    // show what would run, in order — runs nothing
 NotSoBigData.cli('compile')                 // resolve model SQL, without running anything
 NotSoBigData.cli('compile --select orders') // resolve just that model's SQL
+NotSoBigData.cli('debug')                   // check OAuth scopes/services per connector, without writing anything
+NotSoBigData.cli('debug --select orders')   // check just that node's connector(s)
 NotSoBigData.cli('hello')                   // check the library loaded and see what it can find
 NotSoBigData.cli('help')                    // the command list
 ```
@@ -76,10 +78,93 @@ A `move` node has no `{{ }}`-style templating to resolve, so it's reported
 `planned` under `compile` exactly the way it already is under `list` — no
 `compiledSql`, nothing else attached. Only `model` nodes get one.
 
+### cli('debug') — check your OAuth scopes/services before cli('run') does
+
+This exists because of how the library installs. Apps Script normally
+auto-detects which OAuth scopes and Advanced Services a project needs by
+scanning that project's own `.gs` files for the calls that need them — the
+reason you don't usually have to hand-edit `appsscript.json` yourself. But
+notsobigdata is installed with `eval(UrlFetchApp.fetch(...).getContentText())`
+(see the [README](../README.md)'s "Installation"), so the `DriveApp` /
+`SpreadsheetApp` / `BigQuery` / `UrlFetchApp` calls this library makes live
+inside a string that scan never sees. The scope or service they need can
+end up missing from your project with no authorization prompt ever shown
+for it — the first sign is usually a bare permission error buried inside a
+real `cli('run')`. `cli('debug')` checks for that gap directly, connector by
+connector, before you're relying on a real run to find it.
+
+```javascript
+NotSoBigData.cli('debug')                 // check every node's connector(s)
+NotSoBigData.cli('debug --select orders') // just that node's
+```
+
+For every selected node, `debug` checks each connector it declares — a
+`move` node's `source` and `target`, or a `model` node's implicit BigQuery
+target — and reports one of:
+
+| Status | Meaning |
+| --- | --- |
+| `ok` | The connector responded — scope/service is fine. |
+| `missing_scope` | The call was rejected for what looks like a permission/scope reason. The message names the underlying error and reminds you to add the scope to `appsscript.json` by hand (see above — a re-authorization prompt won't add it for you). |
+| `service_not_enabled` | BigQuery only. The `BigQuery` Advanced Service itself isn't turned on for this project — a different switch from an OAuth scope (Apps Script editor → Services → add "BigQuery API", and confirm the BigQuery API is enabled on the linked GCP project). |
+| `error` | Something else went wrong (e.g. a real 404 on a resource that doesn't exist) — not treated as a scope problem. |
+| `unverifiable` | A `custom` source/target calls your own function. `debug` has no way to know what services it uses, so it isn't checked. |
+
+**`debug` never writes.** A source connector's check is (as close as
+possible to) the real read `move()` would do — `url`/`api` sources are
+already GET-only, so checking one *is* the real request. A target
+connector's check is a read-only stand-in for the same resource instead:
+opening a spreadsheet/file/folder rather than writing to it, reading
+BigQuery dataset metadata rather than running a load job. The one
+compromise is an `api` target: its real call (`loadApi`) always POSTs a
+JSON body, so `debug` sends a GET to the same URL instead, to avoid
+re-triggering whatever your endpoint does on POST. That means a POST-only
+endpoint reads back as reachable-but-non-2xx, not as an auth failure —
+`debug` only cares whether `UrlFetchApp` itself was allowed to make the
+call, not what status code came back.
+
+A `model` node with a broken SQL file/config (a `discoveryError` — the same
+thing `cli('list')`/`cli('compile')` already surface) reports `error` for
+its BigQuery check too, since the `projectId`/`dataset` it would check
+against are only resolved once every other discovery-time check on that
+model has already passed.
+
+`debug` returns its own report shape, not the `nodes[]` shape `run`/
+`list`/`compile` share, and writes no manifest — it's a diagnostic dry run,
+not a record of pipeline output:
+
+```javascript
+{
+  ok: false,
+  command: 'debug',
+  checks: [
+    { node: 'rawOrders', kind: 'move',  role: 'source', type: 'sheets',   status: 'ok',            message: 'opened spreadsheet ...' },
+    { node: 'rawOrders', kind: 'move',  role: 'target', type: 'bigquery', status: 'missing_scope',  message: 'bigquery target: ... - Apps Script only auto-adds ...' },
+    { node: 'orders',    kind: 'model', role: 'target', type: 'bigquery', status: 'service_not_enabled', message: 'BigQuery is not available as a "BigQuery" service ...' }
+  ],
+  ignored: []
+}
+```
+
+`ok` is `true` only when every check is `ok` or `unverifiable`. The
+execution log gets one line per check — `OK`/`SKIP`/`FAIL`, reusing the
+same prefixes `run` already uses, `SKIP` standing in for `unverifiable`
+since a custom connector was deliberately not checked rather than found
+broken:
+
+```
+START cli("debug")
+OK    rawOrders (move) source (sheets) - opened spreadsheet ...
+FAIL  rawOrders (move) target (bigquery) - bigquery target: ...
+SKIP  loadToWebhook (move) target (custom) - custom target calls your own "fn" - cli('debug') has no way to know what services it uses.
+DONE  cli("debug") - 1 ok, 1 missing scope, 1 unverifiable (3 total).
+```
+
 ### What cli() returns
 
-`hello` and `help` return their message as a string. `run`, `list` and
-`compile` all return a report:
+`hello` and `help` return their message as a string. `debug` returns its
+own report shape — see [above](#clidebug-check-your-oauth-scopesservices-before-clirun-does).
+`run`, `list` and `compile` share this one:
 
 ```javascript
 {
@@ -121,7 +206,10 @@ way a real run failure does:
 ```
 
 `manifest` is present on `run` and `compile`, never `list` (a pure dry run
-with nothing, not even compiled SQL, to record), and is always one of:
+with nothing, not even compiled SQL, to record) or `debug` (a diagnostic
+check, not a record of pipeline output — see [its own section
+above](#clidebug-check-your-oauth-scopesservices-before-clirun-does)), and
+is always one of:
 
 ```javascript
 { written: true, fileId: '...' }                      // wrote/overwrote the manifest file
@@ -158,7 +246,13 @@ manifest](#the-run-manifest) below, whether or not it hits the console.
 `cli('list')`'s dry run only ever logs one `PLAN` line per node — nothing
 executes, so there's no "in progress" to signal. `cli('compile')` logs the
 same `PLAN` line (with " - compiled" appended for a `model` node that
-resolved successfully), or `FAIL` for one that didn't.
+resolved successfully), or `FAIL` for one that didn't. `cli('debug')` logs
+one `OK`/`FAIL`/`SKIP` line per connector checked (not per node — a `move`
+node with both a `source` and a `target` gets two lines), reusing those
+same three prefixes; `SKIP` means a `custom` connector wasn't checked, not
+that anything failed. See [its own section
+above](#clidebug-check-your-oauth-scopesservices-before-clirun-does) for
+the full log example.
 
 Want the full detail back, e.g. while actively debugging a run? Set
 `verbose: true`:
