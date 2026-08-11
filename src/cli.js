@@ -29,6 +29,19 @@ var EXECUTORS = {
   model: model
 };
 
+// The compile-time counterpart to EXECUTORS, consulted only by
+// cli('compile') (see runNodes()'s 'compile' branch below). Not every kind
+// has something to compile - move has no {{ }}-style templating, so a move
+// node under cli('compile') just reports 'planned' with no compiledSql,
+// the same as it already does under cli('list'). Deliberately its own
+// small map rather than folded into EXECUTORS: EXECUTORS answers "how do I
+// run this kind for real", COMPILERS answers a different, narrower
+// question ("can this kind's SQL be resolved without running it") that
+// only 'model' can answer yes to today.
+var COMPILERS = {
+  model: compileModel
+};
+
 function knownKinds() {
   return Object.keys(EXECUTORS);
 }
@@ -108,7 +121,7 @@ function nodeLabel(node) {
   return node.name + ' (' + node.kind + ')';
 }
 
-var COMMANDS = ['run', 'list', 'hello', 'help'];
+var COMMANDS = ['run', 'list', 'compile', 'debug', 'hello', 'help'];
 
 function usage() {
   return [
@@ -119,6 +132,8 @@ function usage() {
     '  cli("run --select a,b")        run only the named nodes',
     '  cli("run --exclude a")         run everything except the named nodes',
     '  cli("list")                    show what would run, in order, without running it',
+    '  cli("compile")                 resolve model SQL ({{ ref() }}/var()/config()) without running anything',
+    '  cli("debug")                   check OAuth scopes/services for each node\'s connector, without writing anything',
     '  cli("hello")                   check the library loaded and see which nodes it can find',
     '  cli("help")                    this message',
     '',
@@ -269,7 +284,12 @@ function discoverNodes() {
   // (assertDependenciesExist, selection, ordering, running) sees one flat
   // node list and never has to know two different discovery mechanisms
   // produced it.
-  expandModelNodes().forEach(function (node) {
+  //
+  // nodes (everything the scan above already found - today, only move) is
+  // passed in so a model's {{ ref() }} can also resolve a move node with a
+  // bigquery target, not just another model - see expandModelNodes()'s own
+  // comment for how it uses this list.
+  expandModelNodes(nodes).forEach(function (node) {
     claimName(claimedNames, node.name, node.variable);
     nodes.push(node);
   });
@@ -438,13 +458,13 @@ function orderNodes(nodes) {
 //
 // START logs immediately before the one branch that can actually take
 // real time - the EXECUTORS[node.kind] call - not before the blocked-check
-// or the dry-run check above it, since neither of those waits on anything:
-// a skipped or planned node is decided instantly, so a START line there
-// would never carry the "is this still working" signal it exists for. That
-// signal matters for real execution (a BigQuery job can poll for tens of
-// seconds) - without it, a human watching the Apps Script log during a
-// long run can only see which nodes have already finished, never which one
-// is currently in flight.
+// or the dry-run/compile checks above it, since none of those waits on
+// anything: a skipped, planned or compiled node is decided instantly, so a
+// START line there would never carry the "is this still working" signal it
+// exists for. That signal matters for real execution (a BigQuery job can
+// poll for tens of seconds) - without it, a human watching the Apps Script
+// log during a long run can only see which nodes have already finished,
+// never which one is currently in flight.
 //
 // SKIP and FAIL always log - they're exactly what needs a human's
 // attention. OK only logs when verbose is true: nothing failed is already
@@ -455,7 +475,18 @@ function orderNodes(nodes) {
 // verbose defaults false (see resolveLoggingConfig()) precisely so a
 // normal run's console output stays proportional to what needs attention,
 // not to how many nodes happened to succeed.
-function runNodes(nodes, dryRun, verbose) {
+//
+// command is one of 'run', 'list' or 'compile' - not a bare dryRun boolean,
+// since 'list' and 'compile' are both "don't touch BigQuery/Sheets/Drive"
+// modes but differ in what they report: 'list' always reports 'planned'
+// with nothing else attached, kind-agnostically; 'compile' additionally
+// resolves a model's SQL via COMPILERS (see its own comment above
+// EXECUTORS) for any kind that has something to compile, attaching the
+// result as compiledSql on the same 'planned' status, and treating a
+// compile failure the same way a real run failure is treated - it blocks
+// dependents transitively via the same `blocked` map, rather than needing
+// a parallel skip mechanism just for this mode.
+function runNodes(nodes, command, verbose) {
   var results = [];
   var blocked = emptyMap();
   nodes.forEach(function (node) {
@@ -464,12 +495,12 @@ function runNodes(nodes, dryRun, verbose) {
     // configuration is bad, discovered while building the graph, well
     // before any node's turn to actually run. Checked here, kind-
     // agnostically (a plain node-level field, not something only model
-    // nodes could have), and ahead of the dryRun branch below: the whole
-    // point of a "list" dry run is surfacing a config mistake before
-    // anything executes for real, and this error is already fully known
-    // with nothing to execute to see it - reporting it only on a real
-    // "run" would make "list" strictly less useful for exactly the
-    // errors that are cheapest to catch early.
+    // nodes could have), and ahead of the dry-run/compile branches below:
+    // the whole point of a "list"/"compile" dry run is surfacing a config
+    // mistake before anything executes for real, and this error is already
+    // fully known with nothing to execute to see it - reporting it only on
+    // a real "run" would make "list"/"compile" strictly less useful for
+    // exactly the errors that are cheapest to catch early.
     if (node.discoveryError) {
       blocked[node.name] = true;
       results.push({ name: node.name, kind: node.kind, status: 'failed', error: node.discoveryError });
@@ -483,7 +514,24 @@ function runNodes(nodes, dryRun, verbose) {
       Logger.log('SKIP  ' + nodeLabel(node) + ' - waiting on ' + blockers.join(', '));
       return;
     }
-    if (dryRun) {
+    if (command === 'compile') {
+      if (!has(COMPILERS, node.kind)) {
+        results.push({ name: node.name, kind: node.kind, status: 'planned' });
+        Logger.log('PLAN  ' + nodeLabel(node));
+        return;
+      }
+      try {
+        var compiledSql = COMPILERS[node.kind](node.config);
+        results.push({ name: node.name, kind: node.kind, status: 'planned', compiledSql: compiledSql });
+        Logger.log('PLAN  ' + nodeLabel(node) + ' - compiled');
+      } catch (error) {
+        blocked[node.name] = true;
+        results.push({ name: node.name, kind: node.kind, status: 'failed', error: error.message });
+        Logger.log('FAIL  ' + nodeLabel(node) + ' - ' + error.message);
+      }
+      return;
+    }
+    if (command === 'list') {
       results.push({ name: node.name, kind: node.kind, status: 'planned' });
       Logger.log('PLAN  ' + nodeLabel(node));
       return;
@@ -580,6 +628,14 @@ function summarizeNodeResult(result) {
   } else if (result.status === 'failed') {
     summary.ms = result.ms;
     summary.error = result.error;
+  } else if (result.status === 'planned') {
+    // Only cli('compile') ever sets this - cli('list')'s own 'planned'
+    // results never carry a compiledSql, and 'list' never calls
+    // buildManifest() at all (see cli()'s dispatch below), so this branch
+    // is a no-op for every manifest except the compile one.
+    if (result.compiledSql !== undefined) {
+      summary.compiledSql = result.compiledSql;
+    }
   } else if (result.status === 'success') {
     summary.ms = result.ms;
     if (Array.isArray(result.result)) {
@@ -653,6 +709,292 @@ function writeManifest(commandText, ok, results, ignored) {
   }
 }
 
+// Reads the optional notsobigdataCompileManifest global, same guarded
+// pattern and shape as resolveManifestConfig() above - a deliberately
+// separate global, not a second field on notsobigdataManifest, so
+// configuring (or disabling) the compile manifest can never accidentally
+// touch the run manifest's own settings. Different default fileName for
+// the same reason: the two are meant to coexist as two files, not fight
+// over one.
+function resolveCompileManifestConfig() {
+  var raw = readOptionalGlobal('notsobigdataCompileManifest');
+  var config = (raw && typeof raw === 'object') ? raw : {};
+  return {
+    enabled: config.enabled !== false,
+    folderId: typeof config.folderId === 'string' && config.folderId ? config.folderId : null,
+    fileName: typeof config.fileName === 'string' && config.fileName ? config.fileName : 'notsobigdata-compile-manifest.json'
+  };
+}
+
+// cli('compile')'s counterpart to writeManifest() above - same
+// upsert-by-name Drive write, same best-effort/never-throw contract, same
+// "every outcome gets a Logger.log line" reasoning - but to its own file,
+// via resolveCompileManifestConfig() rather than resolveManifestConfig().
+// A compile pass never touches BigQuery/Sheets/Drive, so it must never
+// overwrite the run manifest's own record of what the last real run
+// actually did - see docs/cli.md's "The compile manifest" for the
+// user-facing version of this reasoning.
+function writeCompileManifest(commandText, ok, results, ignored) {
+  var config = resolveCompileManifestConfig();
+  if (!config.enabled) {
+    Logger.log('COMPILE MANIFEST skipped - notsobigdataCompileManifest.enabled is false');
+    return { written: false, reason: 'disabled' };
+  }
+  try {
+    var folderId = resolveManifestFolderId(config.folderId);
+    var manifest = buildManifest(commandText, ok, results, ignored);
+    var target = { folderId: folderId, fileName: config.fileName, upsertByName: true };
+    var fileId = resolveDriveWriteTarget(target);
+    fileId = writeDriveText(fileId, target, JSON.stringify(manifest, null, 2), MimeType.PLAIN_TEXT);
+    Logger.log('COMPILE MANIFEST written to ' + fileId);
+    return { written: true, fileId: fileId };
+  } catch (error) {
+    Logger.log('COMPILE MANIFEST failed - ' + error.message);
+    return { written: false, reason: 'error', error: error.message };
+  }
+}
+
+// cli('debug') - a diagnostic, non-mutating check of whether the current
+// Apps Script project's OAuth scopes / Advanced Services actually cover
+// what each declared node's connector needs.
+//
+// This exists because of the eval() scoping gotcha documented in
+// CLAUDE.md: Apps Script auto-detects required OAuth scopes and Advanced
+// Services by statically scanning a project's own .gs files. Code that
+// arrives via eval(UrlFetchApp.fetch(...).getContentText()) was never in
+// those files, so a call this library makes from inside that eval'd text -
+// to DriveApp, SpreadsheetApp, BigQuery, UrlFetchApp - can be invisible to
+// that scan. The consuming project's appsscript.json can end up missing a
+// scope nobody was ever shown a prompt to grant. cli('debug') probes each
+// connector for real (safely - see below) so that gap turns into a clear
+// message here instead of a bare permission error surfacing deep inside a
+// real move()/model() run.
+//
+// Safety rule, load-bearing: a debug check must never trigger a write.
+// A source connector's probe is (as close as possible to) the real read
+// call, since a source is already read-only by contract. A target
+// connector's probe is a read-only stand-in for the same resource instead
+// - open it, don't write to it. probeApi's target case is the one
+// deliberate compromise: loadApi (move.js) always POSTs a JSON body, so
+// probing a target sends a GET instead. That means a POST-only endpoint
+// reads back as reachable-but-non-2xx rather than as an auth failure -
+// fetchProbe() below treats any HTTP response at all, regardless of
+// status code, as proof UrlFetchApp itself is authorized, and leaves the
+// status code out of the ok/not-ok decision entirely.
+var SCOPE_ERROR_PATTERN = /permission|scope|not authorized|unauthorized|PERMISSION_DENIED|insufficient/i;
+
+// The message every 'missing_scope'/'service_not_enabled' check ends with.
+// kind is a short phrase naming what to add ("an oauthScopes entry",
+// "the BigQuery Advanced Service") so the same explanation reads right
+// in both callers below.
+function evalScopingHint(kind) {
+  return 'Apps Script only auto-adds OAuth scopes/Advanced Services by scanning a project\'s own .gs files for the calls that need them - it can\'t see calls made from code installed via eval(), which is how notsobigdata loads. Add ' + kind + ' by hand in the Apps Script editor (Project Settings > "Show appsscript.json") rather than expecting an authorization prompt to add it for you.';
+}
+
+function classifyProbeError(error, type, role) {
+  var message = error && error.message ? error.message : String(error);
+  if (SCOPE_ERROR_PATTERN.test(message)) {
+    return { status: 'missing_scope', message: type + ' ' + role + ': ' + message + ' - ' + evalScopingHint('the missing oauthScopes entry') };
+  }
+  return { status: 'error', message: type + ' ' + role + ': ' + message };
+}
+
+function bigQueryServiceNotEnabledMessage() {
+  return 'BigQuery is not available as a "BigQuery" service in this project, so the Advanced BigQuery Service isn\'t enabled - a separate switch from OAuth scopes (Apps Script editor > Services > add "BigQuery API", and confirm the BigQuery API is enabled on the linked GCP project). ' + evalScopingHint('the BigQuery Advanced Service');
+}
+
+// Shared by probeUrl and probeApi. Always forces a GET and always mutes
+// HTTP exceptions: the status code is deliberately irrelevant to whether
+// this counts as 'ok' (see the module comment above) - only a thrown
+// error means UrlFetchApp itself couldn't make the call. method/payload
+// are stripped out of options rather than merged in, so a target's own
+// POST configuration can never leak through and turn a probe into a
+// second real write.
+function fetchProbe(url, options, type, role) {
+  var fetchOptions = { method: 'get', muteHttpExceptions: true };
+  if (options) {
+    Object.keys(options).forEach(function (key) {
+      if (key !== 'method' && key !== 'payload') {
+        fetchOptions[key] = options[key];
+      }
+    });
+  }
+  try {
+    var response = UrlFetchApp.fetch(url, fetchOptions);
+    return { status: 'ok', message: 'UrlFetchApp reached ' + url + ' (HTTP ' + response.getResponseCode() + ').' };
+  } catch (error) {
+    return classifyProbeError(error, type, role);
+  }
+}
+
+function probeSheets(role, config) {
+  if (!config.spreadsheetId) {
+    return { status: 'error', message: 'sheets ' + role + ' has no "spreadsheetId" to check.' };
+  }
+  try {
+    SpreadsheetApp.openById(config.spreadsheetId);
+    return { status: 'ok', message: 'opened spreadsheet ' + config.spreadsheetId + '.' };
+  } catch (error) {
+    return classifyProbeError(error, 'sheets', role);
+  }
+}
+
+function probeDrive(role, config) {
+  if (config.fileId) {
+    try {
+      DriveApp.getFileById(config.fileId);
+      return { status: 'ok', message: 'opened Drive file ' + config.fileId + '.' };
+    } catch (error) {
+      return classifyProbeError(error, 'drive', role);
+    }
+  }
+  if (config.folderId) {
+    try {
+      DriveApp.getFolderById(config.folderId);
+      return { status: 'ok', message: 'opened Drive folder ' + config.folderId + '.' };
+    } catch (error) {
+      return classifyProbeError(error, 'drive', role);
+    }
+  }
+  return { status: 'error', message: 'drive ' + role + ' has neither "fileId" nor "folderId" to check.' };
+}
+
+// dataset is optional on a bigquery *source* (a "query"/"queryFileId" mode
+// source has a projectId but no particular dataset to name - see
+// resolveBigQuerySql in move.js) but always present on a target and on a
+// resolved model config. When there's no dataset to check, this falls back
+// to listing one page of datasets in the project - still a real,
+// scope-sensitive call, just not scoped to one dataset.
+function probeBigQuery(role, config) {
+  if (typeof BigQuery === 'undefined') {
+    return { status: 'service_not_enabled', message: bigQueryServiceNotEnabledMessage() };
+  }
+  if (!config.projectId) {
+    return { status: 'error', message: 'bigquery ' + role + ' has no "projectId" to check.' };
+  }
+  try {
+    if (config.dataset) {
+      BigQuery.Datasets.get(config.projectId, config.dataset);
+      return { status: 'ok', message: 'read dataset metadata for ' + config.projectId + '.' + config.dataset + '.' };
+    }
+    BigQuery.Datasets.list(config.projectId, { maxResults: 1 });
+    return { status: 'ok', message: 'listed datasets in project ' + config.projectId + '.' };
+  } catch (error) {
+    return classifyProbeError(error, 'bigquery', role);
+  }
+}
+
+// A url source is always a GET (extractUrl in move.js never writes), so
+// this probe is the real call, github-blob rewrite included - the same
+// request a real run would make.
+function probeUrl(role, config) {
+  if (!config.url) {
+    return { status: 'error', message: 'url ' + role + ' has no "url" to check.' };
+  }
+  return fetchProbe(rewriteGithubBlobUrl(config.url), config.options, 'url', role);
+}
+
+// An api source is a real GET too (extractApi), so this probe is exactly
+// that call. An api target's real call (loadApi) is always a POST with a
+// JSON body - fetchProbe forces a GET instead, the one deliberate
+// compromise described in this section's module comment above.
+function probeApi(role, config) {
+  if (!config.url) {
+    return { status: 'error', message: 'api ' + role + ' has no "url" to check.' };
+  }
+  return fetchProbe(config.url, config.options, 'api', role);
+}
+
+function probeCustom(role) {
+  return { status: 'unverifiable', message: 'custom ' + role + ' calls your own "fn" - cli(\'debug\') has no way to know what services it uses.' };
+}
+
+// Keyed by connector type (source.type/target.type - the same six strings
+// extract()/load() in move.js switch on), parallel to EXECUTORS/COMPILERS
+// above: one small map per question this module can answer about a kind
+// or a connector, rather than one map trying to answer all of them.
+var DEBUG_PROBES = {
+  sheets: probeSheets,
+  drive: probeDrive,
+  bigquery: probeBigQuery,
+  api: probeApi,
+  url: probeUrl,
+  custom: probeCustom
+};
+
+// Pulls (role, type, config) probe tuples out of one discovered node. A
+// model node never carries a source/target shape at all - its single
+// implicit tuple is built from the projectId/dataset resolveModelConfig()
+// (model.js) already resolved onto every model node's config, the same
+// two fields a real bigquery target requires and probeBigQuery already
+// expects. One nuance: expandModelNodes() only attaches that resolved
+// config to the node once every discovery-time check (SQL file read,
+// {{ }} validation, ref() resolution) has already passed - a model with a
+// discoveryError keeps the placeholder { name: name } config it started
+// with, so this reports 'error' (no projectId to check) for a broken
+// model rather than silently skipping it or crashing.
+function connectorTuplesForNode(node) {
+  if (node.kind === 'model') {
+    return [{ role: 'target', type: 'bigquery', config: { projectId: node.config.projectId, dataset: node.config.dataset } }];
+  }
+  var tuples = [];
+  if (isPlainObject(node.config.source) && typeof node.config.source.type === 'string') {
+    tuples.push({ role: 'source', type: node.config.source.type, config: node.config.source });
+  }
+  if (isPlainObject(node.config.target) && typeof node.config.target.type === 'string') {
+    tuples.push({ role: 'target', type: node.config.target.type, config: node.config.target });
+  }
+  return tuples;
+}
+
+// Runs every connector check for one selected node. Deliberately
+// independent of every other node's status - unlike runNodes()'s
+// run/list/compile branches, this never consults a `blocked` map: the
+// whole point of cli('debug') is surfacing every connector problem in one
+// pass, not respecting dependency order, which a diagnostic dry run has
+// no use for in the first place.
+function debugNode(node) {
+  return connectorTuplesForNode(node).map(function (tuple) {
+    var probe = DEBUG_PROBES[tuple.type];
+    var outcome = probe
+      ? probe(tuple.role, tuple.config)
+      : { status: 'error', message: 'unknown connector type "' + tuple.type + '".' };
+    return { node: node.name, kind: node.kind, role: tuple.role, type: tuple.type, status: outcome.status, message: outcome.message };
+  });
+}
+
+function runDebugChecks(nodes) {
+  var checks = [];
+  nodes.forEach(function (node) {
+    debugNode(node).forEach(function (check) {
+      checks.push(check);
+      var label = nodeLabel(node) + ' ' + check.role + ' (' + check.type + ')';
+      if (check.status === 'ok') {
+        Logger.log('OK    ' + label + ' - ' + check.message);
+      } else if (check.status === 'unverifiable') {
+        Logger.log('SKIP  ' + label + ' - ' + check.message);
+      } else {
+        Logger.log('FAIL  ' + label + ' - ' + check.message);
+      }
+    });
+  });
+  return checks;
+}
+
+// formatStatusCounts()'s counterpart for a debug report's check statuses
+// rather than a run report's node statuses - same "only render non-zero
+// counts" reasoning, kept separate since the two status vocabularies
+// don't overlap (a check is never 'success'/'skipped'/'planned').
+function formatDebugStatusCounts(checks) {
+  var counts = { ok: 0, missing_scope: 0, service_not_enabled: 0, error: 0, unverifiable: 0 };
+  checks.forEach(function (check) { counts[check.status] += 1; });
+  var labels = { ok: 'ok', missing_scope: 'missing scope', service_not_enabled: 'service not enabled', error: 'error', unverifiable: 'unverifiable' };
+  var parts = Object.keys(labels)
+    .filter(function (status) { return counts[status] > 0; })
+    .map(function (status) { return counts[status] + ' ' + labels[status]; });
+  return parts.length ? parts.join(', ') : 'nothing to check';
+}
+
 // The smoke test. This is the first thing to run when anything looks
 // wrong, so it is the one command that never throws: it has to be able
 // to report "I found nothing" as a finding rather than as a failure,
@@ -687,8 +1029,8 @@ function hello() {
 }
 
 // The single public entrypoint. Takes one command string and returns
-// either a run report (for "run"/"list") or a message string (for
-// "hello"/"help").
+// either a run report (for "run"/"list"/"compile") or a message string
+// (for "hello"/"help").
 //
 // Logs "START"/"DONE" bookends around every call, padded to the same
 // six characters as runNodes()'s own "OK"/"FAIL"/"SKIP"/"PLAN" labels so
@@ -696,9 +1038,9 @@ function hello() {
 // thing this function does, before parseCommand() - so a call that
 // throws immediately (an unknown command, zero discovered nodes) still
 // leaves a marker that cli() actually ran, not silence up to the error.
-// "DONE" only fires for "run"/"list": hello()/help() already log their
-// own single result line and have no per-node pass/fail/skip status to
-// roll up. Both are pure Logger.log side effects - report is unchanged.
+// "DONE" only fires for "run"/"list"/"compile": hello()/help() already log
+// their own single result line and have no per-node pass/fail/skip status
+// to roll up. Both are pure Logger.log side effects - report is unchanged.
 function cli(input) {
   Logger.log('START cli("' + input + '")');
   var parsed = parseCommand(input);
@@ -719,8 +1061,19 @@ function cli(input) {
   if (!selected.length) {
     throw new Error('cli(): the selection matched no nodes. Run cli("list") to see everything available.');
   }
+  // debug diverges from run/list/compile right here, before orderNodes():
+  // it checks every selected node's connector independently of every
+  // other node's status, so it has no use for dependency order or the
+  // blocked-node skip logic runNodes() applies to the other three
+  // commands - see runDebugChecks()'s own comment above.
+  if (parsed.command === 'debug') {
+    var checks = runDebugChecks(selected);
+    var debugOk = checks.every(function (check) { return check.status === 'ok' || check.status === 'unverifiable'; });
+    Logger.log('DONE  cli("' + input + '") - ' + formatDebugStatusCounts(checks) + ' (' + checks.length + ' total).');
+    return { ok: debugOk, command: 'debug', checks: checks, ignored: discovered.ignored };
+  }
   var ordered = orderNodes(selected);
-  var results = runNodes(ordered, parsed.command === 'list', resolveLoggingConfig().verbose);
+  var results = runNodes(ordered, parsed.command, resolveLoggingConfig().verbose);
   var ok = results.every(function (result) { return result.status !== 'failed' && result.status !== 'skipped'; });
   Logger.log('DONE  cli("' + input + '") - ' + formatStatusCounts(results) + ' (' + results.length + ' total).');
   var report = {
@@ -729,11 +1082,16 @@ function cli(input) {
     nodes: results,
     ignored: discovered.ignored
   };
-  // Only "run" writes a manifest - "list" is a dry run where nothing
-  // executed, and overwriting the last real run's record with a no-op
-  // would defeat the "reflects what actually happened" point of it.
+  // "run" and "compile" each write their own manifest; "list" writes
+  // neither - it's a pure dry run with nothing, not even compiled SQL, to
+  // record. "compile" gets a *separate* file from "run" (writeCompileManifest,
+  // not writeManifest) rather than sharing one: a compile pass never
+  // touches BigQuery/Sheets/Drive, so it must never overwrite the run
+  // manifest's own record of what the last real run actually did.
   if (parsed.command === 'run') {
     report.manifest = writeManifest(input, ok, results, discovered.ignored);
+  } else if (parsed.command === 'compile') {
+    report.manifest = writeCompileManifest(input, ok, results, discovered.ignored);
   }
   return report;
 }

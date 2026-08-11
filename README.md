@@ -117,6 +117,8 @@ NotSoBigData.cli('run --select rawOrders')  // run only that node
 NotSoBigData.cli('run --select a,b')        // run only these, ordered among themselves
 NotSoBigData.cli('run --exclude a')         // run everything except these
 NotSoBigData.cli('list')                    // show what would run, in order — runs nothing
+NotSoBigData.cli('compile')                 // resolve model SQL, without running anything
+NotSoBigData.cli('debug')                   // check OAuth scopes/services per connector, without writing anything
 NotSoBigData.cli('hello')                   // check the library loaded and see what it can find
 NotSoBigData.cli('help')                    // the command list
 ```
@@ -135,7 +137,9 @@ declared → **[docs/cli.md](docs/cli.md)**.
   connector config → **[docs/move.md](docs/move.md)**.
 - **`model`** — SQL models against BigQuery, the "T" of "ELT": dbt-style
   `{{ ref() }}` dependencies, `view`/`table` materialization, SQL stored in
-  `.html` files. Full config → **[docs/model.md](docs/model.md)**.
+  `.html` files, with optional dbt-style tests (`not_null`, `unique`,
+  `accepted_values`, `relationships`) or your own SQL. Full config →
+  **[docs/model.md](docs/model.md)**.
 
 ## Scheduling
 
