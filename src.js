@@ -1704,6 +1704,16 @@ var NotSoBigData = (function () {
   // second config()-settable key beyond materialized eventually shows up.
   var MODEL_CONFIG_KEYS = ['materialized'];
 
+  // The {{ name(...) }} calls compileModelSql() gives a built-in meaning -
+  // see readMacroDefinitions() below. A user-authored macro reusing one of
+  // these names would silently shadow the built-in project-wide (every
+  // {{ ref(...) }} in every model, say, would stop meaning "resolve a
+  // dependency"), with no error and no dependency edges - so a macro
+  // declaration reusing one of these names is rejected outright, the same
+  // "no obvious precedence, reject rather than guess" posture this file
+  // already takes for a duplicate {% set %} name or a second config() call.
+  var BUILTIN_TEMPLATE_CALLS = ['ref', 'config', 'var'];
+
   // Guarded read of the single notsobigdataModels global, reusing cli.js's
   // readOptionalGlobal() - same "never throw because of a global this
   // library doesn't own" reasoning discoverNodes() applies to every other
@@ -1884,13 +1894,18 @@ var NotSoBigData = (function () {
   // a move node with a non-bigquery target). Just extracts names here, with
   // no opinion on whether a name is a model or a move node - expandModelNodes()
   // below is what classifies each one and turns an unknown name into a
-  // discoveryError. Scans stripSqlComments()'s output (move.js's own
-  // comment-stripping, reused rather than re-implemented) rather than the raw
-  // SQL, so a ref() a user has commented out (e.g. "-- from {{ ref('old_model')
-  // }}") doesn't become a real dependency edge on a node that may not even
-  // exist any more.
-  function extractRefDependencies(sql) {
-    return scanTemplateExpressions(stripSqlComments(sql))
+  // discoveryError. Takes matches already scanned off stripSqlComments()'s
+  // output (move.js's own comment-stripping, reused rather than
+  // re-implemented) rather than the raw SQL, so a ref() a user has commented
+  // out (e.g. "-- from {{ ref('old_model') }}") doesn't become a real
+  // dependency edge on a node that may not even exist any more. Shares that
+  // one scan with extractConfigOverrides()/validateVarUsage() below - all
+  // three read the same model's SQL at the same point in
+  // expandModelNodes()'s per-model loop, so scanning once there instead of
+  // once per function avoids stripping/tokenizing identical text three
+  // times over.
+  function extractRefDependencies(matches) {
+    return matches
       .filter(function (expression) { return expression.call === 'ref'; })
       .map(function (expression) { return parseSingleStringArgument('ref', expression.args); });
   }
@@ -1899,9 +1914,11 @@ var NotSoBigData = (function () {
   // above: a model's own {{ config(...) }} call (if any) sets values that win
   // over both the registry's project-wide defaults and the model's own
   // registry entry - the same "closest to the model wins" relationship dbt's
-  // own inline config() has with dbt_project.yml. Scans stripSqlComments()'s
-  // output for the same reason ref()'s scan does - a commented-out config()
-  // call must not take effect.
+  // own inline config() has with dbt_project.yml. Takes the same
+  // stripSqlComments()'d matches extractRefDependencies() does, for the same
+  // reason - a commented-out config() call must not take effect, and the
+  // scan is shared rather than repeated (see extractRefDependencies()'s
+  // comment above).
   //
   // At most one config() call is allowed per model - unlike ref(), which is
   // expected to appear once per dependency, a second config() call setting
@@ -1913,8 +1930,8 @@ var NotSoBigData = (function () {
   // Every key returned is already validated against MODEL_CONFIG_KEYS here,
   // at discovery time, so expandModelNodes() below can merge the result
   // straight into a model's resolved config without a second whitelist check.
-  function extractConfigOverrides(sql) {
-    var calls = scanTemplateExpressions(stripSqlComments(sql))
+  function extractConfigOverrides(matches) {
+    var calls = matches
       .filter(function (expression) { return expression.call === 'config'; });
     if (!calls.length) {
       return {};
@@ -2182,6 +2199,9 @@ var NotSoBigData = (function () {
     macroFiles.forEach(function (file) {
       var blocks = extractMacroBlocks(readModelHtml(file));
       Object.keys(blocks).forEach(function (name) {
+        if (BUILTIN_TEMPLATE_CALLS.indexOf(name) !== -1) {
+          throw new Error('model(): macro "' + name + '" in "' + file + '" reuses a built-in name (' + BUILTIN_TEMPLATE_CALLS.join(', ') + ') - every {{ ' + name + '(...) }} call in the project would silently stop meaning the built-in. Rename the macro.');
+        }
         if (has(macros, name)) {
           throw new Error('model(): macro "' + name + '" is declared in more than one file listed in notsobigdataModels.macros ("' + macros[name].file + '" and "' + file + '").');
         }
@@ -2312,9 +2332,11 @@ var NotSoBigData = (function () {
   // itself is also called at run time (from compileModelSql()), where no
   // per-model prefix is available. Called from expandModelNodes()'s existing
   // per-model try/catch, so a bad var() becomes that model's own
-  // discoveryError, caught by cli('list') before any real run.
-  function validateVarUsage(sql, registry, messagePrefix) {
-    scanTemplateExpressions(stripSqlComments(sql))
+  // discoveryError, caught by cli('list') before any real run. Takes the
+  // same stripSqlComments()'d matches extractRefDependencies()/
+  // extractConfigOverrides() do, for the same shared-scan reason.
+  function validateVarUsage(matches, registry, messagePrefix) {
+    matches
       .filter(function (expression) { return expression.call === 'var'; })
       .forEach(function (expression) {
         var parsed = parseVarArguments('var', expression.args);
@@ -2370,18 +2392,7 @@ var NotSoBigData = (function () {
   //
   // {{ var(...) }} resolves via resolveVar() above - notsobigdataModels.vars
   // (registry is the caller's, same one it already read for ref()
-  // resolution) or the call's own default. {{ config(...) }} is stripped to
-  // '' - its values were already folded into node.config back in
-  // expandModelNodes(), so by the time this runs the call has nothing left
-  // to do except disappear from the compiled statement. parseKwargsArgument
-  // is still called here (its result discarded) rather than just matching
-  // the call name, so a config() call this SQL string carries that somehow
-  // differs from the one discovery already validated (there is no
-  // legitimate way for that to happen today, since config.sql is set once
-  // and never mutated - but ref() gets this same redundant re-validation on
-  // every compile, and diverging from that precedent for config() only
-  // would be its own small surprise) still throws instead of silently
-  // vanishing.
+  // resolution) or the call's own default.
   //
   // {% set key = 'value' %} strips to '' after this first pass, in its own
   // second replace() below - it's a different bracket shape ({% %}, not
@@ -2790,15 +2801,20 @@ var NotSoBigData = (function () {
         // comment for why a ref()/var() living inside a macro body is picked
         // up "for free" by the scans that follow.
         config.sql = expandMacroCalls(config.sql, macros);
+        // One scan of this model's stripSqlComments()'d SQL, shared by the
+        // three extractors/validators below - see extractRefDependencies()'s
+        // own comment for why scanning once here beats each of them
+        // stripping and re-tokenizing the same text independently.
+        var templateMatches = scanTemplateExpressions(stripSqlComments(config.sql));
         // {{ config(...) }} overrides applied after resolveModelConfig()'s own
         // defaults+entry merge, so a model's own SQL wins over both the
         // registry's project-wide default and its own registry entry - see
         // extractConfigOverrides above.
-        var configOverrides = extractConfigOverrides(config.sql);
+        var configOverrides = extractConfigOverrides(templateMatches);
         Object.keys(configOverrides).forEach(function (key) { config[key] = configOverrides[key]; });
         validateModelTests(config.tests, 'model(): "' + name + '"');
         validateSetUsage(config.sql, 'model(): "' + name + '"');
-        validateVarUsage(config.sql, registry, 'model(): "' + name + '"');
+        validateVarUsage(templateMatches, registry, 'model(): "' + name + '"');
         // Every {{ ref(...) }} name must resolve to something - a declared
         // model (unchanged, handled by model()'s own resolveRef at compile
         // time) or a bigquery-target move node (resolved right here, once,
@@ -2808,7 +2824,7 @@ var NotSoBigData = (function () {
         // every other check in this loop - without this, a typo'd or
         // non-bigquery move node name would only surface once model() itself
         // ran and its resolveRef fallback found nothing.
-        var refNames = extractRefDependencies(config.sql);
+        var refNames = extractRefDependencies(templateMatches);
         // emptyMap(), not {} - same reason every other name-keyed map in
         // this library uses it (see cli.js's own emptyMap() comment): a move
         // node literally named "__proto__" is a real, if wacky, possible key

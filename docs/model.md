@@ -291,7 +291,11 @@ A macro name declared in more than one file listed in
 `notsobigdataModels.macros`, an unterminated `{% macro %}` with no matching
 `{% endmacro %}`, a call with the wrong number of arguments, or a
 parameter list with a duplicate or non-identifier name are all
-discovery-time errors too. Declaring zero macro files (or omitting
+discovery-time errors too. So is naming a macro `ref`, `config`, or
+`var` — those are the library's own built-in calls, and a macro reusing
+one of those names would silently take over every `{{ ref(...) }}` (etc.)
+in the whole project rather than raising an error, so it's rejected
+outright instead. Declaring zero macro files (or omitting
 `macros` from `notsobigdataModels` entirely) is not an error — it just
 means no model can call one.
 
