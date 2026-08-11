@@ -1083,7 +1083,20 @@ function quoteSqlLiteral(value) {
 // own discoveryError - caught by cli('list'), not just a real run - same
 // "validated even before there's data to check" posture move.js's own
 // validateTest takes for config.tests.
-function validateModelTest(test, messagePrefix) {
+//
+// registry is needed for exactly one check: a "relationships" test's "to"
+// must name a declared model, not just any node. Before this check
+// existed, "to" naming a real node of any kind (e.g. a move node, which
+// extractTestRefDependencies() below is happy to turn into a dependsOn
+// edge the same way it would a model) passed discovery clean, only for
+// MODEL_TEST_COMPILERS.relationships's own resolveModelConfig() call to
+// throw "is not declared in notsobigdataModels.models" once the model had
+// already materialized (CREATE OR REPLACE already ran, and for a "table"
+// materialization, modelTableStaged() had already created its staging
+// table) - a discovery-time check should have caught this before any
+// BigQuery work started, the same way every other "to"/"ref()" mismatch
+// in this file already does.
+function validateModelTest(test, messagePrefix, registry) {
   if (!test || typeof test !== 'object') {
     throw new Error(messagePrefix + ' every "tests" entry must be an object.');
   }
@@ -1119,6 +1132,10 @@ function validateModelTest(test, messagePrefix) {
     if (typeof test.to !== 'string' || !test.to) {
       throw new Error(messagePrefix + ' test on column "' + test.column + '" (check "relationships") requires "to" (another model\'s name).');
     }
+    if (!has(registry.models, test.to)) {
+      throw new Error(messagePrefix + ' test on column "' + test.column + '" (check "relationships") has "to": "' + test.to
+        + '", which is not a declared model. Known models: ' + Object.keys(registry.models).join(', ') + '.');
+    }
     if (test.field !== undefined) {
       if (typeof test.field !== 'string' || !test.field) {
         throw new Error(messagePrefix + ' test on column "' + test.column + '" (check "relationships") has an invalid "field" - must be a non-empty string.');
@@ -1128,14 +1145,14 @@ function validateModelTest(test, messagePrefix) {
   }
 }
 
-function validateModelTests(tests, messagePrefix) {
+function validateModelTests(tests, messagePrefix, registry) {
   if (tests === undefined) {
     return;
   }
   if (!Array.isArray(tests)) {
     throw new Error(messagePrefix + ' "tests" must be an array of test objects.');
   }
-  tests.forEach(function (test) { validateModelTest(test, messagePrefix); });
+  tests.forEach(function (test) { validateModelTest(test, messagePrefix, registry); });
 }
 
 // The name a compiled test reports itself as in a failure message, when
@@ -1345,7 +1362,7 @@ function expandModelNodes(otherNodes) {
       // extractConfigOverrides above.
       var configOverrides = extractConfigOverrides(templateMatches);
       Object.keys(configOverrides).forEach(function (key) { config[key] = configOverrides[key]; });
-      validateModelTests(config.tests, 'model(): "' + name + '"');
+      validateModelTests(config.tests, 'model(): "' + name + '"', registry);
       validateSetUsage(config.sql, 'model(): "' + name + '"');
       validateVarUsage(templateMatches, registry, 'model(): "' + name + '"');
       // Every {{ ref(...) }} name must resolve to something - a declared
