@@ -1987,6 +1987,47 @@ var NotSoBigData = (function () {
     return values;
   }
 
+  // Splits a comma-joined list into its top-level segments without cutting
+  // a comma that sits *inside* a quoted item in half - parseForIterable()
+  // below used to just call inner.split(','), which does exactly that:
+  // ['open, pending', 'closed'] became "'open" and " pending'", neither a
+  // valid quoted string, so the whole list threw even though it looks
+  // well-formed to whoever wrote it. A plain char-by-char scan, tracking
+  // whether the current position sits inside a quote, is enough here - no
+  // escape-sequence support, same "simple string literal, no backslash
+  // escaping" posture every other quoted value in this file already has
+  // (parseSingleStringArgument, parseKwargsArgument, ...), so a quote
+  // character can only ever open or close an item, never appear inside one
+  // escaped.
+  function splitTopLevelListItems(inner) {
+    var items = [];
+    var current = '';
+    var quoteChar = null;
+    for (var i = 0; i < inner.length; i++) {
+      var ch = inner.charAt(i);
+      if (quoteChar) {
+        current += ch;
+        if (ch === quoteChar) {
+          quoteChar = null;
+        }
+        continue;
+      }
+      if (ch === '\'' || ch === '"') {
+        quoteChar = ch;
+        current += ch;
+        continue;
+      }
+      if (ch === ',') {
+        items.push(current);
+        current = '';
+        continue;
+      }
+      current += ch;
+    }
+    items.push(current);
+    return items;
+  }
+
   // The one argument shape {% for %} accepts: a literal, comma-separated
   // list of quoted strings - e.g. ['open', 'closed', 'cancelled']. Same
   // string-literal-only posture parseKwargsArgument/parseVarArguments
@@ -2003,7 +2044,7 @@ var NotSoBigData = (function () {
       throw new Error('model(): "{% for %}" list "' + raw + '" is empty - needs at least one quoted item, e.g. [\'a\', \'b\'].');
     }
     var itemPattern = /^\s*(['"])([^'"]*)\1\s*$/;
-    return inner.split(',').map(function (segment) {
+    return splitTopLevelListItems(inner).map(function (segment) {
       var match = itemPattern.exec(segment);
       if (!match) {
         throw new Error('model(): "{% for %}" list "' + raw + '" is not valid - every item must be a quoted string, e.g. [\'a\', \'b\'].');
