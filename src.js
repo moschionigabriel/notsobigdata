@@ -2409,9 +2409,42 @@ var NotSoBigData = (function () {
   // Any *other* {{ name(...) }} call is rejected the same way ref()'s
   // unknown name is, for the same reason - see the module comment above
   // about growing this dispatch.
+  //
+  // A commented-out call (e.g. "-- {{ var('region') }}") must be inert here
+  // the same way it already is at discovery: extractRefDependencies()/
+  // extractConfigOverrides()/validateVarUsage()/validateSetUsage() all scan
+  // stripSqlComments()'d SQL, so a commented-out call never becomes a
+  // dependency edge or gets its var() validated against notsobigdataModels.vars.
+  // Before this function guarded against it too, that asymmetry meant a
+  // commented-out call passed cli('list') clean but could still throw at
+  // cli('run')/cli('compile') - this function scanned the raw, un-stripped
+  // sql. commentSpans()/isCommentedOut() below let each pass skip a match
+  // that falls inside a comment (returning it unchanged) without stripping
+  // the comment text out of the compiled SQL - unlike discovery, which only
+  // needs to *ignore* comments, this function has to *emit* them unchanged,
+  // since a real, non-macro SQL comment is legitimate output.
+  function commentSpans(text) {
+    var spans = [];
+    [/--[^\n]*/g, /\/\*[\s\S]*?\*\//g].forEach(function (pattern) {
+      var match;
+      while ((match = pattern.exec(text))) {
+        spans.push([match.index, match.index + match[0].length]);
+      }
+    });
+    return spans;
+  }
+
+  function isCommentedOut(spans, offset) {
+    return spans.some(function (span) { return offset >= span[0] && offset < span[1]; });
+  }
+
   function compileModelSql(sql, resolveRef, registry) {
     var setValues = extractSetStatements(sql);
-    var compiled = sql.replace(templateExpressionPattern(), function (raw, call, args) {
+    var refConfigVarSpans = commentSpans(sql);
+    var compiled = sql.replace(templateExpressionPattern(), function (raw, call, args, offset) {
+      if (isCommentedOut(refConfigVarSpans, offset)) {
+        return raw;
+      }
       if (call === 'config') {
         parseKwargsArgument('config', args);
         return '';
@@ -2426,8 +2459,20 @@ var NotSoBigData = (function () {
       }
       return resolveRef(parseSingleStringArgument('ref', args));
     });
-    compiled = compiled.replace(setStatementPattern(), '');
-    compiled = compiled.replace(bareVarPattern(), function (raw, name) {
+    // Spans recomputed against `compiled`, not reused from refConfigVarSpans
+    // above - the first pass above never touches a comment's own text (a
+    // commented-out match returns unchanged), so comment syntax still exists
+    // to find, just possibly at different offsets since substitutions
+    // outside comments changed the string's length.
+    var setSpans = commentSpans(compiled);
+    compiled = compiled.replace(setStatementPattern(), function (raw, key, quote, value, offset) {
+      return isCommentedOut(setSpans, offset) ? raw : '';
+    });
+    var bareVarSpans = commentSpans(compiled);
+    compiled = compiled.replace(bareVarPattern(), function (raw, name, offset) {
+      if (isCommentedOut(bareVarSpans, offset)) {
+        return raw;
+      }
       if (!has(setValues, name)) {
         throw new Error('model(): {{ ' + name + ' }} references "' + name + '", which is never set via {% set ' + name + ' = ... %} in this SQL.');
       }
@@ -2443,8 +2488,19 @@ var NotSoBigData = (function () {
     // generic scanner exists to avoid. Checking for both "{{" and "{%"
     // catches a malformed {% set %} (or an unimplemented {% if %}) the same
     // way it already catches a malformed {{ ref(...) }}.
-    if (compiled.indexOf('{{') !== -1 || compiled.indexOf('{%') !== -1) {
-      throw new Error('model(): SQL still contains "{{" or "{%" after substitution - check for a malformed template call or {% set %} statement.');
+    //
+    // A leftover "{{"/"{%" inside a comment is not this failure mode - it's
+    // the commented-out, deliberately-untouched syntax the three passes
+    // above just left alone - so this scan skips any occurrence inside a
+    // comment span the same way those passes did, rather than flagging
+    // every commented-out macro call as a malformed one.
+    var strayPattern = /\{\{|\{%/g;
+    var straySpans = commentSpans(compiled);
+    var strayMatch;
+    while ((strayMatch = strayPattern.exec(compiled))) {
+      if (!isCommentedOut(straySpans, strayMatch.index)) {
+        throw new Error('model(): SQL still contains "{{" or "{%" after substitution - check for a malformed template call or {% set %} statement.');
+      }
     }
     return compiled;
   }
