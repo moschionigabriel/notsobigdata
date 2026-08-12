@@ -1038,6 +1038,36 @@ var NotSoBigData = (function () {
     );
   }
 
+  // Promotes a staging table into its real destination via a BigQuery copy
+  // job (a metadata-level table copy, no query slots consumed - not a
+  // second "SELECT * FROM staging" write). The one piece of "stage, test,
+  // promote" this function's own two callers - loadBigQueryStaged below and
+  // model.js's modelTableStaged - need identically, extracted so a future
+  // copy-job quirk only needs fixing in one place. widenDestinationTableForPromotion's
+  // own discovery is exactly that kind of quirk: schemaUpdateOptions on the
+  // copy job itself was tried first and confirmed, against a real project,
+  // not to work the way a load job's does - if a second such quirk ever
+  // turns up, this is the one function both callers already share, not two
+  // independently-written copy calls that could drift apart in only fixing
+  // it for whichever caller happened to hit it first.
+  //
+  // widenFirst is the caller's own decision, not something this function
+  // infers - loadBigQueryStaged only widens for allowSchemaEvolution +
+  // WRITE_APPEND (see its own comment); model.js's promotion is always a
+  // full WRITE_TRUNCATE replace with no schema-evolution concept of its
+  // own, so it always passes false.
+  function promoteStagedTable(target, stagingTable, writeDisposition, widenFirst) {
+    if (widenFirst) {
+      widenDestinationTableForPromotion(target, stagingTable);
+    }
+    var copyConfig = {
+      sourceTable: { projectId: target.projectId, datasetId: target.dataset, tableId: stagingTable },
+      destinationTable: { projectId: target.projectId, datasetId: target.dataset, tableId: target.table },
+      writeDisposition: writeDisposition
+    };
+    return runBigQueryJob({ configuration: { copy: copyConfig } }, target.projectId, null, 'copy');
+  }
+
   // Stages rows into a brand-new scratch table, runs target.sqlTests
   // against it, and only if every test passes promotes - via a BigQuery
   // copy job, not a second CSV upload - into the real target. A failing
@@ -1078,16 +1108,8 @@ var NotSoBigData = (function () {
 
       var testResults = runSqlTests(target.sqlTests, { projectId: target.projectId, dataset: target.dataset, table: stagingTable }, 'move(): bigquery target.sqlTests');
 
-      if (target.allowSchemaEvolution && writeDisposition === 'WRITE_APPEND') {
-        widenDestinationTableForPromotion(target, stagingTable);
-      }
-
-      var copyConfig = {
-        sourceTable: { projectId: target.projectId, datasetId: target.dataset, tableId: stagingTable },
-        destinationTable: { projectId: target.projectId, datasetId: target.dataset, tableId: target.table },
-        writeDisposition: writeDisposition
-      };
-      var promoteJobId = runBigQueryJob({ configuration: { copy: copyConfig } }, target.projectId, null, 'copy');
+      var widenFirst = !!(target.allowSchemaEvolution && writeDisposition === 'WRITE_APPEND');
+      var promoteJobId = promoteStagedTable(target, stagingTable, writeDisposition, widenFirst);
 
       return {
         projectId: target.projectId, dataset: target.dataset, table: target.table, jobId: promoteJobId,
@@ -3106,7 +3128,12 @@ var NotSoBigData = (function () {
   // GAS-execution-timeout reasoning behind the staging table's
   // belt-and-suspenders expiration_timestamp). Reuses move.js's
   // resolveStagingTableId rather than growing a second staging-id helper -
-  // it was already generic, just previously only called from move.js.
+  // it was already generic, just previously only called from move.js. As of
+  // 2026-08-11, promotion itself also reuses move.js's promoteStagedTable()
+  // rather than a second hand-written copy job - see that function's own
+  // comment for why (a future BigQuery copy-job quirk, the kind
+  // widenDestinationTableForPromotion already was once, should only ever
+  // need fixing in one place).
   //
   // Promotion is a BigQuery *copy* job (configuration.copy,
   // WRITE_TRUNCATE - a full replace, matching what CREATE OR REPLACE TABLE
@@ -3150,12 +3177,17 @@ var NotSoBigData = (function () {
         'model(): "' + config.name + '" tests'
       );
 
-      var copyConfig = {
-        sourceTable: { projectId: config.projectId, datasetId: config.dataset, tableId: stagingTable },
-        destinationTable: { projectId: config.projectId, datasetId: config.dataset, tableId: config.name },
-        writeDisposition: 'WRITE_TRUNCATE'
-      };
-      runBigQueryJob({ configuration: { copy: copyConfig } }, config.projectId, null, 'copy');
+      // Reuses move.js's promoteStagedTable() rather than a second, hand-written
+      // copy job - the same primitive loadBigQueryStaged uses for its own
+      // promotion, so a future BigQuery copy-job quirk discovered against
+      // either caller (widenDestinationTableForPromotion was one such quirk)
+      // only ever needs fixing in the one function both share. widenFirst is
+      // always false here: a model's promotion is always a full WRITE_TRUNCATE
+      // replace, with no schema-evolution concept of its own to opt into.
+      promoteStagedTable(
+        { projectId: config.projectId, dataset: config.dataset, table: config.name },
+        stagingTable, 'WRITE_TRUNCATE', false
+      );
 
       return { relation: relation, materialized: 'table', staged: { table: stagingTable }, testResults: testResults };
     } finally {

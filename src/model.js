@@ -1626,7 +1626,12 @@ function model(config) {
 // GAS-execution-timeout reasoning behind the staging table's
 // belt-and-suspenders expiration_timestamp). Reuses move.js's
 // resolveStagingTableId rather than growing a second staging-id helper -
-// it was already generic, just previously only called from move.js.
+// it was already generic, just previously only called from move.js. As of
+// 2026-08-11, promotion itself also reuses move.js's promoteStagedTable()
+// rather than a second hand-written copy job - see that function's own
+// comment for why (a future BigQuery copy-job quirk, the kind
+// widenDestinationTableForPromotion already was once, should only ever
+// need fixing in one place).
 //
 // Promotion is a BigQuery *copy* job (configuration.copy,
 // WRITE_TRUNCATE - a full replace, matching what CREATE OR REPLACE TABLE
@@ -1670,12 +1675,17 @@ function modelTableStaged(config, compiled, relation, registry) {
       'model(): "' + config.name + '" tests'
     );
 
-    var copyConfig = {
-      sourceTable: { projectId: config.projectId, datasetId: config.dataset, tableId: stagingTable },
-      destinationTable: { projectId: config.projectId, datasetId: config.dataset, tableId: config.name },
-      writeDisposition: 'WRITE_TRUNCATE'
-    };
-    runBigQueryJob({ configuration: { copy: copyConfig } }, config.projectId, null, 'copy');
+    // Reuses move.js's promoteStagedTable() rather than a second, hand-written
+    // copy job - the same primitive loadBigQueryStaged uses for its own
+    // promotion, so a future BigQuery copy-job quirk discovered against
+    // either caller (widenDestinationTableForPromotion was one such quirk)
+    // only ever needs fixing in the one function both share. widenFirst is
+    // always false here: a model's promotion is always a full WRITE_TRUNCATE
+    // replace, with no schema-evolution concept of its own to opt into.
+    promoteStagedTable(
+      { projectId: config.projectId, dataset: config.dataset, table: config.name },
+      stagingTable, 'WRITE_TRUNCATE', false
+    );
 
     return { relation: relation, materialized: 'table', staged: { table: stagingTable }, testResults: testResults };
   } finally {

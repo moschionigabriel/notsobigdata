@@ -1028,6 +1028,36 @@ function widenDestinationTableForPromotion(target, stagingTable) {
   );
 }
 
+// Promotes a staging table into its real destination via a BigQuery copy
+// job (a metadata-level table copy, no query slots consumed - not a
+// second "SELECT * FROM staging" write). The one piece of "stage, test,
+// promote" this function's own two callers - loadBigQueryStaged below and
+// model.js's modelTableStaged - need identically, extracted so a future
+// copy-job quirk only needs fixing in one place. widenDestinationTableForPromotion's
+// own discovery is exactly that kind of quirk: schemaUpdateOptions on the
+// copy job itself was tried first and confirmed, against a real project,
+// not to work the way a load job's does - if a second such quirk ever
+// turns up, this is the one function both callers already share, not two
+// independently-written copy calls that could drift apart in only fixing
+// it for whichever caller happened to hit it first.
+//
+// widenFirst is the caller's own decision, not something this function
+// infers - loadBigQueryStaged only widens for allowSchemaEvolution +
+// WRITE_APPEND (see its own comment); model.js's promotion is always a
+// full WRITE_TRUNCATE replace with no schema-evolution concept of its
+// own, so it always passes false.
+function promoteStagedTable(target, stagingTable, writeDisposition, widenFirst) {
+  if (widenFirst) {
+    widenDestinationTableForPromotion(target, stagingTable);
+  }
+  var copyConfig = {
+    sourceTable: { projectId: target.projectId, datasetId: target.dataset, tableId: stagingTable },
+    destinationTable: { projectId: target.projectId, datasetId: target.dataset, tableId: target.table },
+    writeDisposition: writeDisposition
+  };
+  return runBigQueryJob({ configuration: { copy: copyConfig } }, target.projectId, null, 'copy');
+}
+
 // Stages rows into a brand-new scratch table, runs target.sqlTests
 // against it, and only if every test passes promotes - via a BigQuery
 // copy job, not a second CSV upload - into the real target. A failing
@@ -1068,16 +1098,8 @@ function loadBigQueryStaged(rows, target, writeDisposition) {
 
     var testResults = runSqlTests(target.sqlTests, { projectId: target.projectId, dataset: target.dataset, table: stagingTable }, 'move(): bigquery target.sqlTests');
 
-    if (target.allowSchemaEvolution && writeDisposition === 'WRITE_APPEND') {
-      widenDestinationTableForPromotion(target, stagingTable);
-    }
-
-    var copyConfig = {
-      sourceTable: { projectId: target.projectId, datasetId: target.dataset, tableId: stagingTable },
-      destinationTable: { projectId: target.projectId, datasetId: target.dataset, tableId: target.table },
-      writeDisposition: writeDisposition
-    };
-    var promoteJobId = runBigQueryJob({ configuration: { copy: copyConfig } }, target.projectId, null, 'copy');
+    var widenFirst = !!(target.allowSchemaEvolution && writeDisposition === 'WRITE_APPEND');
+    var promoteJobId = promoteStagedTable(target, stagingTable, writeDisposition, widenFirst);
 
     return {
       projectId: target.projectId, dataset: target.dataset, table: target.table, jobId: promoteJobId,
