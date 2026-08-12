@@ -1007,17 +1007,44 @@ function runDebugChecks(nodes) {
   return checks;
 }
 
+// The five status values a debug check can report (see
+// classifyProbeError()/fetchProbe()/probeSheets/probeDrive/probeBigQuery/
+// probeApi/probeUrl/probeCustom above, and connectorTuplesForNode()'s own
+// 'unknown connector type' fallback) and the label formatDebugStatusCounts()
+// below renders each one under - one ordered list, not two separately
+// hardcoded objects (a `counts` seed and a `labels` map) that used to have
+// to be kept in sync by hand. A status added, renamed, or removed from one
+// of the probe functions above only needs updating here now; before this,
+// a status produced there but missing from formatDebugStatusCounts()'s own
+// `counts` object would silently render as "NaN <status>" in the summary
+// line (`counts[status] += 1` on an undefined key is `NaN`), rather than
+// failing loudly the way this file treats every other config/name mismatch.
+var DEBUG_CHECK_STATUSES = [
+  { status: 'ok', label: 'ok' },
+  { status: 'missing_scope', label: 'missing scope' },
+  { status: 'service_not_enabled', label: 'service not enabled' },
+  { status: 'error', label: 'error' },
+  { status: 'unverifiable', label: 'unverifiable' }
+];
+
 // formatStatusCounts()'s counterpart for a debug report's check statuses
 // rather than a run report's node statuses - same "only render non-zero
 // counts" reasoning, kept separate since the two status vocabularies
-// don't overlap (a check is never 'success'/'skipped'/'planned').
+// don't overlap (a check is never 'success'/'skipped'/'planned'). Throws
+// on a status outside DEBUG_CHECK_STATUSES rather than silently producing
+// NaN - see that list's own comment above.
 function formatDebugStatusCounts(checks) {
-  var counts = { ok: 0, missing_scope: 0, service_not_enabled: 0, error: 0, unverifiable: 0 };
-  checks.forEach(function (check) { counts[check.status] += 1; });
-  var labels = { ok: 'ok', missing_scope: 'missing scope', service_not_enabled: 'service not enabled', error: 'error', unverifiable: 'unverifiable' };
-  var parts = Object.keys(labels)
-    .filter(function (status) { return counts[status] > 0; })
-    .map(function (status) { return counts[status] + ' ' + labels[status]; });
+  var counts = emptyMap();
+  DEBUG_CHECK_STATUSES.forEach(function (entry) { counts[entry.status] = 0; });
+  checks.forEach(function (check) {
+    if (!has(counts, check.status)) {
+      throw new Error('cli(): debug check reported unknown status "' + check.status + '" - add it to DEBUG_CHECK_STATUSES.');
+    }
+    counts[check.status] += 1;
+  });
+  var parts = DEBUG_CHECK_STATUSES
+    .filter(function (entry) { return counts[entry.status] > 0; })
+    .map(function (entry) { return counts[entry.status] + ' ' + entry.label; });
   return parts.length ? parts.join(', ') : 'nothing to check';
 }
 
