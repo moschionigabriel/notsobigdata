@@ -3660,10 +3660,19 @@ var NotSoBigData = (function () {
   // Turns one runNodes() result into a manifest-safe summary. Kind-agnostic
   // by construction: it never branches on node.kind, only on the *shape* of
   // the result (an array of rows, an object carrying loadResult/testResults,
-  // or model()'s relation/materialized) - the same shapes every EXECUTORS
-  // entry already produces. The raw rows are never included, only their
-  // size - a manifest is an observability artifact, not a second copy of
-  // the data that already landed at its real destination.
+  // or model()'s relation/materialized/staged) - the same shapes every
+  // EXECUTORS entry already produces. The raw rows are never included, only
+  // their size - a manifest is an observability artifact, not a second copy
+  // of the data that already landed at its real destination.
+  //
+  // staged (model.js's modelTableStaged(), a table model with tests) is its
+  // own independent `if`, same as every other optional field here - it was
+  // missing until a code-review pass caught it (2026-08-11): the staging
+  // table itself is already gone by the time a manifest is written (deleted
+  // in modelTableStaged()'s own finally block), so this field is purely
+  // informational, recording that this run went through the staged path at
+  // all rather than materializing directly - worth knowing from the
+  // manifest alone, without having to infer it from materialized/tests.
   function summarizeNodeResult(result) {
     var summary = { name: result.name, kind: result.kind, status: result.status };
     if (result.status === 'skipped') {
@@ -3694,6 +3703,9 @@ var NotSoBigData = (function () {
       if (result.result && result.result.relation !== undefined) {
         summary.relation = result.result.relation;
         summary.materialized = result.result.materialized;
+      }
+      if (result.result && result.result.staged !== undefined) {
+        summary.staged = result.result.staged;
       }
     }
     return summary;

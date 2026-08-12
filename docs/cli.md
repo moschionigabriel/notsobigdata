@@ -303,8 +303,12 @@ It never contains the actual rows a node moved — only their shape
 `testResults`, if present, or — for a `model` node — the `relation` it
 materialized and as which (`materialized: 'view'` or `'table'`), plus its
 own `testResults` if it declared `tests` (see [docs/model.md](model.md)).
-This keeps the file's size independent of how much data your pipeline
-actually moves.
+A `table` model with `tests` also carries `staged: { table: '...' }`,
+naming the scratch table its data was tested in before being promoted —
+purely informational, since that table is already deleted by the time the
+manifest is written; it just records that this run went through the
+staged-then-promoted path at all. This keeps the file's size independent
+of how much data your pipeline actually moves.
 
 On by default. Configure it with an optional top-level `var`, same
 declaration style as a node:
