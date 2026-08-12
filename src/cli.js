@@ -668,13 +668,15 @@ function buildManifest(commandText, ok, results, ignored) {
   };
 }
 
-// Writes the run manifest to Drive, overwriting the same file every time
-// (found by name via upsertByName, never a fresh file per run - creating
-// one per run is exactly the pattern that piled up duplicate fixture
-// files in the test project before, see CLAUDE.md's "About testing").
-// Best-effort: a Drive failure here must never throw or affect the
+// Shared by writeManifest()/writeCompileManifest() below - both do the
+// exact same "resolve folder, upsert by name via Drive, log every outcome,
+// never throw" work, differing only in which global they read config from
+// and what prefix they log under (logPrefix), so this is the one place
+// that actually writes, called with each caller's own already-resolved
+// config plus the *other* one's config for the collision guard right
+// below. Best-effort: a Drive failure here must never throw or affect the
 // node results actually being reported, so every path is caught and
-// turned into one of three report.manifest shapes instead.
+// turned into one of four report.manifest shapes instead.
 //
 // Every outcome also gets a Logger.log line, same as every other outcome
 // in a run (the call-level START/DONE, each node's START/OK/FAIL/SKIP/PLAN).
@@ -689,24 +691,47 @@ function buildManifest(commandText, ok, results, ignored) {
 // time - the first helper call to cross the move.js/cli.js boundary, and
 // deliberately so: this is genuinely the same primitive loadDriveJson
 // already uses, not new drive-writing logic.
-function writeManifest(commandText, ok, results, ignored) {
-  var config = resolveManifestConfig();
+//
+// otherConfig is only consulted (and only ever costs a Drive lookup, via
+// resolveManifestFolderId(), when its own folderId is unset) if it's
+// enabled - a disabled manifest can never actually be overwritten, so
+// there is nothing to guard against. When both configs resolve to the
+// same folderId + fileName, refusing to write (rather than writing
+// anyway) is the only choice that can't silently destroy whichever
+// manifest was written most recently - a run's manifest overwritten by a
+// later compile, or vice versa, with no error either time it happened
+// before this guard existed.
+function writeManifestFile(logPrefix, config, otherConfig, commandText, ok, results, ignored) {
   if (!config.enabled) {
-    Logger.log('MANIFEST skipped - notsobigdataManifest.enabled is false');
+    Logger.log(logPrefix + ' skipped - enabled is false');
     return { written: false, reason: 'disabled' };
   }
   try {
     var folderId = resolveManifestFolderId(config.folderId);
+    if (otherConfig.enabled) {
+      var otherFolderId = resolveManifestFolderId(otherConfig.folderId);
+      if (folderId === otherFolderId && config.fileName === otherConfig.fileName) {
+        var message = 'notsobigdataManifest and notsobigdataCompileManifest resolve to the same Drive file (folderId "'
+          + folderId + '", fileName "' + config.fileName + '") - refusing to write, since cli(\'run\') and cli(\'compile\') '
+          + 'would otherwise silently overwrite each other\'s manifest. Give one of them its own folderId or fileName.';
+        Logger.log(logPrefix + ' failed - ' + message);
+        return { written: false, reason: 'collision', error: message };
+      }
+    }
     var manifest = buildManifest(commandText, ok, results, ignored);
     var target = { folderId: folderId, fileName: config.fileName, upsertByName: true };
     var fileId = resolveDriveWriteTarget(target);
     fileId = writeDriveText(fileId, target, JSON.stringify(manifest, null, 2), MimeType.PLAIN_TEXT);
-    Logger.log('MANIFEST written to ' + fileId);
+    Logger.log(logPrefix + ' written to ' + fileId);
     return { written: true, fileId: fileId };
   } catch (error) {
-    Logger.log('MANIFEST failed - ' + error.message);
+    Logger.log(logPrefix + ' failed - ' + error.message);
     return { written: false, reason: 'error', error: error.message };
   }
+}
+
+function writeManifest(commandText, ok, results, ignored) {
+  return writeManifestFile('MANIFEST', resolveManifestConfig(), resolveCompileManifestConfig(), commandText, ok, results, ignored);
 }
 
 // Reads the optional notsobigdataCompileManifest global, same guarded
@@ -727,31 +752,15 @@ function resolveCompileManifestConfig() {
 }
 
 // cli('compile')'s counterpart to writeManifest() above - same
-// upsert-by-name Drive write, same best-effort/never-throw contract, same
-// "every outcome gets a Logger.log line" reasoning - but to its own file,
-// via resolveCompileManifestConfig() rather than resolveManifestConfig().
-// A compile pass never touches BigQuery/Sheets/Drive, so it must never
-// overwrite the run manifest's own record of what the last real run
-// actually did - see docs/cli.md's "The compile manifest" for the
-// user-facing version of this reasoning.
+// writeManifestFile() call, to its own file via resolveCompileManifestConfig()
+// rather than resolveManifestConfig(). A compile pass never touches
+// BigQuery/Sheets/Drive, so it must never overwrite the run manifest's own
+// record of what the last real run actually did - see docs/cli.md's "The
+// compile manifest" for the user-facing version of this reasoning, and
+// writeManifestFile()'s own comment above for how the same-target case is
+// now caught rather than silently allowed.
 function writeCompileManifest(commandText, ok, results, ignored) {
-  var config = resolveCompileManifestConfig();
-  if (!config.enabled) {
-    Logger.log('COMPILE MANIFEST skipped - notsobigdataCompileManifest.enabled is false');
-    return { written: false, reason: 'disabled' };
-  }
-  try {
-    var folderId = resolveManifestFolderId(config.folderId);
-    var manifest = buildManifest(commandText, ok, results, ignored);
-    var target = { folderId: folderId, fileName: config.fileName, upsertByName: true };
-    var fileId = resolveDriveWriteTarget(target);
-    fileId = writeDriveText(fileId, target, JSON.stringify(manifest, null, 2), MimeType.PLAIN_TEXT);
-    Logger.log('COMPILE MANIFEST written to ' + fileId);
-    return { written: true, fileId: fileId };
-  } catch (error) {
-    Logger.log('COMPILE MANIFEST failed - ' + error.message);
-    return { written: false, reason: 'error', error: error.message };
-  }
+  return writeManifestFile('COMPILE MANIFEST', resolveCompileManifestConfig(), resolveManifestConfig(), commandText, ok, results, ignored);
 }
 
 // cli('debug') - a diagnostic, non-mutating check of whether the current

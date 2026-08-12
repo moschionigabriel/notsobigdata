@@ -330,6 +330,16 @@ never happened. The execution log has the same three-outcome line, prefixed
 `COMPILE MANIFEST` instead of `MANIFEST`, so you can tell the two apart at a
 glance.
 
+If `notsobigdataManifest` and `notsobigdataCompileManifest` are configured
+with the same `folderId` + `fileName` (only possible if you set at least
+one of them explicitly — the defaults never collide), neither manifest is
+written: `cli('run')` and `cli('compile')` would otherwise silently
+overwrite each other's file, so both refuse instead, logging a
+`MANIFEST failed - .../COMPILE MANIFEST failed - ...` line that names
+which two globals collided. Give one of them its own `folderId` or
+`fileName` to fix it — this doesn't affect `report.ok` or any node's own
+result, only whether the manifest file itself gets written.
+
 ```json
 {
   "notsobigdata": "manifest",
