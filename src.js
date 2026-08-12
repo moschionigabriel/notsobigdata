@@ -3922,15 +3922,20 @@ var NotSoBigData = (function () {
   // Shared by probeUrl and probeApi. Always forces a GET and always mutes
   // HTTP exceptions: the status code is deliberately irrelevant to whether
   // this counts as 'ok' (see the module comment above) - only a thrown
-  // error means UrlFetchApp itself couldn't make the call. method/payload
-  // are stripped out of options rather than merged in, so a target's own
-  // POST configuration can never leak through and turn a probe into a
-  // second real write.
+  // error means UrlFetchApp itself couldn't make the call. method/payload/
+  // muteHttpExceptions are all stripped out of options rather than merged
+  // in - method/payload so a target's own POST configuration can never leak
+  // through and turn a probe into a second real write, muteHttpExceptions
+  // so a node's own options (e.g. one that sets muteHttpExceptions: false
+  // to let its real call inspect a non-2xx response body) can never
+  // override the forced true here and turn a perfectly reachable, non-2xx
+  // endpoint into a thrown error this function misreports as 'missing_scope'
+  // or 'error' instead of 'ok'.
   function fetchProbe(url, options, type, role) {
     var fetchOptions = { method: 'get', muteHttpExceptions: true };
     if (options) {
       Object.keys(options).forEach(function (key) {
-        if (key !== 'method' && key !== 'payload') {
+        if (key !== 'method' && key !== 'payload' && key !== 'muteHttpExceptions') {
           fetchOptions[key] = options[key];
         }
       });
