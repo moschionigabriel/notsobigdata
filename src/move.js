@@ -182,9 +182,22 @@ function extractDrive(source) {
 // any non-GitHub host - Kaggle included, which needs authenticated API
 // access this library deliberately doesn't take on) passes through
 // unchanged.
+//
+// The path capture is split on the first "?"/"#" before being reused, so a
+// trailing query string or line-range fragment from a URL copied straight
+// out of the GitHub UI (e.g. "...blob/main/data.csv?raw=true", or a
+// "#L10-L20" line-range link) doesn't get forwarded verbatim into the
+// rewritten raw.githubusercontent.com URL - that host doesn't understand
+// either one, and a query string in particular could produce a different
+// or unexpected response instead of the plain file body this function
+// exists to fetch.
 function rewriteGithubBlobUrl(url) {
   var match = /^https:\/\/github\.com\/([^\/]+)\/([^\/]+)\/blob\/(.+)$/.exec(url);
-  return match ? 'https://raw.githubusercontent.com/' + match[1] + '/' + match[2] + '/' + match[3] : url;
+  if (!match) {
+    return url;
+  }
+  var path = match[3].split(/[?#]/)[0];
+  return 'https://raw.githubusercontent.com/' + match[1] + '/' + match[2] + '/' + path;
 }
 
 // Fetches a URL's body as text. Shared by extractUrlCsv/Json below - the
