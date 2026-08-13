@@ -25,7 +25,7 @@ only, not as source to port.
 The intentioin is to wrap the whole library in a IFFE funciton and then "call" it from google apps script like this:
 
 ``` javascript
-    eval(UrlFetchApp.fetch('https://raw.githubusercontent.com/moschionigabriel/notsobigdata/main/src.js').getContentText())
+    eval(UrlFetchApp.fetch('https://raw.githubusercontent.com/notsobigdata/lib/main/src.js').getContentText())
 ```
 
 In that way we can use custom gas functions within the user scope (like reading html files) without problemse

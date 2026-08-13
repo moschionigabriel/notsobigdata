@@ -13,7 +13,7 @@
 // so setupScriptProperties() can still run standalone on a fresh project.
 var SRC_REF = PropertiesService.getScriptProperties().getProperty('SRC_REF');
 if (SRC_REF) {
-  var SRC_URL = 'https://raw.githubusercontent.com/moschionigabriel/notsobigdata/' + SRC_REF + '/src.js';
+  var SRC_URL = 'https://raw.githubusercontent.com/notsobigdata/lib/' + SRC_REF + '/src.js';
   eval(UrlFetchApp.fetch(SRC_URL).getContentText());
 }
 

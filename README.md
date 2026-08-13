@@ -38,7 +38,7 @@ right order from the dependencies you declared, and runs them:
 
 ```javascript
 // Top level of a .gs file — see the scope warning under Installation.
-eval(UrlFetchApp.fetch('https://raw.githubusercontent.com/moschionigabriel/notsobigdata/v1.0.0/src.js').getContentText())
+eval(UrlFetchApp.fetch('https://raw.githubusercontent.com/notsobigdata/lib/v1.0.0/src.js').getContentText())
 
 var props = PropertiesService.getScriptProperties().getProperties();
 
@@ -83,7 +83,7 @@ The library is pulled into your Apps Script project at runtime — no package
 manager, no build step, just one line:
 
 ```javascript
-eval(UrlFetchApp.fetch('https://raw.githubusercontent.com/moschionigabriel/notsobigdata/main/src.js').getContentText())
+eval(UrlFetchApp.fetch('https://raw.githubusercontent.com/notsobigdata/lib/main/src.js').getContentText())
 ```
 
 > **Where you put your code matters — for two things.**
@@ -112,7 +112,7 @@ trusting this repo continuously rather than once.
 different:
 
 ```javascript
-eval(UrlFetchApp.fetch('https://raw.githubusercontent.com/moschionigabriel/notsobigdata/v1.0.0/src.js').getContentText())
+eval(UrlFetchApp.fetch('https://raw.githubusercontent.com/notsobigdata/lib/v1.0.0/src.js').getContentText())
 ```
 
 Unlike `main`, a tag never moves — `v1.0.0` will keep pointing at exactly
