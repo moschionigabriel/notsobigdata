@@ -38,7 +38,7 @@ right order from the dependencies you declared, and runs them:
 
 ```javascript
 // Top level of a .gs file — see the scope warning under Installation.
-eval(UrlFetchApp.fetch('https://raw.githubusercontent.com/moschionigabriel/notsobigdata/main/src.js').getContentText())
+eval(UrlFetchApp.fetch('https://raw.githubusercontent.com/moschionigabriel/notsobigdata/v1.0.0/src.js').getContentText())
 
 var props = PropertiesService.getScriptProperties().getProperties();
 
