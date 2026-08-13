@@ -144,7 +144,7 @@ var NotSoBigData = (function () {
     return objectsToRows(JSON.parse(readDriveFileText(fileId)));
   }
 
-  // Apps Script has no native XLSX parser, so this converts the file to a
+  // Apps Script has no native XLSX parser, so this converts a file to a
   // temporary Google Sheet via the Advanced Drive Service, reads it with
   // SpreadsheetApp, and always deletes the temp copy afterward — including
   // on error — so a failed extract never leaves an orphan file in the
@@ -152,8 +152,13 @@ var NotSoBigData = (function () {
   // which one the Advanced Drive Service expects depends on the API
   // version configured in the consumer's appsscript.json — the unused one
   // is simply ignored by whichever version is active.
-  function extractDriveXlsx(fileId) {
-    var tempFileName = 'notsobigdata-xlsx-import-' + fileId;
+  //
+  // Shared by extractDriveXlsx (fileId is already a real Drive file) and
+  // extractUrlXlsx below (fileId is a freshly-uploaded temp copy of a
+  // fetched blob) - both need exactly the same "copy to a Google Sheet,
+  // read it, delete the copy" steps, just starting from a file id reached
+  // two different ways.
+  function readXlsxFileIdAsGrid(fileId, tempFileName) {
     var tempFileMetadata = Drive.Files.copy(
       { name: tempFileName, title: tempFileName, mimeType: MimeType.GOOGLE_SHEETS },
       fileId
@@ -165,6 +170,10 @@ var NotSoBigData = (function () {
     } finally {
       Drive.Files.remove(tempFileMetadata.id);
     }
+  }
+
+  function extractDriveXlsx(fileId) {
+    return readXlsxFileIdAsGrid(fileId, 'notsobigdata-xlsx-import-' + fileId);
   }
 
   function extractDrive(source) {
@@ -227,10 +236,11 @@ var NotSoBigData = (function () {
     return objectsToRows(JSON.parse(readUrlText(url, options)));
   }
 
-  // Mirrors extractDriveXlsx's temp-Google-Sheet trick, but starting from a
-  // fetched blob instead of an existing Drive file id. Getting from "a blob"
-  // to "a Drive file id" needs a plain DriveApp upload first (no conversion,
-  // just bytes) - Drive.Files.insert would do that upload *and* the GOOGLE_
+  // Mirrors extractDriveXlsx's temp-Google-Sheet trick (both now go through
+  // the shared readXlsxFileIdAsGrid above), but starting from a fetched blob
+  // instead of an existing Drive file id. Getting from "a blob" to "a Drive
+  // file id" needs a plain DriveApp upload first (no conversion, just
+  // bytes) - Drive.Files.insert would do that upload *and* the GOOGLE_
   // SHEETS conversion in one call, but insert is Drive API v2 only; v3 (what
   // a newly-enabled Advanced Drive Service defaults to today) renamed it to
   // Files.create, and guessing which one a consumer's appsscript.json has
@@ -242,25 +252,15 @@ var NotSoBigData = (function () {
   // createFile here - either way, a plain create followed by Drive.Files.copy
   // doing the conversion), rather than adding a second untested code path.
   // Both temp files - the raw upload and the converted sheet - are removed
-  // in nested finally blocks, including on error, so a failure at either
-  // step never leaves an orphan behind.
+  // on error too: the raw upload via this function's own finally, the
+  // converted sheet via readXlsxFileIdAsGrid's own finally underneath it.
   function extractUrlXlsx(url, options) {
     var response = UrlFetchApp.fetch(url, options || {});
     assertHttpOk(response, 'move(): url source request to "' + url + '" failed');
     var tempFileName = 'notsobigdata-xlsx-import-' + Utilities.getUuid();
     var rawFileId = DriveApp.getRootFolder().createFile(response.getBlob().setName(tempFileName)).getId();
     try {
-      var tempFileMetadata = Drive.Files.copy(
-        { name: tempFileName, title: tempFileName, mimeType: MimeType.GOOGLE_SHEETS },
-        rawFileId
-      );
-      try {
-        var spreadsheet = SpreadsheetApp.openById(tempFileMetadata.id);
-        var values = spreadsheet.getActiveSheet().getDataRange().getValues();
-        return isBlankGrid(values) ? [] : values;
-      } finally {
-        Drive.Files.remove(tempFileMetadata.id);
-      }
+      return readXlsxFileIdAsGrid(rawFileId, tempFileName);
     } finally {
       Drive.Files.remove(rawFileId);
     }
@@ -3776,18 +3776,26 @@ var NotSoBigData = (function () {
     return parts.length ? parts.join(', ') : 'nothing to do';
   }
 
-  // Reads the optional notsobigdataManifest global the same guarded way
+  // Reads an optional manifest-config global the same guarded way
   // discoverNodes() reads every other global - the read must never throw
-  // because of something this library doesn't own. Every field is
-  // optional; omitting the global entirely gives all three defaults.
-  function resolveManifestConfig() {
-    var raw = readOptionalGlobal('notsobigdataManifest');
+  // because of something this library doesn't own. Every field is optional;
+  // omitting the global entirely gives all three defaults. Shared by
+  // resolveManifestConfig() and resolveCompileManifestConfig() below, which
+  // differ only in which global they read and the fileName default - see
+  // resolveCompileManifestConfig()'s own comment for why those two stay
+  // separate globals rather than one shared config.
+  function resolveManifestConfigFrom(globalName, defaultFileName) {
+    var raw = readOptionalGlobal(globalName);
     var config = (raw && typeof raw === 'object') ? raw : {};
     return {
       enabled: config.enabled !== false,
       folderId: typeof config.folderId === 'string' && config.folderId ? config.folderId : null,
-      fileName: typeof config.fileName === 'string' && config.fileName ? config.fileName : 'notsobigdata-manifest.json'
+      fileName: typeof config.fileName === 'string' && config.fileName ? config.fileName : defaultFileName
     };
+  }
+
+  function resolveManifestConfig() {
+    return resolveManifestConfigFrom('notsobigdataManifest', 'notsobigdata-manifest.json');
   }
 
   // Reads the optional notsobigdataLogging global, same guarded pattern as
@@ -3948,21 +3956,14 @@ var NotSoBigData = (function () {
     return writeManifestFile('MANIFEST', resolveManifestConfig(), resolveCompileManifestConfig(), commandText, ok, results, ignored);
   }
 
-  // Reads the optional notsobigdataCompileManifest global, same guarded
-  // pattern and shape as resolveManifestConfig() above - a deliberately
-  // separate global, not a second field on notsobigdataManifest, so
-  // configuring (or disabling) the compile manifest can never accidentally
-  // touch the run manifest's own settings. Different default fileName for
-  // the same reason: the two are meant to coexist as two files, not fight
-  // over one.
+  // notsobigdataCompileManifest, read via the same resolveManifestConfigFrom()
+  // above - a deliberately separate global, not a second field on
+  // notsobigdataManifest, so configuring (or disabling) the compile manifest
+  // can never accidentally touch the run manifest's own settings. Different
+  // default fileName for the same reason: the two are meant to coexist as
+  // two files, not fight over one.
   function resolveCompileManifestConfig() {
-    var raw = readOptionalGlobal('notsobigdataCompileManifest');
-    var config = (raw && typeof raw === 'object') ? raw : {};
-    return {
-      enabled: config.enabled !== false,
-      folderId: typeof config.folderId === 'string' && config.folderId ? config.folderId : null,
-      fileName: typeof config.fileName === 'string' && config.fileName ? config.fileName : 'notsobigdata-compile-manifest.json'
-    };
+    return resolveManifestConfigFrom('notsobigdataCompileManifest', 'notsobigdata-compile-manifest.json');
   }
 
   // cli('compile')'s counterpart to writeManifest() above - same

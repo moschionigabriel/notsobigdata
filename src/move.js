@@ -134,7 +134,7 @@ function extractDriveJson(fileId) {
   return objectsToRows(JSON.parse(readDriveFileText(fileId)));
 }
 
-// Apps Script has no native XLSX parser, so this converts the file to a
+// Apps Script has no native XLSX parser, so this converts a file to a
 // temporary Google Sheet via the Advanced Drive Service, reads it with
 // SpreadsheetApp, and always deletes the temp copy afterward — including
 // on error — so a failed extract never leaves an orphan file in the
@@ -142,8 +142,13 @@ function extractDriveJson(fileId) {
 // which one the Advanced Drive Service expects depends on the API
 // version configured in the consumer's appsscript.json — the unused one
 // is simply ignored by whichever version is active.
-function extractDriveXlsx(fileId) {
-  var tempFileName = 'notsobigdata-xlsx-import-' + fileId;
+//
+// Shared by extractDriveXlsx (fileId is already a real Drive file) and
+// extractUrlXlsx below (fileId is a freshly-uploaded temp copy of a
+// fetched blob) - both need exactly the same "copy to a Google Sheet,
+// read it, delete the copy" steps, just starting from a file id reached
+// two different ways.
+function readXlsxFileIdAsGrid(fileId, tempFileName) {
   var tempFileMetadata = Drive.Files.copy(
     { name: tempFileName, title: tempFileName, mimeType: MimeType.GOOGLE_SHEETS },
     fileId
@@ -155,6 +160,10 @@ function extractDriveXlsx(fileId) {
   } finally {
     Drive.Files.remove(tempFileMetadata.id);
   }
+}
+
+function extractDriveXlsx(fileId) {
+  return readXlsxFileIdAsGrid(fileId, 'notsobigdata-xlsx-import-' + fileId);
 }
 
 function extractDrive(source) {
@@ -217,10 +226,11 @@ function extractUrlJson(url, options) {
   return objectsToRows(JSON.parse(readUrlText(url, options)));
 }
 
-// Mirrors extractDriveXlsx's temp-Google-Sheet trick, but starting from a
-// fetched blob instead of an existing Drive file id. Getting from "a blob"
-// to "a Drive file id" needs a plain DriveApp upload first (no conversion,
-// just bytes) - Drive.Files.insert would do that upload *and* the GOOGLE_
+// Mirrors extractDriveXlsx's temp-Google-Sheet trick (both now go through
+// the shared readXlsxFileIdAsGrid above), but starting from a fetched blob
+// instead of an existing Drive file id. Getting from "a blob" to "a Drive
+// file id" needs a plain DriveApp upload first (no conversion, just
+// bytes) - Drive.Files.insert would do that upload *and* the GOOGLE_
 // SHEETS conversion in one call, but insert is Drive API v2 only; v3 (what
 // a newly-enabled Advanced Drive Service defaults to today) renamed it to
 // Files.create, and guessing which one a consumer's appsscript.json has
@@ -232,25 +242,15 @@ function extractUrlJson(url, options) {
 // createFile here - either way, a plain create followed by Drive.Files.copy
 // doing the conversion), rather than adding a second untested code path.
 // Both temp files - the raw upload and the converted sheet - are removed
-// in nested finally blocks, including on error, so a failure at either
-// step never leaves an orphan behind.
+// on error too: the raw upload via this function's own finally, the
+// converted sheet via readXlsxFileIdAsGrid's own finally underneath it.
 function extractUrlXlsx(url, options) {
   var response = UrlFetchApp.fetch(url, options || {});
   assertHttpOk(response, 'move(): url source request to "' + url + '" failed');
   var tempFileName = 'notsobigdata-xlsx-import-' + Utilities.getUuid();
   var rawFileId = DriveApp.getRootFolder().createFile(response.getBlob().setName(tempFileName)).getId();
   try {
-    var tempFileMetadata = Drive.Files.copy(
-      { name: tempFileName, title: tempFileName, mimeType: MimeType.GOOGLE_SHEETS },
-      rawFileId
-    );
-    try {
-      var spreadsheet = SpreadsheetApp.openById(tempFileMetadata.id);
-      var values = spreadsheet.getActiveSheet().getDataRange().getValues();
-      return isBlankGrid(values) ? [] : values;
-    } finally {
-      Drive.Files.remove(tempFileMetadata.id);
-    }
+    return readXlsxFileIdAsGrid(rawFileId, tempFileName);
   } finally {
     Drive.Files.remove(rawFileId);
   }
