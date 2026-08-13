@@ -554,38 +554,72 @@ function runNodes(nodes, command, verbose) {
   return results;
 }
 
-// Counts each status in a runNodes() result set and renders it as the
-// "DONE" summary line cli() logs at the end of a run/list - see there.
-// Only non-zero counts are rendered - a "list" run (every node
-// "planned") would otherwise print "0 passed, 0 failed, 0 skipped, 5
-// planned", which buries the one number that matters in noise nobody
-// asked about. One function rather than a count/format split: this
-// project's tests are black-box (a human runs cli() from the Apps
-// Script editor - see CLAUDE.md's "About testing"), so there is no
-// caller that would ever want the raw counts independent of this one
-// string.
-function formatStatusCounts(results) {
-  var counts = { success: 0, failed: 0, skipped: 0, planned: 0 };
-  results.forEach(function (result) { counts[result.status] += 1; });
-  var labels = { success: 'passed', failed: 'failed', skipped: 'skipped', planned: 'planned' };
-  var parts = ['success', 'failed', 'skipped', 'planned']
-    .filter(function (status) { return counts[status] > 0; })
-    .map(function (status) { return counts[status] + ' ' + labels[status]; });
-  return parts.length ? parts.join(', ') : 'nothing to do';
+// The four status values a run node result can report, in the order the
+// summary line renders them - one ordered list, not two separately
+// hardcoded objects (a `counts` seed and a `labels` map) that used to have
+// to be kept in sync by hand. Mirrors DEBUG_CHECK_STATUSES below; the two
+// stay separate lists since a run status is never one of a debug check's
+// five values.
+var NODE_RESULT_STATUSES = [
+  { status: 'success', label: 'passed' },
+  { status: 'failed', label: 'failed' },
+  { status: 'skipped', label: 'skipped' },
+  { status: 'planned', label: 'planned' }
+];
+
+// Counts each item's `statusField` against an ordered {status,label} list
+// and renders only the non-zero counts, e.g. "3 passed, 1 failed" - shared
+// by formatStatusCounts() and formatDebugStatusCounts() below, which differ
+// only in which status list/field they use and the "nothing happened"
+// message. Throws on any status outside the given list rather than
+// silently producing NaN in the summary line (`counts[status] += 1` on an
+// undefined key), the way this file treats every other config/name
+// mismatch.
+function formatStatusList(items, statusField, statusList, nothingMessage, unknownContext) {
+  var counts = emptyMap();
+  statusList.forEach(function (entry) { counts[entry.status] = 0; });
+  items.forEach(function (item) {
+    var status = item[statusField];
+    if (!has(counts, status)) {
+      throw new Error('cli(): ' + unknownContext + ' reported unknown status "' + status + '".');
+    }
+    counts[status] += 1;
+  });
+  var parts = statusList
+    .filter(function (entry) { return counts[entry.status] > 0; })
+    .map(function (entry) { return counts[entry.status] + ' ' + entry.label; });
+  return parts.length ? parts.join(', ') : nothingMessage;
 }
 
-// Reads the optional notsobigdataManifest global the same guarded way
+// Renders the "DONE" summary line cli() logs at the end of a run/list -
+// see there. Only non-zero counts are rendered - a "list" run (every node
+// "planned") would otherwise print "0 passed, 0 failed, 0 skipped, 5
+// planned", which buries the one number that matters in noise nobody
+// asked about.
+function formatStatusCounts(results) {
+  return formatStatusList(results, 'status', NODE_RESULT_STATUSES, 'nothing to do', 'run node');
+}
+
+// Reads an optional manifest-config global the same guarded way
 // discoverNodes() reads every other global - the read must never throw
-// because of something this library doesn't own. Every field is
-// optional; omitting the global entirely gives all three defaults.
-function resolveManifestConfig() {
-  var raw = readOptionalGlobal('notsobigdataManifest');
+// because of something this library doesn't own. Every field is optional;
+// omitting the global entirely gives all three defaults. Shared by
+// resolveManifestConfig() and resolveCompileManifestConfig() below, which
+// differ only in which global they read and the fileName default - see
+// resolveCompileManifestConfig()'s own comment for why those two stay
+// separate globals rather than one shared config.
+function resolveManifestConfigFrom(globalName, defaultFileName) {
+  var raw = readOptionalGlobal(globalName);
   var config = (raw && typeof raw === 'object') ? raw : {};
   return {
     enabled: config.enabled !== false,
     folderId: typeof config.folderId === 'string' && config.folderId ? config.folderId : null,
-    fileName: typeof config.fileName === 'string' && config.fileName ? config.fileName : 'notsobigdata-manifest.json'
+    fileName: typeof config.fileName === 'string' && config.fileName ? config.fileName : defaultFileName
   };
+}
+
+function resolveManifestConfig() {
+  return resolveManifestConfigFrom('notsobigdataManifest', 'notsobigdata-manifest.json');
 }
 
 // Reads the optional notsobigdataLogging global, same guarded pattern as
@@ -617,10 +651,19 @@ function resolveManifestFolderId(folderId) {
 // Turns one runNodes() result into a manifest-safe summary. Kind-agnostic
 // by construction: it never branches on node.kind, only on the *shape* of
 // the result (an array of rows, an object carrying loadResult/testResults,
-// or model()'s relation/materialized) - the same shapes every EXECUTORS
-// entry already produces. The raw rows are never included, only their
-// size - a manifest is an observability artifact, not a second copy of
-// the data that already landed at its real destination.
+// or model()'s relation/materialized/staged) - the same shapes every
+// EXECUTORS entry already produces. The raw rows are never included, only
+// their size - a manifest is an observability artifact, not a second copy
+// of the data that already landed at its real destination.
+//
+// staged (model.js's modelTableStaged(), a table model with tests) is its
+// own independent `if`, same as every other optional field here - it was
+// missing until a code-review pass caught it (2026-08-11): the staging
+// table itself is already gone by the time a manifest is written (deleted
+// in modelTableStaged()'s own finally block), so this field is purely
+// informational, recording that this run went through the staged path at
+// all rather than materializing directly - worth knowing from the
+// manifest alone, without having to infer it from materialized/tests.
 function summarizeNodeResult(result) {
   var summary = { name: result.name, kind: result.kind, status: result.status };
   if (result.status === 'skipped') {
@@ -652,6 +695,9 @@ function summarizeNodeResult(result) {
       summary.relation = result.result.relation;
       summary.materialized = result.result.materialized;
     }
+    if (result.result && result.result.staged !== undefined) {
+      summary.staged = result.result.staged;
+    }
   }
   return summary;
 }
@@ -668,13 +714,15 @@ function buildManifest(commandText, ok, results, ignored) {
   };
 }
 
-// Writes the run manifest to Drive, overwriting the same file every time
-// (found by name via upsertByName, never a fresh file per run - creating
-// one per run is exactly the pattern that piled up duplicate fixture
-// files in the test project before, see CLAUDE.md's "About testing").
-// Best-effort: a Drive failure here must never throw or affect the
+// Shared by writeManifest()/writeCompileManifest() below - both do the
+// exact same "resolve folder, upsert by name via Drive, log every outcome,
+// never throw" work, differing only in which global they read config from
+// and what prefix they log under (logPrefix), so this is the one place
+// that actually writes, called with each caller's own already-resolved
+// config plus the *other* one's config for the collision guard right
+// below. Best-effort: a Drive failure here must never throw or affect the
 // node results actually being reported, so every path is caught and
-// turned into one of three report.manifest shapes instead.
+// turned into one of four report.manifest shapes instead.
 //
 // Every outcome also gets a Logger.log line, same as every other outcome
 // in a run (the call-level START/DONE, each node's START/OK/FAIL/SKIP/PLAN).
@@ -689,69 +737,69 @@ function buildManifest(commandText, ok, results, ignored) {
 // time - the first helper call to cross the move.js/cli.js boundary, and
 // deliberately so: this is genuinely the same primitive loadDriveJson
 // already uses, not new drive-writing logic.
-function writeManifest(commandText, ok, results, ignored) {
-  var config = resolveManifestConfig();
+//
+// otherConfig is only consulted (and only ever costs a Drive lookup, via
+// resolveManifestFolderId(), when its own folderId is unset) if it's
+// enabled - a disabled manifest can never actually be overwritten, so
+// there is nothing to guard against. When both configs resolve to the
+// same folderId + fileName, refusing to write (rather than writing
+// anyway) is the only choice that can't silently destroy whichever
+// manifest was written most recently - a run's manifest overwritten by a
+// later compile, or vice versa, with no error either time it happened
+// before this guard existed.
+function writeManifestFile(logPrefix, config, otherConfig, commandText, ok, results, ignored) {
   if (!config.enabled) {
-    Logger.log('MANIFEST skipped - notsobigdataManifest.enabled is false');
+    Logger.log(logPrefix + ' skipped - enabled is false');
     return { written: false, reason: 'disabled' };
   }
   try {
     var folderId = resolveManifestFolderId(config.folderId);
+    if (otherConfig.enabled && config.fileName === otherConfig.fileName) {
+      var otherFolderId = resolveManifestFolderId(otherConfig.folderId);
+      if (folderId === otherFolderId) {
+        var message = 'notsobigdataManifest and notsobigdataCompileManifest resolve to the same Drive file (folderId "'
+          + folderId + '", fileName "' + config.fileName + '") - refusing to write, since cli(\'run\') and cli(\'compile\') '
+          + 'would otherwise silently overwrite each other\'s manifest. Give one of them its own folderId or fileName.';
+        Logger.log(logPrefix + ' failed - ' + message);
+        return { written: false, reason: 'collision', error: message };
+      }
+    }
     var manifest = buildManifest(commandText, ok, results, ignored);
     var target = { folderId: folderId, fileName: config.fileName, upsertByName: true };
     var fileId = resolveDriveWriteTarget(target);
     fileId = writeDriveText(fileId, target, JSON.stringify(manifest, null, 2), MimeType.PLAIN_TEXT);
-    Logger.log('MANIFEST written to ' + fileId);
+    Logger.log(logPrefix + ' written to ' + fileId);
     return { written: true, fileId: fileId };
   } catch (error) {
-    Logger.log('MANIFEST failed - ' + error.message);
+    Logger.log(logPrefix + ' failed - ' + error.message);
     return { written: false, reason: 'error', error: error.message };
   }
 }
 
-// Reads the optional notsobigdataCompileManifest global, same guarded
-// pattern and shape as resolveManifestConfig() above - a deliberately
-// separate global, not a second field on notsobigdataManifest, so
-// configuring (or disabling) the compile manifest can never accidentally
-// touch the run manifest's own settings. Different default fileName for
-// the same reason: the two are meant to coexist as two files, not fight
-// over one.
+function writeManifest(commandText, ok, results, ignored) {
+  return writeManifestFile('MANIFEST', resolveManifestConfig(), resolveCompileManifestConfig(), commandText, ok, results, ignored);
+}
+
+// notsobigdataCompileManifest, read via the same resolveManifestConfigFrom()
+// above - a deliberately separate global, not a second field on
+// notsobigdataManifest, so configuring (or disabling) the compile manifest
+// can never accidentally touch the run manifest's own settings. Different
+// default fileName for the same reason: the two are meant to coexist as
+// two files, not fight over one.
 function resolveCompileManifestConfig() {
-  var raw = readOptionalGlobal('notsobigdataCompileManifest');
-  var config = (raw && typeof raw === 'object') ? raw : {};
-  return {
-    enabled: config.enabled !== false,
-    folderId: typeof config.folderId === 'string' && config.folderId ? config.folderId : null,
-    fileName: typeof config.fileName === 'string' && config.fileName ? config.fileName : 'notsobigdata-compile-manifest.json'
-  };
+  return resolveManifestConfigFrom('notsobigdataCompileManifest', 'notsobigdata-compile-manifest.json');
 }
 
 // cli('compile')'s counterpart to writeManifest() above - same
-// upsert-by-name Drive write, same best-effort/never-throw contract, same
-// "every outcome gets a Logger.log line" reasoning - but to its own file,
-// via resolveCompileManifestConfig() rather than resolveManifestConfig().
-// A compile pass never touches BigQuery/Sheets/Drive, so it must never
-// overwrite the run manifest's own record of what the last real run
-// actually did - see docs/cli.md's "The compile manifest" for the
-// user-facing version of this reasoning.
+// writeManifestFile() call, to its own file via resolveCompileManifestConfig()
+// rather than resolveManifestConfig(). A compile pass never touches
+// BigQuery/Sheets/Drive, so it must never overwrite the run manifest's own
+// record of what the last real run actually did - see docs/cli.md's "The
+// compile manifest" for the user-facing version of this reasoning, and
+// writeManifestFile()'s own comment above for how the same-target case is
+// now caught rather than silently allowed.
 function writeCompileManifest(commandText, ok, results, ignored) {
-  var config = resolveCompileManifestConfig();
-  if (!config.enabled) {
-    Logger.log('COMPILE MANIFEST skipped - notsobigdataCompileManifest.enabled is false');
-    return { written: false, reason: 'disabled' };
-  }
-  try {
-    var folderId = resolveManifestFolderId(config.folderId);
-    var manifest = buildManifest(commandText, ok, results, ignored);
-    var target = { folderId: folderId, fileName: config.fileName, upsertByName: true };
-    var fileId = resolveDriveWriteTarget(target);
-    fileId = writeDriveText(fileId, target, JSON.stringify(manifest, null, 2), MimeType.PLAIN_TEXT);
-    Logger.log('COMPILE MANIFEST written to ' + fileId);
-    return { written: true, fileId: fileId };
-  } catch (error) {
-    Logger.log('COMPILE MANIFEST failed - ' + error.message);
-    return { written: false, reason: 'error', error: error.message };
-  }
+  return writeManifestFile('COMPILE MANIFEST', resolveCompileManifestConfig(), resolveManifestConfig(), commandText, ok, results, ignored);
 }
 
 // cli('debug') - a diagnostic, non-mutating check of whether the current
@@ -806,15 +854,20 @@ function bigQueryServiceNotEnabledMessage() {
 // Shared by probeUrl and probeApi. Always forces a GET and always mutes
 // HTTP exceptions: the status code is deliberately irrelevant to whether
 // this counts as 'ok' (see the module comment above) - only a thrown
-// error means UrlFetchApp itself couldn't make the call. method/payload
-// are stripped out of options rather than merged in, so a target's own
-// POST configuration can never leak through and turn a probe into a
-// second real write.
+// error means UrlFetchApp itself couldn't make the call. method/payload/
+// muteHttpExceptions are all stripped out of options rather than merged
+// in - method/payload so a target's own POST configuration can never leak
+// through and turn a probe into a second real write, muteHttpExceptions
+// so a node's own options (e.g. one that sets muteHttpExceptions: false
+// to let its real call inspect a non-2xx response body) can never
+// override the forced true here and turn a perfectly reachable, non-2xx
+// endpoint into a thrown error this function misreports as 'missing_scope'
+// or 'error' instead of 'ok'.
 function fetchProbe(url, options, type, role) {
   var fetchOptions = { method: 'get', muteHttpExceptions: true };
   if (options) {
     Object.keys(options).forEach(function (key) {
-      if (key !== 'method' && key !== 'payload') {
+      if (key !== 'method' && key !== 'payload' && key !== 'muteHttpExceptions') {
         fetchOptions[key] = options[key];
       }
     });
@@ -981,18 +1034,32 @@ function runDebugChecks(nodes) {
   return checks;
 }
 
+// The five status values a debug check can report (see
+// classifyProbeError()/fetchProbe()/probeSheets/probeDrive/probeBigQuery/
+// probeApi/probeUrl/probeCustom above, and connectorTuplesForNode()'s own
+// 'unknown connector type' fallback) and the label formatDebugStatusCounts()
+// below renders each one under - one ordered list, not two separately
+// hardcoded objects (a `counts` seed and a `labels` map) that used to have
+// to be kept in sync by hand. A status added, renamed, or removed from one
+// of the probe functions above only needs updating here now; before this,
+// a status produced there but missing from formatDebugStatusCounts()'s own
+// `counts` object would silently render as "NaN <status>" in the summary
+// line (`counts[status] += 1` on an undefined key is `NaN`), rather than
+// failing loudly the way this file treats every other config/name mismatch.
+var DEBUG_CHECK_STATUSES = [
+  { status: 'ok', label: 'ok' },
+  { status: 'missing_scope', label: 'missing scope' },
+  { status: 'service_not_enabled', label: 'service not enabled' },
+  { status: 'error', label: 'error' },
+  { status: 'unverifiable', label: 'unverifiable' }
+];
+
 // formatStatusCounts()'s counterpart for a debug report's check statuses
-// rather than a run report's node statuses - same "only render non-zero
-// counts" reasoning, kept separate since the two status vocabularies
-// don't overlap (a check is never 'success'/'skipped'/'planned').
+// rather than a run report's node statuses - kept as a separate status list
+// since the two vocabularies don't overlap (a check is never
+// 'success'/'skipped'/'planned').
 function formatDebugStatusCounts(checks) {
-  var counts = { ok: 0, missing_scope: 0, service_not_enabled: 0, error: 0, unverifiable: 0 };
-  checks.forEach(function (check) { counts[check.status] += 1; });
-  var labels = { ok: 'ok', missing_scope: 'missing scope', service_not_enabled: 'service not enabled', error: 'error', unverifiable: 'unverifiable' };
-  var parts = Object.keys(labels)
-    .filter(function (status) { return counts[status] > 0; })
-    .map(function (status) { return counts[status] + ' ' + labels[status]; });
-  return parts.length ? parts.join(', ') : 'nothing to check';
+  return formatStatusList(checks, 'status', DEBUG_CHECK_STATUSES, 'nothing to check', 'debug check');
 }
 
 // The smoke test. This is the first thing to run when anything looks

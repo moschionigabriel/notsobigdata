@@ -520,6 +520,47 @@ function extractSetStatements(sql) {
   return values;
 }
 
+// Splits a comma-joined list into its top-level segments without cutting
+// a comma that sits *inside* a quoted item in half - parseForIterable()
+// below used to just call inner.split(','), which does exactly that:
+// ['open, pending', 'closed'] became "'open" and " pending'", neither a
+// valid quoted string, so the whole list threw even though it looks
+// well-formed to whoever wrote it. A plain char-by-char scan, tracking
+// whether the current position sits inside a quote, is enough here - no
+// escape-sequence support, same "simple string literal, no backslash
+// escaping" posture every other quoted value in this file already has
+// (parseSingleStringArgument, parseKwargsArgument, ...), so a quote
+// character can only ever open or close an item, never appear inside one
+// escaped.
+function splitTopLevelListItems(inner) {
+  var items = [];
+  var current = '';
+  var quoteChar = null;
+  for (var i = 0; i < inner.length; i++) {
+    var ch = inner.charAt(i);
+    if (quoteChar) {
+      current += ch;
+      if (ch === quoteChar) {
+        quoteChar = null;
+      }
+      continue;
+    }
+    if (ch === '\'' || ch === '"') {
+      quoteChar = ch;
+      current += ch;
+      continue;
+    }
+    if (ch === ',') {
+      items.push(current);
+      current = '';
+      continue;
+    }
+    current += ch;
+  }
+  items.push(current);
+  return items;
+}
+
 // The one argument shape {% for %} accepts: a literal, comma-separated
 // list of quoted strings - e.g. ['open', 'closed', 'cancelled']. Same
 // string-literal-only posture parseKwargsArgument/parseVarArguments
@@ -536,7 +577,7 @@ function parseForIterable(raw) {
     throw new Error('model(): "{% for %}" list "' + raw + '" is empty - needs at least one quoted item, e.g. [\'a\', \'b\'].');
   }
   var itemPattern = /^\s*(['"])([^'"]*)\1\s*$/;
-  return inner.split(',').map(function (segment) {
+  return splitTopLevelListItems(inner).map(function (segment) {
     var match = itemPattern.exec(segment);
     if (!match) {
       throw new Error('model(): "{% for %}" list "' + raw + '" is not valid - every item must be a quoted string, e.g. [\'a\', \'b\'].');
@@ -942,9 +983,42 @@ function mergeDependsOn(refDeps, handWrittenDeps) {
 // Any *other* {{ name(...) }} call is rejected the same way ref()'s
 // unknown name is, for the same reason - see the module comment above
 // about growing this dispatch.
+//
+// A commented-out call (e.g. "-- {{ var('region') }}") must be inert here
+// the same way it already is at discovery: extractRefDependencies()/
+// extractConfigOverrides()/validateVarUsage()/validateSetUsage() all scan
+// stripSqlComments()'d SQL, so a commented-out call never becomes a
+// dependency edge or gets its var() validated against notsobigdataModels.vars.
+// Before this function guarded against it too, that asymmetry meant a
+// commented-out call passed cli('list') clean but could still throw at
+// cli('run')/cli('compile') - this function scanned the raw, un-stripped
+// sql. commentSpans()/isCommentedOut() below let each pass skip a match
+// that falls inside a comment (returning it unchanged) without stripping
+// the comment text out of the compiled SQL - unlike discovery, which only
+// needs to *ignore* comments, this function has to *emit* them unchanged,
+// since a real, non-macro SQL comment is legitimate output.
+function commentSpans(text) {
+  var spans = [];
+  SQL_COMMENT_PATTERNS.forEach(function (pattern) {
+    var match;
+    while ((match = pattern.exec(text))) {
+      spans.push([match.index, match.index + match[0].length]);
+    }
+  });
+  return spans;
+}
+
+function isCommentedOut(spans, offset) {
+  return spans.some(function (span) { return offset >= span[0] && offset < span[1]; });
+}
+
 function compileModelSql(sql, resolveRef, registry) {
   var setValues = extractSetStatements(sql);
-  var compiled = sql.replace(templateExpressionPattern(), function (raw, call, args) {
+  var refConfigVarSpans = commentSpans(sql);
+  var compiled = sql.replace(templateExpressionPattern(), function (raw, call, args, offset) {
+    if (isCommentedOut(refConfigVarSpans, offset)) {
+      return raw;
+    }
     if (call === 'config') {
       parseKwargsArgument('config', args);
       return '';
@@ -959,8 +1033,20 @@ function compileModelSql(sql, resolveRef, registry) {
     }
     return resolveRef(parseSingleStringArgument('ref', args));
   });
-  compiled = compiled.replace(setStatementPattern(), '');
-  compiled = compiled.replace(bareVarPattern(), function (raw, name) {
+  // Spans recomputed against `compiled`, not reused from refConfigVarSpans
+  // above - the first pass above never touches a comment's own text (a
+  // commented-out match returns unchanged), so comment syntax still exists
+  // to find, just possibly at different offsets since substitutions
+  // outside comments changed the string's length.
+  var setSpans = commentSpans(compiled);
+  compiled = compiled.replace(setStatementPattern(), function (raw, key, quote, value, offset) {
+    return isCommentedOut(setSpans, offset) ? raw : '';
+  });
+  var bareVarSpans = commentSpans(compiled);
+  compiled = compiled.replace(bareVarPattern(), function (raw, name, offset) {
+    if (isCommentedOut(bareVarSpans, offset)) {
+      return raw;
+    }
     if (!has(setValues, name)) {
       throw new Error('model(): {{ ' + name + ' }} references "' + name + '", which is never set via {% set ' + name + ' = ... %} in this SQL.');
     }
@@ -976,8 +1062,19 @@ function compileModelSql(sql, resolveRef, registry) {
   // generic scanner exists to avoid. Checking for both "{{" and "{%"
   // catches a malformed {% set %} (or an unimplemented {% if %}) the same
   // way it already catches a malformed {{ ref(...) }}.
-  if (compiled.indexOf('{{') !== -1 || compiled.indexOf('{%') !== -1) {
-    throw new Error('model(): SQL still contains "{{" or "{%" after substitution - check for a malformed template call or {% set %} statement.');
+  //
+  // A leftover "{{"/"{%" inside a comment is not this failure mode - it's
+  // the commented-out, deliberately-untouched syntax the three passes
+  // above just left alone - so this scan skips any occurrence inside a
+  // comment span the same way those passes did, rather than flagging
+  // every commented-out macro call as a malformed one.
+  var strayPattern = /\{\{|\{%/g;
+  var straySpans = commentSpans(compiled);
+  var strayMatch;
+  while ((strayMatch = strayPattern.exec(compiled))) {
+    if (!isCommentedOut(straySpans, strayMatch.index)) {
+      throw new Error('model(): SQL still contains "{{" or "{%" after substitution - check for a malformed template call or {% set %} statement.');
+    }
   }
   return compiled;
 }
@@ -1083,7 +1180,20 @@ function quoteSqlLiteral(value) {
 // own discoveryError - caught by cli('list'), not just a real run - same
 // "validated even before there's data to check" posture move.js's own
 // validateTest takes for config.tests.
-function validateModelTest(test, messagePrefix) {
+//
+// registry is needed for exactly one check: a "relationships" test's "to"
+// must name a declared model, not just any node. Before this check
+// existed, "to" naming a real node of any kind (e.g. a move node, which
+// extractTestRefDependencies() below is happy to turn into a dependsOn
+// edge the same way it would a model) passed discovery clean, only for
+// MODEL_TEST_COMPILERS.relationships's own resolveModelConfig() call to
+// throw "is not declared in notsobigdataModels.models" once the model had
+// already materialized (CREATE OR REPLACE already ran, and for a "table"
+// materialization, modelTableStaged() had already created its staging
+// table) - a discovery-time check should have caught this before any
+// BigQuery work started, the same way every other "to"/"ref()" mismatch
+// in this file already does.
+function validateModelTest(test, messagePrefix, registry) {
   if (!test || typeof test !== 'object') {
     throw new Error(messagePrefix + ' every "tests" entry must be an object.');
   }
@@ -1119,6 +1229,12 @@ function validateModelTest(test, messagePrefix) {
     if (typeof test.to !== 'string' || !test.to) {
       throw new Error(messagePrefix + ' test on column "' + test.column + '" (check "relationships") requires "to" (another model\'s name).');
     }
+    try {
+      resolveModelConfig(test.to, registry);
+    } catch (error) {
+      throw new Error(messagePrefix + ' test on column "' + test.column + '" (check "relationships") has "to": "' + test.to
+        + '", which is not a declared model. Known models: ' + Object.keys(registry.models).join(', ') + '.');
+    }
     if (test.field !== undefined) {
       if (typeof test.field !== 'string' || !test.field) {
         throw new Error(messagePrefix + ' test on column "' + test.column + '" (check "relationships") has an invalid "field" - must be a non-empty string.');
@@ -1128,14 +1244,14 @@ function validateModelTest(test, messagePrefix) {
   }
 }
 
-function validateModelTests(tests, messagePrefix) {
+function validateModelTests(tests, messagePrefix, registry) {
   if (tests === undefined) {
     return;
   }
   if (!Array.isArray(tests)) {
     throw new Error(messagePrefix + ' "tests" must be an array of test objects.');
   }
-  tests.forEach(function (test) { validateModelTest(test, messagePrefix); });
+  tests.forEach(function (test) { validateModelTest(test, messagePrefix, registry); });
 }
 
 // The name a compiled test reports itself as in a failure message, when
@@ -1345,7 +1461,7 @@ function expandModelNodes(otherNodes) {
       // extractConfigOverrides above.
       var configOverrides = extractConfigOverrides(templateMatches);
       Object.keys(configOverrides).forEach(function (key) { config[key] = configOverrides[key]; });
-      validateModelTests(config.tests, 'model(): "' + name + '"');
+      validateModelTests(config.tests, 'model(): "' + name + '"', registry);
       validateSetUsage(config.sql, 'model(): "' + name + '"');
       validateVarUsage(templateMatches, registry, 'model(): "' + name + '"');
       // Every {{ ref(...) }} name must resolve to something - a declared
@@ -1512,7 +1628,12 @@ function model(config) {
 // GAS-execution-timeout reasoning behind the staging table's
 // belt-and-suspenders expiration_timestamp). Reuses move.js's
 // resolveStagingTableId rather than growing a second staging-id helper -
-// it was already generic, just previously only called from move.js.
+// it was already generic, just previously only called from move.js. As of
+// 2026-08-11, promotion itself also reuses move.js's promoteStagedTable()
+// rather than a second hand-written copy job - see that function's own
+// comment for why (a future BigQuery copy-job quirk, the kind
+// widenDestinationTableForPromotion already was once, should only ever
+// need fixing in one place).
 //
 // Promotion is a BigQuery *copy* job (configuration.copy,
 // WRITE_TRUNCATE - a full replace, matching what CREATE OR REPLACE TABLE
@@ -1556,12 +1677,17 @@ function modelTableStaged(config, compiled, relation, registry) {
       'model(): "' + config.name + '" tests'
     );
 
-    var copyConfig = {
-      sourceTable: { projectId: config.projectId, datasetId: config.dataset, tableId: stagingTable },
-      destinationTable: { projectId: config.projectId, datasetId: config.dataset, tableId: config.name },
-      writeDisposition: 'WRITE_TRUNCATE'
-    };
-    runBigQueryJob({ configuration: { copy: copyConfig } }, config.projectId, null, 'copy');
+    // Reuses move.js's promoteStagedTable() rather than a second, hand-written
+    // copy job - the same primitive loadBigQueryStaged uses for its own
+    // promotion, so a future BigQuery copy-job quirk discovered against
+    // either caller (widenDestinationTableForPromotion was one such quirk)
+    // only ever needs fixing in the one function both share. widenFirst is
+    // always false here: a model's promotion is always a full WRITE_TRUNCATE
+    // replace, with no schema-evolution concept of its own to opt into.
+    promoteStagedTable(
+      { projectId: config.projectId, dataset: config.dataset, table: config.name },
+      stagingTable, 'WRITE_TRUNCATE', false
+    );
 
     return { relation: relation, materialized: 'table', staged: { table: stagingTable }, testResults: testResults };
   } finally {

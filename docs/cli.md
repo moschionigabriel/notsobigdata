@@ -303,8 +303,12 @@ It never contains the actual rows a node moved — only their shape
 `testResults`, if present, or — for a `model` node — the `relation` it
 materialized and as which (`materialized: 'view'` or `'table'`), plus its
 own `testResults` if it declared `tests` (see [docs/model.md](model.md)).
-This keeps the file's size independent of how much data your pipeline
-actually moves.
+A `table` model with `tests` also carries `staged: { table: '...' }`,
+naming the scratch table its data was tested in before being promoted —
+purely informational, since that table is already deleted by the time the
+manifest is written; it just records that this run went through the
+staged-then-promoted path at all. This keeps the file's size independent
+of how much data your pipeline actually moves.
 
 On by default. Configure it with an optional top-level `var`, same
 declaration style as a node:
@@ -329,6 +333,16 @@ record of what your last real run actually did with a record of a run that
 never happened. The execution log has the same three-outcome line, prefixed
 `COMPILE MANIFEST` instead of `MANIFEST`, so you can tell the two apart at a
 glance.
+
+If `notsobigdataManifest` and `notsobigdataCompileManifest` are configured
+with the same `folderId` + `fileName` (only possible if you set at least
+one of them explicitly — the defaults never collide), neither manifest is
+written: `cli('run')` and `cli('compile')` would otherwise silently
+overwrite each other's file, so both refuse instead, logging a
+`MANIFEST failed - .../COMPILE MANIFEST failed - ...` line that names
+which two globals collided. Give one of them its own `folderId` or
+`fileName` to fix it — this doesn't affect `report.ok` or any node's own
+result, only whether the manifest file itself gets written.
 
 ```json
 {

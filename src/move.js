@@ -134,7 +134,7 @@ function extractDriveJson(fileId) {
   return objectsToRows(JSON.parse(readDriveFileText(fileId)));
 }
 
-// Apps Script has no native XLSX parser, so this converts the file to a
+// Apps Script has no native XLSX parser, so this converts a file to a
 // temporary Google Sheet via the Advanced Drive Service, reads it with
 // SpreadsheetApp, and always deletes the temp copy afterward — including
 // on error — so a failed extract never leaves an orphan file in the
@@ -142,8 +142,13 @@ function extractDriveJson(fileId) {
 // which one the Advanced Drive Service expects depends on the API
 // version configured in the consumer's appsscript.json — the unused one
 // is simply ignored by whichever version is active.
-function extractDriveXlsx(fileId) {
-  var tempFileName = 'notsobigdata-xlsx-import-' + fileId;
+//
+// Shared by extractDriveXlsx (fileId is already a real Drive file) and
+// extractUrlXlsx below (fileId is a freshly-uploaded temp copy of a
+// fetched blob) - both need exactly the same "copy to a Google Sheet,
+// read it, delete the copy" steps, just starting from a file id reached
+// two different ways.
+function readXlsxFileIdAsGrid(fileId, tempFileName) {
   var tempFileMetadata = Drive.Files.copy(
     { name: tempFileName, title: tempFileName, mimeType: MimeType.GOOGLE_SHEETS },
     fileId
@@ -155,6 +160,10 @@ function extractDriveXlsx(fileId) {
   } finally {
     Drive.Files.remove(tempFileMetadata.id);
   }
+}
+
+function extractDriveXlsx(fileId) {
+  return readXlsxFileIdAsGrid(fileId, 'notsobigdata-xlsx-import-' + fileId);
 }
 
 function extractDrive(source) {
@@ -182,9 +191,22 @@ function extractDrive(source) {
 // any non-GitHub host - Kaggle included, which needs authenticated API
 // access this library deliberately doesn't take on) passes through
 // unchanged.
+//
+// The path capture is split on the first "?"/"#" before being reused, so a
+// trailing query string or line-range fragment from a URL copied straight
+// out of the GitHub UI (e.g. "...blob/main/data.csv?raw=true", or a
+// "#L10-L20" line-range link) doesn't get forwarded verbatim into the
+// rewritten raw.githubusercontent.com URL - that host doesn't understand
+// either one, and a query string in particular could produce a different
+// or unexpected response instead of the plain file body this function
+// exists to fetch.
 function rewriteGithubBlobUrl(url) {
   var match = /^https:\/\/github\.com\/([^\/]+)\/([^\/]+)\/blob\/(.+)$/.exec(url);
-  return match ? 'https://raw.githubusercontent.com/' + match[1] + '/' + match[2] + '/' + match[3] : url;
+  if (!match) {
+    return url;
+  }
+  var path = match[3].split(/[?#]/)[0];
+  return 'https://raw.githubusercontent.com/' + match[1] + '/' + match[2] + '/' + path;
 }
 
 // Fetches a URL's body as text. Shared by extractUrlCsv/Json below - the
@@ -204,10 +226,11 @@ function extractUrlJson(url, options) {
   return objectsToRows(JSON.parse(readUrlText(url, options)));
 }
 
-// Mirrors extractDriveXlsx's temp-Google-Sheet trick, but starting from a
-// fetched blob instead of an existing Drive file id. Getting from "a blob"
-// to "a Drive file id" needs a plain DriveApp upload first (no conversion,
-// just bytes) - Drive.Files.insert would do that upload *and* the GOOGLE_
+// Mirrors extractDriveXlsx's temp-Google-Sheet trick (both now go through
+// the shared readXlsxFileIdAsGrid above), but starting from a fetched blob
+// instead of an existing Drive file id. Getting from "a blob" to "a Drive
+// file id" needs a plain DriveApp upload first (no conversion, just
+// bytes) - Drive.Files.insert would do that upload *and* the GOOGLE_
 // SHEETS conversion in one call, but insert is Drive API v2 only; v3 (what
 // a newly-enabled Advanced Drive Service defaults to today) renamed it to
 // Files.create, and guessing which one a consumer's appsscript.json has
@@ -219,25 +242,15 @@ function extractUrlJson(url, options) {
 // createFile here - either way, a plain create followed by Drive.Files.copy
 // doing the conversion), rather than adding a second untested code path.
 // Both temp files - the raw upload and the converted sheet - are removed
-// in nested finally blocks, including on error, so a failure at either
-// step never leaves an orphan behind.
+// on error too: the raw upload via this function's own finally, the
+// converted sheet via readXlsxFileIdAsGrid's own finally underneath it.
 function extractUrlXlsx(url, options) {
   var response = UrlFetchApp.fetch(url, options || {});
   assertHttpOk(response, 'move(): url source request to "' + url + '" failed');
   var tempFileName = 'notsobigdata-xlsx-import-' + Utilities.getUuid();
   var rawFileId = DriveApp.getRootFolder().createFile(response.getBlob().setName(tempFileName)).getId();
   try {
-    var tempFileMetadata = Drive.Files.copy(
-      { name: tempFileName, title: tempFileName, mimeType: MimeType.GOOGLE_SHEETS },
-      rawFileId
-    );
-    try {
-      var spreadsheet = SpreadsheetApp.openById(tempFileMetadata.id);
-      var values = spreadsheet.getActiveSheet().getDataRange().getValues();
-      return isBlankGrid(values) ? [] : values;
-    } finally {
-      Drive.Files.remove(tempFileMetadata.id);
-    }
+    return readXlsxFileIdAsGrid(rawFileId, tempFileName);
   } finally {
     Drive.Files.remove(rawFileId);
   }
@@ -299,10 +312,14 @@ function qualifiedTableRef(projectId, dataset, table) {
 // below and assertSingleStatement, so the two checks that read pipeline-
 // author-supplied SQL agree on what "the statement" is before either one
 // judges it.
+// What counts as a SQL comment, shared with model.js's commentSpans() -
+// one definition of "-- line" / "/* block */" rather than two regex
+// literals that could drift apart.
+var SQL_COMMENT_PATTERNS = [/--[^\n]*/g, /\/\*[\s\S]*?\*\//g];
+
 function stripSqlComments(sql) {
-  return sql
-    .replace(/--[^\n]*/g, '')
-    .replace(/\/\*[\s\S]*?\*\//g, '')
+  return SQL_COMMENT_PATTERNS
+    .reduce(function (text, pattern) { return text.replace(pattern, ''); }, sql)
     .trim()
     .replace(/;\s*$/, '');
 }
@@ -1015,6 +1032,36 @@ function widenDestinationTableForPromotion(target, stagingTable) {
   );
 }
 
+// Promotes a staging table into its real destination via a BigQuery copy
+// job (a metadata-level table copy, no query slots consumed - not a
+// second "SELECT * FROM staging" write). The one piece of "stage, test,
+// promote" this function's own two callers - loadBigQueryStaged below and
+// model.js's modelTableStaged - need identically, extracted so a future
+// copy-job quirk only needs fixing in one place. widenDestinationTableForPromotion's
+// own discovery is exactly that kind of quirk: schemaUpdateOptions on the
+// copy job itself was tried first and confirmed, against a real project,
+// not to work the way a load job's does - if a second such quirk ever
+// turns up, this is the one function both callers already share, not two
+// independently-written copy calls that could drift apart in only fixing
+// it for whichever caller happened to hit it first.
+//
+// widenFirst is the caller's own decision, not something this function
+// infers - loadBigQueryStaged only widens for allowSchemaEvolution +
+// WRITE_APPEND (see its own comment); model.js's promotion is always a
+// full WRITE_TRUNCATE replace with no schema-evolution concept of its
+// own, so it always passes false.
+function promoteStagedTable(target, stagingTable, writeDisposition, widenFirst) {
+  if (widenFirst) {
+    widenDestinationTableForPromotion(target, stagingTable);
+  }
+  var copyConfig = {
+    sourceTable: { projectId: target.projectId, datasetId: target.dataset, tableId: stagingTable },
+    destinationTable: { projectId: target.projectId, datasetId: target.dataset, tableId: target.table },
+    writeDisposition: writeDisposition
+  };
+  return runBigQueryJob({ configuration: { copy: copyConfig } }, target.projectId, null, 'copy');
+}
+
 // Stages rows into a brand-new scratch table, runs target.sqlTests
 // against it, and only if every test passes promotes - via a BigQuery
 // copy job, not a second CSV upload - into the real target. A failing
@@ -1055,16 +1102,8 @@ function loadBigQueryStaged(rows, target, writeDisposition) {
 
     var testResults = runSqlTests(target.sqlTests, { projectId: target.projectId, dataset: target.dataset, table: stagingTable }, 'move(): bigquery target.sqlTests');
 
-    if (target.allowSchemaEvolution && writeDisposition === 'WRITE_APPEND') {
-      widenDestinationTableForPromotion(target, stagingTable);
-    }
-
-    var copyConfig = {
-      sourceTable: { projectId: target.projectId, datasetId: target.dataset, tableId: stagingTable },
-      destinationTable: { projectId: target.projectId, datasetId: target.dataset, tableId: target.table },
-      writeDisposition: writeDisposition
-    };
-    var promoteJobId = runBigQueryJob({ configuration: { copy: copyConfig } }, target.projectId, null, 'copy');
+    var widenFirst = !!(target.allowSchemaEvolution && writeDisposition === 'WRITE_APPEND');
+    var promoteJobId = promoteStagedTable(target, stagingTable, writeDisposition, widenFirst);
 
     return {
       projectId: target.projectId, dataset: target.dataset, table: target.table, jobId: promoteJobId,

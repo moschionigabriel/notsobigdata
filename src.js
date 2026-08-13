@@ -144,7 +144,7 @@ var NotSoBigData = (function () {
     return objectsToRows(JSON.parse(readDriveFileText(fileId)));
   }
 
-  // Apps Script has no native XLSX parser, so this converts the file to a
+  // Apps Script has no native XLSX parser, so this converts a file to a
   // temporary Google Sheet via the Advanced Drive Service, reads it with
   // SpreadsheetApp, and always deletes the temp copy afterward — including
   // on error — so a failed extract never leaves an orphan file in the
@@ -152,8 +152,13 @@ var NotSoBigData = (function () {
   // which one the Advanced Drive Service expects depends on the API
   // version configured in the consumer's appsscript.json — the unused one
   // is simply ignored by whichever version is active.
-  function extractDriveXlsx(fileId) {
-    var tempFileName = 'notsobigdata-xlsx-import-' + fileId;
+  //
+  // Shared by extractDriveXlsx (fileId is already a real Drive file) and
+  // extractUrlXlsx below (fileId is a freshly-uploaded temp copy of a
+  // fetched blob) - both need exactly the same "copy to a Google Sheet,
+  // read it, delete the copy" steps, just starting from a file id reached
+  // two different ways.
+  function readXlsxFileIdAsGrid(fileId, tempFileName) {
     var tempFileMetadata = Drive.Files.copy(
       { name: tempFileName, title: tempFileName, mimeType: MimeType.GOOGLE_SHEETS },
       fileId
@@ -165,6 +170,10 @@ var NotSoBigData = (function () {
     } finally {
       Drive.Files.remove(tempFileMetadata.id);
     }
+  }
+
+  function extractDriveXlsx(fileId) {
+    return readXlsxFileIdAsGrid(fileId, 'notsobigdata-xlsx-import-' + fileId);
   }
 
   function extractDrive(source) {
@@ -192,9 +201,22 @@ var NotSoBigData = (function () {
   // any non-GitHub host - Kaggle included, which needs authenticated API
   // access this library deliberately doesn't take on) passes through
   // unchanged.
+  //
+  // The path capture is split on the first "?"/"#" before being reused, so a
+  // trailing query string or line-range fragment from a URL copied straight
+  // out of the GitHub UI (e.g. "...blob/main/data.csv?raw=true", or a
+  // "#L10-L20" line-range link) doesn't get forwarded verbatim into the
+  // rewritten raw.githubusercontent.com URL - that host doesn't understand
+  // either one, and a query string in particular could produce a different
+  // or unexpected response instead of the plain file body this function
+  // exists to fetch.
   function rewriteGithubBlobUrl(url) {
     var match = /^https:\/\/github\.com\/([^\/]+)\/([^\/]+)\/blob\/(.+)$/.exec(url);
-    return match ? 'https://raw.githubusercontent.com/' + match[1] + '/' + match[2] + '/' + match[3] : url;
+    if (!match) {
+      return url;
+    }
+    var path = match[3].split(/[?#]/)[0];
+    return 'https://raw.githubusercontent.com/' + match[1] + '/' + match[2] + '/' + path;
   }
 
   // Fetches a URL's body as text. Shared by extractUrlCsv/Json below - the
@@ -214,10 +236,11 @@ var NotSoBigData = (function () {
     return objectsToRows(JSON.parse(readUrlText(url, options)));
   }
 
-  // Mirrors extractDriveXlsx's temp-Google-Sheet trick, but starting from a
-  // fetched blob instead of an existing Drive file id. Getting from "a blob"
-  // to "a Drive file id" needs a plain DriveApp upload first (no conversion,
-  // just bytes) - Drive.Files.insert would do that upload *and* the GOOGLE_
+  // Mirrors extractDriveXlsx's temp-Google-Sheet trick (both now go through
+  // the shared readXlsxFileIdAsGrid above), but starting from a fetched blob
+  // instead of an existing Drive file id. Getting from "a blob" to "a Drive
+  // file id" needs a plain DriveApp upload first (no conversion, just
+  // bytes) - Drive.Files.insert would do that upload *and* the GOOGLE_
   // SHEETS conversion in one call, but insert is Drive API v2 only; v3 (what
   // a newly-enabled Advanced Drive Service defaults to today) renamed it to
   // Files.create, and guessing which one a consumer's appsscript.json has
@@ -229,25 +252,15 @@ var NotSoBigData = (function () {
   // createFile here - either way, a plain create followed by Drive.Files.copy
   // doing the conversion), rather than adding a second untested code path.
   // Both temp files - the raw upload and the converted sheet - are removed
-  // in nested finally blocks, including on error, so a failure at either
-  // step never leaves an orphan behind.
+  // on error too: the raw upload via this function's own finally, the
+  // converted sheet via readXlsxFileIdAsGrid's own finally underneath it.
   function extractUrlXlsx(url, options) {
     var response = UrlFetchApp.fetch(url, options || {});
     assertHttpOk(response, 'move(): url source request to "' + url + '" failed');
     var tempFileName = 'notsobigdata-xlsx-import-' + Utilities.getUuid();
     var rawFileId = DriveApp.getRootFolder().createFile(response.getBlob().setName(tempFileName)).getId();
     try {
-      var tempFileMetadata = Drive.Files.copy(
-        { name: tempFileName, title: tempFileName, mimeType: MimeType.GOOGLE_SHEETS },
-        rawFileId
-      );
-      try {
-        var spreadsheet = SpreadsheetApp.openById(tempFileMetadata.id);
-        var values = spreadsheet.getActiveSheet().getDataRange().getValues();
-        return isBlankGrid(values) ? [] : values;
-      } finally {
-        Drive.Files.remove(tempFileMetadata.id);
-      }
+      return readXlsxFileIdAsGrid(rawFileId, tempFileName);
     } finally {
       Drive.Files.remove(rawFileId);
     }
@@ -309,10 +322,14 @@ var NotSoBigData = (function () {
   // below and assertSingleStatement, so the two checks that read pipeline-
   // author-supplied SQL agree on what "the statement" is before either one
   // judges it.
+  // What counts as a SQL comment, shared with model.js's commentSpans() -
+  // one definition of "-- line" / "/* block */" rather than two regex
+  // literals that could drift apart.
+  var SQL_COMMENT_PATTERNS = [/--[^\n]*/g, /\/\*[\s\S]*?\*\//g];
+
   function stripSqlComments(sql) {
-    return sql
-      .replace(/--[^\n]*/g, '')
-      .replace(/\/\*[\s\S]*?\*\//g, '')
+    return SQL_COMMENT_PATTERNS
+      .reduce(function (text, pattern) { return text.replace(pattern, ''); }, sql)
       .trim()
       .replace(/;\s*$/, '');
   }
@@ -1025,6 +1042,36 @@ var NotSoBigData = (function () {
     );
   }
 
+  // Promotes a staging table into its real destination via a BigQuery copy
+  // job (a metadata-level table copy, no query slots consumed - not a
+  // second "SELECT * FROM staging" write). The one piece of "stage, test,
+  // promote" this function's own two callers - loadBigQueryStaged below and
+  // model.js's modelTableStaged - need identically, extracted so a future
+  // copy-job quirk only needs fixing in one place. widenDestinationTableForPromotion's
+  // own discovery is exactly that kind of quirk: schemaUpdateOptions on the
+  // copy job itself was tried first and confirmed, against a real project,
+  // not to work the way a load job's does - if a second such quirk ever
+  // turns up, this is the one function both callers already share, not two
+  // independently-written copy calls that could drift apart in only fixing
+  // it for whichever caller happened to hit it first.
+  //
+  // widenFirst is the caller's own decision, not something this function
+  // infers - loadBigQueryStaged only widens for allowSchemaEvolution +
+  // WRITE_APPEND (see its own comment); model.js's promotion is always a
+  // full WRITE_TRUNCATE replace with no schema-evolution concept of its
+  // own, so it always passes false.
+  function promoteStagedTable(target, stagingTable, writeDisposition, widenFirst) {
+    if (widenFirst) {
+      widenDestinationTableForPromotion(target, stagingTable);
+    }
+    var copyConfig = {
+      sourceTable: { projectId: target.projectId, datasetId: target.dataset, tableId: stagingTable },
+      destinationTable: { projectId: target.projectId, datasetId: target.dataset, tableId: target.table },
+      writeDisposition: writeDisposition
+    };
+    return runBigQueryJob({ configuration: { copy: copyConfig } }, target.projectId, null, 'copy');
+  }
+
   // Stages rows into a brand-new scratch table, runs target.sqlTests
   // against it, and only if every test passes promotes - via a BigQuery
   // copy job, not a second CSV upload - into the real target. A failing
@@ -1065,16 +1112,8 @@ var NotSoBigData = (function () {
 
       var testResults = runSqlTests(target.sqlTests, { projectId: target.projectId, dataset: target.dataset, table: stagingTable }, 'move(): bigquery target.sqlTests');
 
-      if (target.allowSchemaEvolution && writeDisposition === 'WRITE_APPEND') {
-        widenDestinationTableForPromotion(target, stagingTable);
-      }
-
-      var copyConfig = {
-        sourceTable: { projectId: target.projectId, datasetId: target.dataset, tableId: stagingTable },
-        destinationTable: { projectId: target.projectId, datasetId: target.dataset, tableId: target.table },
-        writeDisposition: writeDisposition
-      };
-      var promoteJobId = runBigQueryJob({ configuration: { copy: copyConfig } }, target.projectId, null, 'copy');
+      var widenFirst = !!(target.allowSchemaEvolution && writeDisposition === 'WRITE_APPEND');
+      var promoteJobId = promoteStagedTable(target, stagingTable, writeDisposition, widenFirst);
 
       return {
         projectId: target.projectId, dataset: target.dataset, table: target.table, jobId: promoteJobId,
@@ -1987,6 +2026,47 @@ var NotSoBigData = (function () {
     return values;
   }
 
+  // Splits a comma-joined list into its top-level segments without cutting
+  // a comma that sits *inside* a quoted item in half - parseForIterable()
+  // below used to just call inner.split(','), which does exactly that:
+  // ['open, pending', 'closed'] became "'open" and " pending'", neither a
+  // valid quoted string, so the whole list threw even though it looks
+  // well-formed to whoever wrote it. A plain char-by-char scan, tracking
+  // whether the current position sits inside a quote, is enough here - no
+  // escape-sequence support, same "simple string literal, no backslash
+  // escaping" posture every other quoted value in this file already has
+  // (parseSingleStringArgument, parseKwargsArgument, ...), so a quote
+  // character can only ever open or close an item, never appear inside one
+  // escaped.
+  function splitTopLevelListItems(inner) {
+    var items = [];
+    var current = '';
+    var quoteChar = null;
+    for (var i = 0; i < inner.length; i++) {
+      var ch = inner.charAt(i);
+      if (quoteChar) {
+        current += ch;
+        if (ch === quoteChar) {
+          quoteChar = null;
+        }
+        continue;
+      }
+      if (ch === '\'' || ch === '"') {
+        quoteChar = ch;
+        current += ch;
+        continue;
+      }
+      if (ch === ',') {
+        items.push(current);
+        current = '';
+        continue;
+      }
+      current += ch;
+    }
+    items.push(current);
+    return items;
+  }
+
   // The one argument shape {% for %} accepts: a literal, comma-separated
   // list of quoted strings - e.g. ['open', 'closed', 'cancelled']. Same
   // string-literal-only posture parseKwargsArgument/parseVarArguments
@@ -2003,7 +2083,7 @@ var NotSoBigData = (function () {
       throw new Error('model(): "{% for %}" list "' + raw + '" is empty - needs at least one quoted item, e.g. [\'a\', \'b\'].');
     }
     var itemPattern = /^\s*(['"])([^'"]*)\1\s*$/;
-    return inner.split(',').map(function (segment) {
+    return splitTopLevelListItems(inner).map(function (segment) {
       var match = itemPattern.exec(segment);
       if (!match) {
         throw new Error('model(): "{% for %}" list "' + raw + '" is not valid - every item must be a quoted string, e.g. [\'a\', \'b\'].');
@@ -2409,9 +2489,42 @@ var NotSoBigData = (function () {
   // Any *other* {{ name(...) }} call is rejected the same way ref()'s
   // unknown name is, for the same reason - see the module comment above
   // about growing this dispatch.
+  //
+  // A commented-out call (e.g. "-- {{ var('region') }}") must be inert here
+  // the same way it already is at discovery: extractRefDependencies()/
+  // extractConfigOverrides()/validateVarUsage()/validateSetUsage() all scan
+  // stripSqlComments()'d SQL, so a commented-out call never becomes a
+  // dependency edge or gets its var() validated against notsobigdataModels.vars.
+  // Before this function guarded against it too, that asymmetry meant a
+  // commented-out call passed cli('list') clean but could still throw at
+  // cli('run')/cli('compile') - this function scanned the raw, un-stripped
+  // sql. commentSpans()/isCommentedOut() below let each pass skip a match
+  // that falls inside a comment (returning it unchanged) without stripping
+  // the comment text out of the compiled SQL - unlike discovery, which only
+  // needs to *ignore* comments, this function has to *emit* them unchanged,
+  // since a real, non-macro SQL comment is legitimate output.
+  function commentSpans(text) {
+    var spans = [];
+    SQL_COMMENT_PATTERNS.forEach(function (pattern) {
+      var match;
+      while ((match = pattern.exec(text))) {
+        spans.push([match.index, match.index + match[0].length]);
+      }
+    });
+    return spans;
+  }
+
+  function isCommentedOut(spans, offset) {
+    return spans.some(function (span) { return offset >= span[0] && offset < span[1]; });
+  }
+
   function compileModelSql(sql, resolveRef, registry) {
     var setValues = extractSetStatements(sql);
-    var compiled = sql.replace(templateExpressionPattern(), function (raw, call, args) {
+    var refConfigVarSpans = commentSpans(sql);
+    var compiled = sql.replace(templateExpressionPattern(), function (raw, call, args, offset) {
+      if (isCommentedOut(refConfigVarSpans, offset)) {
+        return raw;
+      }
       if (call === 'config') {
         parseKwargsArgument('config', args);
         return '';
@@ -2426,8 +2539,20 @@ var NotSoBigData = (function () {
       }
       return resolveRef(parseSingleStringArgument('ref', args));
     });
-    compiled = compiled.replace(setStatementPattern(), '');
-    compiled = compiled.replace(bareVarPattern(), function (raw, name) {
+    // Spans recomputed against `compiled`, not reused from refConfigVarSpans
+    // above - the first pass above never touches a comment's own text (a
+    // commented-out match returns unchanged), so comment syntax still exists
+    // to find, just possibly at different offsets since substitutions
+    // outside comments changed the string's length.
+    var setSpans = commentSpans(compiled);
+    compiled = compiled.replace(setStatementPattern(), function (raw, key, quote, value, offset) {
+      return isCommentedOut(setSpans, offset) ? raw : '';
+    });
+    var bareVarSpans = commentSpans(compiled);
+    compiled = compiled.replace(bareVarPattern(), function (raw, name, offset) {
+      if (isCommentedOut(bareVarSpans, offset)) {
+        return raw;
+      }
       if (!has(setValues, name)) {
         throw new Error('model(): {{ ' + name + ' }} references "' + name + '", which is never set via {% set ' + name + ' = ... %} in this SQL.');
       }
@@ -2443,8 +2568,19 @@ var NotSoBigData = (function () {
     // generic scanner exists to avoid. Checking for both "{{" and "{%"
     // catches a malformed {% set %} (or an unimplemented {% if %}) the same
     // way it already catches a malformed {{ ref(...) }}.
-    if (compiled.indexOf('{{') !== -1 || compiled.indexOf('{%') !== -1) {
-      throw new Error('model(): SQL still contains "{{" or "{%" after substitution - check for a malformed template call or {% set %} statement.');
+    //
+    // A leftover "{{"/"{%" inside a comment is not this failure mode - it's
+    // the commented-out, deliberately-untouched syntax the three passes
+    // above just left alone - so this scan skips any occurrence inside a
+    // comment span the same way those passes did, rather than flagging
+    // every commented-out macro call as a malformed one.
+    var strayPattern = /\{\{|\{%/g;
+    var straySpans = commentSpans(compiled);
+    var strayMatch;
+    while ((strayMatch = strayPattern.exec(compiled))) {
+      if (!isCommentedOut(straySpans, strayMatch.index)) {
+        throw new Error('model(): SQL still contains "{{" or "{%" after substitution - check for a malformed template call or {% set %} statement.');
+      }
     }
     return compiled;
   }
@@ -2550,7 +2686,20 @@ var NotSoBigData = (function () {
   // own discoveryError - caught by cli('list'), not just a real run - same
   // "validated even before there's data to check" posture move.js's own
   // validateTest takes for config.tests.
-  function validateModelTest(test, messagePrefix) {
+  //
+  // registry is needed for exactly one check: a "relationships" test's "to"
+  // must name a declared model, not just any node. Before this check
+  // existed, "to" naming a real node of any kind (e.g. a move node, which
+  // extractTestRefDependencies() below is happy to turn into a dependsOn
+  // edge the same way it would a model) passed discovery clean, only for
+  // MODEL_TEST_COMPILERS.relationships's own resolveModelConfig() call to
+  // throw "is not declared in notsobigdataModels.models" once the model had
+  // already materialized (CREATE OR REPLACE already ran, and for a "table"
+  // materialization, modelTableStaged() had already created its staging
+  // table) - a discovery-time check should have caught this before any
+  // BigQuery work started, the same way every other "to"/"ref()" mismatch
+  // in this file already does.
+  function validateModelTest(test, messagePrefix, registry) {
     if (!test || typeof test !== 'object') {
       throw new Error(messagePrefix + ' every "tests" entry must be an object.');
     }
@@ -2586,6 +2735,12 @@ var NotSoBigData = (function () {
       if (typeof test.to !== 'string' || !test.to) {
         throw new Error(messagePrefix + ' test on column "' + test.column + '" (check "relationships") requires "to" (another model\'s name).');
       }
+      try {
+        resolveModelConfig(test.to, registry);
+      } catch (error) {
+        throw new Error(messagePrefix + ' test on column "' + test.column + '" (check "relationships") has "to": "' + test.to
+          + '", which is not a declared model. Known models: ' + Object.keys(registry.models).join(', ') + '.');
+      }
       if (test.field !== undefined) {
         if (typeof test.field !== 'string' || !test.field) {
           throw new Error(messagePrefix + ' test on column "' + test.column + '" (check "relationships") has an invalid "field" - must be a non-empty string.');
@@ -2595,14 +2750,14 @@ var NotSoBigData = (function () {
     }
   }
 
-  function validateModelTests(tests, messagePrefix) {
+  function validateModelTests(tests, messagePrefix, registry) {
     if (tests === undefined) {
       return;
     }
     if (!Array.isArray(tests)) {
       throw new Error(messagePrefix + ' "tests" must be an array of test objects.');
     }
-    tests.forEach(function (test) { validateModelTest(test, messagePrefix); });
+    tests.forEach(function (test) { validateModelTest(test, messagePrefix, registry); });
   }
 
   // The name a compiled test reports itself as in a failure message, when
@@ -2812,7 +2967,7 @@ var NotSoBigData = (function () {
         // extractConfigOverrides above.
         var configOverrides = extractConfigOverrides(templateMatches);
         Object.keys(configOverrides).forEach(function (key) { config[key] = configOverrides[key]; });
-        validateModelTests(config.tests, 'model(): "' + name + '"');
+        validateModelTests(config.tests, 'model(): "' + name + '"', registry);
         validateSetUsage(config.sql, 'model(): "' + name + '"');
         validateVarUsage(templateMatches, registry, 'model(): "' + name + '"');
         // Every {{ ref(...) }} name must resolve to something - a declared
@@ -2979,7 +3134,12 @@ var NotSoBigData = (function () {
   // GAS-execution-timeout reasoning behind the staging table's
   // belt-and-suspenders expiration_timestamp). Reuses move.js's
   // resolveStagingTableId rather than growing a second staging-id helper -
-  // it was already generic, just previously only called from move.js.
+  // it was already generic, just previously only called from move.js. As of
+  // 2026-08-11, promotion itself also reuses move.js's promoteStagedTable()
+  // rather than a second hand-written copy job - see that function's own
+  // comment for why (a future BigQuery copy-job quirk, the kind
+  // widenDestinationTableForPromotion already was once, should only ever
+  // need fixing in one place).
   //
   // Promotion is a BigQuery *copy* job (configuration.copy,
   // WRITE_TRUNCATE - a full replace, matching what CREATE OR REPLACE TABLE
@@ -3023,12 +3183,17 @@ var NotSoBigData = (function () {
         'model(): "' + config.name + '" tests'
       );
 
-      var copyConfig = {
-        sourceTable: { projectId: config.projectId, datasetId: config.dataset, tableId: stagingTable },
-        destinationTable: { projectId: config.projectId, datasetId: config.dataset, tableId: config.name },
-        writeDisposition: 'WRITE_TRUNCATE'
-      };
-      runBigQueryJob({ configuration: { copy: copyConfig } }, config.projectId, null, 'copy');
+      // Reuses move.js's promoteStagedTable() rather than a second, hand-written
+      // copy job - the same primitive loadBigQueryStaged uses for its own
+      // promotion, so a future BigQuery copy-job quirk discovered against
+      // either caller (widenDestinationTableForPromotion was one such quirk)
+      // only ever needs fixing in the one function both share. widenFirst is
+      // always false here: a model's promotion is always a full WRITE_TRUNCATE
+      // replace, with no schema-evolution concept of its own to opt into.
+      promoteStagedTable(
+        { projectId: config.projectId, dataset: config.dataset, table: config.name },
+        stagingTable, 'WRITE_TRUNCATE', false
+      );
 
       return { relation: relation, materialized: 'table', staged: { table: stagingTable }, testResults: testResults };
     } finally {
@@ -3597,38 +3762,72 @@ var NotSoBigData = (function () {
     return results;
   }
 
-  // Counts each status in a runNodes() result set and renders it as the
-  // "DONE" summary line cli() logs at the end of a run/list - see there.
-  // Only non-zero counts are rendered - a "list" run (every node
-  // "planned") would otherwise print "0 passed, 0 failed, 0 skipped, 5
-  // planned", which buries the one number that matters in noise nobody
-  // asked about. One function rather than a count/format split: this
-  // project's tests are black-box (a human runs cli() from the Apps
-  // Script editor - see CLAUDE.md's "About testing"), so there is no
-  // caller that would ever want the raw counts independent of this one
-  // string.
-  function formatStatusCounts(results) {
-    var counts = { success: 0, failed: 0, skipped: 0, planned: 0 };
-    results.forEach(function (result) { counts[result.status] += 1; });
-    var labels = { success: 'passed', failed: 'failed', skipped: 'skipped', planned: 'planned' };
-    var parts = ['success', 'failed', 'skipped', 'planned']
-      .filter(function (status) { return counts[status] > 0; })
-      .map(function (status) { return counts[status] + ' ' + labels[status]; });
-    return parts.length ? parts.join(', ') : 'nothing to do';
+  // The four status values a run node result can report, in the order the
+  // summary line renders them - one ordered list, not two separately
+  // hardcoded objects (a `counts` seed and a `labels` map) that used to have
+  // to be kept in sync by hand. Mirrors DEBUG_CHECK_STATUSES below; the two
+  // stay separate lists since a run status is never one of a debug check's
+  // five values.
+  var NODE_RESULT_STATUSES = [
+    { status: 'success', label: 'passed' },
+    { status: 'failed', label: 'failed' },
+    { status: 'skipped', label: 'skipped' },
+    { status: 'planned', label: 'planned' }
+  ];
+
+  // Counts each item's `statusField` against an ordered {status,label} list
+  // and renders only the non-zero counts, e.g. "3 passed, 1 failed" - shared
+  // by formatStatusCounts() and formatDebugStatusCounts() below, which differ
+  // only in which status list/field they use and the "nothing happened"
+  // message. Throws on any status outside the given list rather than
+  // silently producing NaN in the summary line (`counts[status] += 1` on an
+  // undefined key), the way this file treats every other config/name
+  // mismatch.
+  function formatStatusList(items, statusField, statusList, nothingMessage, unknownContext) {
+    var counts = emptyMap();
+    statusList.forEach(function (entry) { counts[entry.status] = 0; });
+    items.forEach(function (item) {
+      var status = item[statusField];
+      if (!has(counts, status)) {
+        throw new Error('cli(): ' + unknownContext + ' reported unknown status "' + status + '".');
+      }
+      counts[status] += 1;
+    });
+    var parts = statusList
+      .filter(function (entry) { return counts[entry.status] > 0; })
+      .map(function (entry) { return counts[entry.status] + ' ' + entry.label; });
+    return parts.length ? parts.join(', ') : nothingMessage;
   }
 
-  // Reads the optional notsobigdataManifest global the same guarded way
+  // Renders the "DONE" summary line cli() logs at the end of a run/list -
+  // see there. Only non-zero counts are rendered - a "list" run (every node
+  // "planned") would otherwise print "0 passed, 0 failed, 0 skipped, 5
+  // planned", which buries the one number that matters in noise nobody
+  // asked about.
+  function formatStatusCounts(results) {
+    return formatStatusList(results, 'status', NODE_RESULT_STATUSES, 'nothing to do', 'run node');
+  }
+
+  // Reads an optional manifest-config global the same guarded way
   // discoverNodes() reads every other global - the read must never throw
-  // because of something this library doesn't own. Every field is
-  // optional; omitting the global entirely gives all three defaults.
-  function resolveManifestConfig() {
-    var raw = readOptionalGlobal('notsobigdataManifest');
+  // because of something this library doesn't own. Every field is optional;
+  // omitting the global entirely gives all three defaults. Shared by
+  // resolveManifestConfig() and resolveCompileManifestConfig() below, which
+  // differ only in which global they read and the fileName default - see
+  // resolveCompileManifestConfig()'s own comment for why those two stay
+  // separate globals rather than one shared config.
+  function resolveManifestConfigFrom(globalName, defaultFileName) {
+    var raw = readOptionalGlobal(globalName);
     var config = (raw && typeof raw === 'object') ? raw : {};
     return {
       enabled: config.enabled !== false,
       folderId: typeof config.folderId === 'string' && config.folderId ? config.folderId : null,
-      fileName: typeof config.fileName === 'string' && config.fileName ? config.fileName : 'notsobigdata-manifest.json'
+      fileName: typeof config.fileName === 'string' && config.fileName ? config.fileName : defaultFileName
     };
+  }
+
+  function resolveManifestConfig() {
+    return resolveManifestConfigFrom('notsobigdataManifest', 'notsobigdata-manifest.json');
   }
 
   // Reads the optional notsobigdataLogging global, same guarded pattern as
@@ -3660,10 +3859,19 @@ var NotSoBigData = (function () {
   // Turns one runNodes() result into a manifest-safe summary. Kind-agnostic
   // by construction: it never branches on node.kind, only on the *shape* of
   // the result (an array of rows, an object carrying loadResult/testResults,
-  // or model()'s relation/materialized) - the same shapes every EXECUTORS
-  // entry already produces. The raw rows are never included, only their
-  // size - a manifest is an observability artifact, not a second copy of
-  // the data that already landed at its real destination.
+  // or model()'s relation/materialized/staged) - the same shapes every
+  // EXECUTORS entry already produces. The raw rows are never included, only
+  // their size - a manifest is an observability artifact, not a second copy
+  // of the data that already landed at its real destination.
+  //
+  // staged (model.js's modelTableStaged(), a table model with tests) is its
+  // own independent `if`, same as every other optional field here - it was
+  // missing until a code-review pass caught it (2026-08-11): the staging
+  // table itself is already gone by the time a manifest is written (deleted
+  // in modelTableStaged()'s own finally block), so this field is purely
+  // informational, recording that this run went through the staged path at
+  // all rather than materializing directly - worth knowing from the
+  // manifest alone, without having to infer it from materialized/tests.
   function summarizeNodeResult(result) {
     var summary = { name: result.name, kind: result.kind, status: result.status };
     if (result.status === 'skipped') {
@@ -3695,6 +3903,9 @@ var NotSoBigData = (function () {
         summary.relation = result.result.relation;
         summary.materialized = result.result.materialized;
       }
+      if (result.result && result.result.staged !== undefined) {
+        summary.staged = result.result.staged;
+      }
     }
     return summary;
   }
@@ -3711,13 +3922,15 @@ var NotSoBigData = (function () {
     };
   }
 
-  // Writes the run manifest to Drive, overwriting the same file every time
-  // (found by name via upsertByName, never a fresh file per run - creating
-  // one per run is exactly the pattern that piled up duplicate fixture
-  // files in the test project before, see CLAUDE.md's "About testing").
-  // Best-effort: a Drive failure here must never throw or affect the
+  // Shared by writeManifest()/writeCompileManifest() below - both do the
+  // exact same "resolve folder, upsert by name via Drive, log every outcome,
+  // never throw" work, differing only in which global they read config from
+  // and what prefix they log under (logPrefix), so this is the one place
+  // that actually writes, called with each caller's own already-resolved
+  // config plus the *other* one's config for the collision guard right
+  // below. Best-effort: a Drive failure here must never throw or affect the
   // node results actually being reported, so every path is caught and
-  // turned into one of three report.manifest shapes instead.
+  // turned into one of four report.manifest shapes instead.
   //
   // Every outcome also gets a Logger.log line, same as every other outcome
   // in a run (the call-level START/DONE, each node's START/OK/FAIL/SKIP/PLAN).
@@ -3732,69 +3945,69 @@ var NotSoBigData = (function () {
   // time - the first helper call to cross the move.js/cli.js boundary, and
   // deliberately so: this is genuinely the same primitive loadDriveJson
   // already uses, not new drive-writing logic.
-  function writeManifest(commandText, ok, results, ignored) {
-    var config = resolveManifestConfig();
+  //
+  // otherConfig is only consulted (and only ever costs a Drive lookup, via
+  // resolveManifestFolderId(), when its own folderId is unset) if it's
+  // enabled - a disabled manifest can never actually be overwritten, so
+  // there is nothing to guard against. When both configs resolve to the
+  // same folderId + fileName, refusing to write (rather than writing
+  // anyway) is the only choice that can't silently destroy whichever
+  // manifest was written most recently - a run's manifest overwritten by a
+  // later compile, or vice versa, with no error either time it happened
+  // before this guard existed.
+  function writeManifestFile(logPrefix, config, otherConfig, commandText, ok, results, ignored) {
     if (!config.enabled) {
-      Logger.log('MANIFEST skipped - notsobigdataManifest.enabled is false');
+      Logger.log(logPrefix + ' skipped - enabled is false');
       return { written: false, reason: 'disabled' };
     }
     try {
       var folderId = resolveManifestFolderId(config.folderId);
+      if (otherConfig.enabled && config.fileName === otherConfig.fileName) {
+        var otherFolderId = resolveManifestFolderId(otherConfig.folderId);
+        if (folderId === otherFolderId) {
+          var message = 'notsobigdataManifest and notsobigdataCompileManifest resolve to the same Drive file (folderId "'
+            + folderId + '", fileName "' + config.fileName + '") - refusing to write, since cli(\'run\') and cli(\'compile\') '
+            + 'would otherwise silently overwrite each other\'s manifest. Give one of them its own folderId or fileName.';
+          Logger.log(logPrefix + ' failed - ' + message);
+          return { written: false, reason: 'collision', error: message };
+        }
+      }
       var manifest = buildManifest(commandText, ok, results, ignored);
       var target = { folderId: folderId, fileName: config.fileName, upsertByName: true };
       var fileId = resolveDriveWriteTarget(target);
       fileId = writeDriveText(fileId, target, JSON.stringify(manifest, null, 2), MimeType.PLAIN_TEXT);
-      Logger.log('MANIFEST written to ' + fileId);
+      Logger.log(logPrefix + ' written to ' + fileId);
       return { written: true, fileId: fileId };
     } catch (error) {
-      Logger.log('MANIFEST failed - ' + error.message);
+      Logger.log(logPrefix + ' failed - ' + error.message);
       return { written: false, reason: 'error', error: error.message };
     }
   }
 
-  // Reads the optional notsobigdataCompileManifest global, same guarded
-  // pattern and shape as resolveManifestConfig() above - a deliberately
-  // separate global, not a second field on notsobigdataManifest, so
-  // configuring (or disabling) the compile manifest can never accidentally
-  // touch the run manifest's own settings. Different default fileName for
-  // the same reason: the two are meant to coexist as two files, not fight
-  // over one.
+  function writeManifest(commandText, ok, results, ignored) {
+    return writeManifestFile('MANIFEST', resolveManifestConfig(), resolveCompileManifestConfig(), commandText, ok, results, ignored);
+  }
+
+  // notsobigdataCompileManifest, read via the same resolveManifestConfigFrom()
+  // above - a deliberately separate global, not a second field on
+  // notsobigdataManifest, so configuring (or disabling) the compile manifest
+  // can never accidentally touch the run manifest's own settings. Different
+  // default fileName for the same reason: the two are meant to coexist as
+  // two files, not fight over one.
   function resolveCompileManifestConfig() {
-    var raw = readOptionalGlobal('notsobigdataCompileManifest');
-    var config = (raw && typeof raw === 'object') ? raw : {};
-    return {
-      enabled: config.enabled !== false,
-      folderId: typeof config.folderId === 'string' && config.folderId ? config.folderId : null,
-      fileName: typeof config.fileName === 'string' && config.fileName ? config.fileName : 'notsobigdata-compile-manifest.json'
-    };
+    return resolveManifestConfigFrom('notsobigdataCompileManifest', 'notsobigdata-compile-manifest.json');
   }
 
   // cli('compile')'s counterpart to writeManifest() above - same
-  // upsert-by-name Drive write, same best-effort/never-throw contract, same
-  // "every outcome gets a Logger.log line" reasoning - but to its own file,
-  // via resolveCompileManifestConfig() rather than resolveManifestConfig().
-  // A compile pass never touches BigQuery/Sheets/Drive, so it must never
-  // overwrite the run manifest's own record of what the last real run
-  // actually did - see docs/cli.md's "The compile manifest" for the
-  // user-facing version of this reasoning.
+  // writeManifestFile() call, to its own file via resolveCompileManifestConfig()
+  // rather than resolveManifestConfig(). A compile pass never touches
+  // BigQuery/Sheets/Drive, so it must never overwrite the run manifest's own
+  // record of what the last real run actually did - see docs/cli.md's "The
+  // compile manifest" for the user-facing version of this reasoning, and
+  // writeManifestFile()'s own comment above for how the same-target case is
+  // now caught rather than silently allowed.
   function writeCompileManifest(commandText, ok, results, ignored) {
-    var config = resolveCompileManifestConfig();
-    if (!config.enabled) {
-      Logger.log('COMPILE MANIFEST skipped - notsobigdataCompileManifest.enabled is false');
-      return { written: false, reason: 'disabled' };
-    }
-    try {
-      var folderId = resolveManifestFolderId(config.folderId);
-      var manifest = buildManifest(commandText, ok, results, ignored);
-      var target = { folderId: folderId, fileName: config.fileName, upsertByName: true };
-      var fileId = resolveDriveWriteTarget(target);
-      fileId = writeDriveText(fileId, target, JSON.stringify(manifest, null, 2), MimeType.PLAIN_TEXT);
-      Logger.log('COMPILE MANIFEST written to ' + fileId);
-      return { written: true, fileId: fileId };
-    } catch (error) {
-      Logger.log('COMPILE MANIFEST failed - ' + error.message);
-      return { written: false, reason: 'error', error: error.message };
-    }
+    return writeManifestFile('COMPILE MANIFEST', resolveCompileManifestConfig(), resolveManifestConfig(), commandText, ok, results, ignored);
   }
 
   // cli('debug') - a diagnostic, non-mutating check of whether the current
@@ -3849,15 +4062,20 @@ var NotSoBigData = (function () {
   // Shared by probeUrl and probeApi. Always forces a GET and always mutes
   // HTTP exceptions: the status code is deliberately irrelevant to whether
   // this counts as 'ok' (see the module comment above) - only a thrown
-  // error means UrlFetchApp itself couldn't make the call. method/payload
-  // are stripped out of options rather than merged in, so a target's own
-  // POST configuration can never leak through and turn a probe into a
-  // second real write.
+  // error means UrlFetchApp itself couldn't make the call. method/payload/
+  // muteHttpExceptions are all stripped out of options rather than merged
+  // in - method/payload so a target's own POST configuration can never leak
+  // through and turn a probe into a second real write, muteHttpExceptions
+  // so a node's own options (e.g. one that sets muteHttpExceptions: false
+  // to let its real call inspect a non-2xx response body) can never
+  // override the forced true here and turn a perfectly reachable, non-2xx
+  // endpoint into a thrown error this function misreports as 'missing_scope'
+  // or 'error' instead of 'ok'.
   function fetchProbe(url, options, type, role) {
     var fetchOptions = { method: 'get', muteHttpExceptions: true };
     if (options) {
       Object.keys(options).forEach(function (key) {
-        if (key !== 'method' && key !== 'payload') {
+        if (key !== 'method' && key !== 'payload' && key !== 'muteHttpExceptions') {
           fetchOptions[key] = options[key];
         }
       });
@@ -4024,18 +4242,32 @@ var NotSoBigData = (function () {
     return checks;
   }
 
+  // The five status values a debug check can report (see
+  // classifyProbeError()/fetchProbe()/probeSheets/probeDrive/probeBigQuery/
+  // probeApi/probeUrl/probeCustom above, and connectorTuplesForNode()'s own
+  // 'unknown connector type' fallback) and the label formatDebugStatusCounts()
+  // below renders each one under - one ordered list, not two separately
+  // hardcoded objects (a `counts` seed and a `labels` map) that used to have
+  // to be kept in sync by hand. A status added, renamed, or removed from one
+  // of the probe functions above only needs updating here now; before this,
+  // a status produced there but missing from formatDebugStatusCounts()'s own
+  // `counts` object would silently render as "NaN <status>" in the summary
+  // line (`counts[status] += 1` on an undefined key is `NaN`), rather than
+  // failing loudly the way this file treats every other config/name mismatch.
+  var DEBUG_CHECK_STATUSES = [
+    { status: 'ok', label: 'ok' },
+    { status: 'missing_scope', label: 'missing scope' },
+    { status: 'service_not_enabled', label: 'service not enabled' },
+    { status: 'error', label: 'error' },
+    { status: 'unverifiable', label: 'unverifiable' }
+  ];
+
   // formatStatusCounts()'s counterpart for a debug report's check statuses
-  // rather than a run report's node statuses - same "only render non-zero
-  // counts" reasoning, kept separate since the two status vocabularies
-  // don't overlap (a check is never 'success'/'skipped'/'planned').
+  // rather than a run report's node statuses - kept as a separate status list
+  // since the two vocabularies don't overlap (a check is never
+  // 'success'/'skipped'/'planned').
   function formatDebugStatusCounts(checks) {
-    var counts = { ok: 0, missing_scope: 0, service_not_enabled: 0, error: 0, unverifiable: 0 };
-    checks.forEach(function (check) { counts[check.status] += 1; });
-    var labels = { ok: 'ok', missing_scope: 'missing scope', service_not_enabled: 'service not enabled', error: 'error', unverifiable: 'unverifiable' };
-    var parts = Object.keys(labels)
-      .filter(function (status) { return counts[status] > 0; })
-      .map(function (status) { return counts[status] + ' ' + labels[status]; });
-    return parts.length ? parts.join(', ') : 'nothing to check';
+    return formatStatusList(checks, 'status', DEBUG_CHECK_STATUSES, 'nothing to check', 'debug check');
   }
 
   // The smoke test. This is the first thing to run when anything looks
