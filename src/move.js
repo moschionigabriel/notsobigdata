@@ -312,10 +312,14 @@ function qualifiedTableRef(projectId, dataset, table) {
 // below and assertSingleStatement, so the two checks that read pipeline-
 // author-supplied SQL agree on what "the statement" is before either one
 // judges it.
+// What counts as a SQL comment, shared with model.js's commentSpans() -
+// one definition of "-- line" / "/* block */" rather than two regex
+// literals that could drift apart.
+var SQL_COMMENT_PATTERNS = [/--[^\n]*/g, /\/\*[\s\S]*?\*\//g];
+
 function stripSqlComments(sql) {
-  return sql
-    .replace(/--[^\n]*/g, '')
-    .replace(/\/\*[\s\S]*?\*\//g, '')
+  return SQL_COMMENT_PATTERNS
+    .reduce(function (text, pattern) { return text.replace(pattern, ''); }, sql)
     .trim()
     .replace(/;\s*$/, '');
 }

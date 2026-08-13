@@ -999,7 +999,7 @@ function mergeDependsOn(refDeps, handWrittenDeps) {
 // since a real, non-macro SQL comment is legitimate output.
 function commentSpans(text) {
   var spans = [];
-  [/--[^\n]*/g, /\/\*[\s\S]*?\*\//g].forEach(function (pattern) {
+  SQL_COMMENT_PATTERNS.forEach(function (pattern) {
     var match;
     while ((match = pattern.exec(text))) {
       spans.push([match.index, match.index + match[0].length]);
@@ -1229,7 +1229,9 @@ function validateModelTest(test, messagePrefix, registry) {
     if (typeof test.to !== 'string' || !test.to) {
       throw new Error(messagePrefix + ' test on column "' + test.column + '" (check "relationships") requires "to" (another model\'s name).');
     }
-    if (!has(registry.models, test.to)) {
+    try {
+      resolveModelConfig(test.to, registry);
+    } catch (error) {
       throw new Error(messagePrefix + ' test on column "' + test.column + '" (check "relationships") has "to": "' + test.to
         + '", which is not a declared model. Known models: ' + Object.keys(registry.models).join(', ') + '.');
     }

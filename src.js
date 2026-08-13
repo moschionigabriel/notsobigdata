@@ -322,10 +322,14 @@ var NotSoBigData = (function () {
   // below and assertSingleStatement, so the two checks that read pipeline-
   // author-supplied SQL agree on what "the statement" is before either one
   // judges it.
+  // What counts as a SQL comment, shared with model.js's commentSpans() -
+  // one definition of "-- line" / "/* block */" rather than two regex
+  // literals that could drift apart.
+  var SQL_COMMENT_PATTERNS = [/--[^\n]*/g, /\/\*[\s\S]*?\*\//g];
+
   function stripSqlComments(sql) {
-    return sql
-      .replace(/--[^\n]*/g, '')
-      .replace(/\/\*[\s\S]*?\*\//g, '')
+    return SQL_COMMENT_PATTERNS
+      .reduce(function (text, pattern) { return text.replace(pattern, ''); }, sql)
       .trim()
       .replace(/;\s*$/, '');
   }
@@ -2501,7 +2505,7 @@ var NotSoBigData = (function () {
   // since a real, non-macro SQL comment is legitimate output.
   function commentSpans(text) {
     var spans = [];
-    [/--[^\n]*/g, /\/\*[\s\S]*?\*\//g].forEach(function (pattern) {
+    SQL_COMMENT_PATTERNS.forEach(function (pattern) {
       var match;
       while ((match = pattern.exec(text))) {
         spans.push([match.index, match.index + match[0].length]);
@@ -2731,7 +2735,9 @@ var NotSoBigData = (function () {
       if (typeof test.to !== 'string' || !test.to) {
         throw new Error(messagePrefix + ' test on column "' + test.column + '" (check "relationships") requires "to" (another model\'s name).');
       }
-      if (!has(registry.models, test.to)) {
+      try {
+        resolveModelConfig(test.to, registry);
+      } catch (error) {
         throw new Error(messagePrefix + ' test on column "' + test.column + '" (check "relationships") has "to": "' + test.to
           + '", which is not a declared model. Known models: ' + Object.keys(registry.models).join(', ') + '.');
       }
@@ -3756,24 +3762,50 @@ var NotSoBigData = (function () {
     return results;
   }
 
-  // Counts each status in a runNodes() result set and renders it as the
-  // "DONE" summary line cli() logs at the end of a run/list - see there.
-  // Only non-zero counts are rendered - a "list" run (every node
+  // The four status values a run node result can report, in the order the
+  // summary line renders them - one ordered list, not two separately
+  // hardcoded objects (a `counts` seed and a `labels` map) that used to have
+  // to be kept in sync by hand. Mirrors DEBUG_CHECK_STATUSES below; the two
+  // stay separate lists since a run status is never one of a debug check's
+  // five values.
+  var NODE_RESULT_STATUSES = [
+    { status: 'success', label: 'passed' },
+    { status: 'failed', label: 'failed' },
+    { status: 'skipped', label: 'skipped' },
+    { status: 'planned', label: 'planned' }
+  ];
+
+  // Counts each item's `statusField` against an ordered {status,label} list
+  // and renders only the non-zero counts, e.g. "3 passed, 1 failed" - shared
+  // by formatStatusCounts() and formatDebugStatusCounts() below, which differ
+  // only in which status list/field they use and the "nothing happened"
+  // message. Throws on any status outside the given list rather than
+  // silently producing NaN in the summary line (`counts[status] += 1` on an
+  // undefined key), the way this file treats every other config/name
+  // mismatch.
+  function formatStatusList(items, statusField, statusList, nothingMessage, unknownContext) {
+    var counts = emptyMap();
+    statusList.forEach(function (entry) { counts[entry.status] = 0; });
+    items.forEach(function (item) {
+      var status = item[statusField];
+      if (!has(counts, status)) {
+        throw new Error('cli(): ' + unknownContext + ' reported unknown status "' + status + '".');
+      }
+      counts[status] += 1;
+    });
+    var parts = statusList
+      .filter(function (entry) { return counts[entry.status] > 0; })
+      .map(function (entry) { return counts[entry.status] + ' ' + entry.label; });
+    return parts.length ? parts.join(', ') : nothingMessage;
+  }
+
+  // Renders the "DONE" summary line cli() logs at the end of a run/list -
+  // see there. Only non-zero counts are rendered - a "list" run (every node
   // "planned") would otherwise print "0 passed, 0 failed, 0 skipped, 5
   // planned", which buries the one number that matters in noise nobody
-  // asked about. One function rather than a count/format split: this
-  // project's tests are black-box (a human runs cli() from the Apps
-  // Script editor - see CLAUDE.md's "About testing"), so there is no
-  // caller that would ever want the raw counts independent of this one
-  // string.
+  // asked about.
   function formatStatusCounts(results) {
-    var counts = { success: 0, failed: 0, skipped: 0, planned: 0 };
-    results.forEach(function (result) { counts[result.status] += 1; });
-    var labels = { success: 'passed', failed: 'failed', skipped: 'skipped', planned: 'planned' };
-    var parts = ['success', 'failed', 'skipped', 'planned']
-      .filter(function (status) { return counts[status] > 0; })
-      .map(function (status) { return counts[status] + ' ' + labels[status]; });
-    return parts.length ? parts.join(', ') : 'nothing to do';
+    return formatStatusList(results, 'status', NODE_RESULT_STATUSES, 'nothing to do', 'run node');
   }
 
   // Reads an optional manifest-config global the same guarded way
@@ -3930,9 +3962,9 @@ var NotSoBigData = (function () {
     }
     try {
       var folderId = resolveManifestFolderId(config.folderId);
-      if (otherConfig.enabled) {
+      if (otherConfig.enabled && config.fileName === otherConfig.fileName) {
         var otherFolderId = resolveManifestFolderId(otherConfig.folderId);
-        if (folderId === otherFolderId && config.fileName === otherConfig.fileName) {
+        if (folderId === otherFolderId) {
           var message = 'notsobigdataManifest and notsobigdataCompileManifest resolve to the same Drive file (folderId "'
             + folderId + '", fileName "' + config.fileName + '") - refusing to write, since cli(\'run\') and cli(\'compile\') '
             + 'would otherwise silently overwrite each other\'s manifest. Give one of them its own folderId or fileName.';
@@ -4231,24 +4263,11 @@ var NotSoBigData = (function () {
   ];
 
   // formatStatusCounts()'s counterpart for a debug report's check statuses
-  // rather than a run report's node statuses - same "only render non-zero
-  // counts" reasoning, kept separate since the two status vocabularies
-  // don't overlap (a check is never 'success'/'skipped'/'planned'). Throws
-  // on a status outside DEBUG_CHECK_STATUSES rather than silently producing
-  // NaN - see that list's own comment above.
+  // rather than a run report's node statuses - kept as a separate status list
+  // since the two vocabularies don't overlap (a check is never
+  // 'success'/'skipped'/'planned').
   function formatDebugStatusCounts(checks) {
-    var counts = emptyMap();
-    DEBUG_CHECK_STATUSES.forEach(function (entry) { counts[entry.status] = 0; });
-    checks.forEach(function (check) {
-      if (!has(counts, check.status)) {
-        throw new Error('cli(): debug check reported unknown status "' + check.status + '" - add it to DEBUG_CHECK_STATUSES.');
-      }
-      counts[check.status] += 1;
-    });
-    var parts = DEBUG_CHECK_STATUSES
-      .filter(function (entry) { return counts[entry.status] > 0; })
-      .map(function (entry) { return counts[entry.status] + ' ' + entry.label; });
-    return parts.length ? parts.join(', ') : 'nothing to check';
+    return formatStatusList(checks, 'status', DEBUG_CHECK_STATUSES, 'nothing to check', 'debug check');
   }
 
   // The smoke test. This is the first thing to run when anything looks
