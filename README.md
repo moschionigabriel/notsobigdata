@@ -4,6 +4,10 @@ A declarative ELT library for Google Apps Script — move data, model it with
 SQL, and run the whole pipeline in dependency order, entirely inside a tool
 you probably already have open.
 
+*Not affiliated with or endorsed by dbt Labs, Inc. "dbt-style" throughout
+this repo describes a design posture this library borrows, not a claim of
+official integration.*
+
 > **Status: early-stage / pre-alpha.** Both kinds this library offers are
 > implemented today: `move` (the "EL" — extract/load across Sheets, Drive,
 > BigQuery, external APIs, and your own custom functions) and `model` (the
