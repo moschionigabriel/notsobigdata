@@ -1,0 +1,10 @@
+<script type="text/sql" id="tmpSharedStgOrders">
+  select 1 as order_id, 'alice' as customer union all
+  select 2, 'bob' union all
+  select 3, 'alice'
+</script>
+<script id="tmpSharedOrdersSummary" type="text/sql">
+  select customer, count(*) as order_count
+  from {{ ref('tmpSharedStgOrders') }}
+  group by 1
+</script>

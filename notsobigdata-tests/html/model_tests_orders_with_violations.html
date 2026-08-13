@@ -1,0 +1,5 @@
+<script type="text/sql">
+  select 1 as order_id, 1 as customer_id, 'open' as status union all
+  select 1 as order_id, null as customer_id, 'bogus' as status union all
+  select 3 as order_id, 99 as customer_id, 'open' as status
+</script>

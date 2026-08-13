@@ -1,0 +1,12 @@
+<script type="text/sql">
+  select
+    {% for label in ['open, pending', 'closed'] %}
+    sum(case when status = '{{ label }}' then 1 else 0 end) +
+    {% endfor %}
+    0 as total_matches
+  from (
+    select 'open, pending' as status union all
+    select 'closed' as status union all
+    select 'other' as status
+  )
+</script>

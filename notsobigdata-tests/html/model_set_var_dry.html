@@ -1,0 +1,8 @@
+<script type="text/sql">
+  {% set min_amount = '1' %}
+  select n as amount
+  from unnest([1, 2, 3]) as n
+  where n > {{ min_amount }}
+  group by n
+  having max(n) > {{ min_amount }}
+</script>

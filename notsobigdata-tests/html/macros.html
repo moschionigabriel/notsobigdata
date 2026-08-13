@@ -1,0 +1,7 @@
+{% macro cents_to_dollars(column) %}
+  round({{ column }} / 100, 2)
+{% endmacro %}
+
+{% macro enrich_with_region(column) %}
+  (select name from {{ ref('tmpMacroCustomers') }} where customer_id = {{ column }})
+{% endmacro %}

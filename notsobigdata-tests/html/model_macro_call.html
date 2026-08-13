@@ -1,0 +1,10 @@
+<script type="text/sql">
+  select
+    o.order_id,
+    {{ cents_to_dollars('o.amount_cents') }} as amount_usd,
+    {{ enrich_with_region('o.customer_id') }} as customer_name
+  from (
+    select 1 as order_id, 250 as amount_cents, 1 as customer_id union all
+    select 2 as order_id, 500 as amount_cents, 2 as customer_id
+  ) o
+</script>
