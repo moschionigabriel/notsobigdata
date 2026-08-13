@@ -106,9 +106,19 @@ eval(UrlFetchApp.fetch('https://raw.githubusercontent.com/moschionigabriel/notso
 which means your project runs whatever `main` says today, with your OAuth
 access to your Drive, Sheets and BigQuery. That's the tradeoff for having no
 build step and no package manager: you get fixes automatically, and you're
-trusting this repo continuously rather than once. If you'd rather pin, swap
-`main` for a tag or a commit SHA in the URL and update it deliberately —
-same install, one word different.
+trusting this repo continuously rather than once.
+
+**To pin instead, swap `main` for a tag** — same install, one word
+different:
+
+```javascript
+eval(UrlFetchApp.fetch('https://raw.githubusercontent.com/moschionigabriel/notsobigdata/v1.0.0/src.js').getContentText())
+```
+
+Unlike `main`, a tag never moves — `v1.0.0` will keep pointing at exactly
+the same code even after a `v2.0.0` ships with breaking changes, so a
+pipeline pinned to it keeps running unchanged. Update the tag in the URL
+yourself, deliberately, whenever you're ready to move up.
 
 ## cli()
 
