@@ -1,0 +1,3 @@
+<script type="text/sql">
+  select '{{ var('region') }}' as region, {{ var('missing_with_default', '42') }} as fallback
+</script>

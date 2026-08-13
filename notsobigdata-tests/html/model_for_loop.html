@@ -1,0 +1,14 @@
+<script type="text/sql">
+  select
+    customer,
+    {% for status in ['open', 'closed'] %}
+    countif(status = '{{ status }}') as {{ status }}_count,
+    {% endfor %}
+    count(*) as total
+  from (
+    select 'alice' as customer, 'open' as status union all
+    select 'alice', 'closed' union all
+    select 'bob', 'open'
+  )
+  group by 1
+</script>

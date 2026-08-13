@@ -1,0 +1,8 @@
+<script type="text/sql">
+  select
+  {% for a in ['x'] %}
+    {% for b in ['y'] %}
+    '{{ b }}' as col
+    {% endfor %}
+  {% endfor %}
+</script>

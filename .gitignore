@@ -1,4 +1,2 @@
-CLAUDE.md
 .claude/
-notsobigdata-tests/
-src/*.md
+notsobigdata-tests/.clasp.json
